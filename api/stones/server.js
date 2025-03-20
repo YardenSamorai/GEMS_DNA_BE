@@ -4,7 +4,7 @@ const { Pool } = require("pg");
 require("dotenv").config();
 
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || "postgresql://gems_owner:npg_mr64DAeRqOfd@ep-bitter-paper-a5t16ihi-pooler.us-east-2.aws.neon.tech/gems?sslmode=require",
