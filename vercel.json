@@ -2,14 +2,18 @@
   "version": 2,
   "builds": [
     {
-      "src": "Backend/api/stones/server.js",
+      "src": "backend/api/stones/server.js",
       "use": "@vercel/node"
     }
   ],
   "routes": [
     {
-      "src": "/(.*)",
-      "dest": "Backend/api/stones/server.js"
+      "src": "/api/stones",
+      "dest": "backend/api/stones/server.js"
+    },
+    {
+      "src": "/api/stones/(.*)",
+      "dest": "backend/api/stones/server.js"
     }
   ]
 }
