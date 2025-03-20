@@ -1,15 +1,26 @@
 {
-  "name": "cgemcer_backend",
+  "name": "backend",
   "version": "1.0.0",
-  "main": "backend/api/stones/server.js",
+  "main": "import-csv.js",
   "scripts": {
-    "start": "node backend/api/stones/server.js",
-    "vercel-start": "node backend/api/stones/server.js"
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YardenSamorai/cgemcer_backend.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/YardenSamorai/cgemcer_backend/issues"
+  },
+  "homepage": "https://github.com/YardenSamorai/cgemcer_backend#readme",
+  "description": "",
   "dependencies": {
-    "express": "^4.18.2",
-    "dotenv": "^16.0.3",
     "cors": "^2.8.5",
-    "pg": "^8.10.0"
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pg": "^8.14.1"
   }
 }

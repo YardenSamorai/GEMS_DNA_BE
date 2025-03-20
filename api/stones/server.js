@@ -1,5 +1,5 @@
 const express = require("express");
-const cors = require("cors"); // ✅ ייבוא CORS
+const cors = require("cors");
 const { Pool } = require("pg");
 require("dotenv").config();
 
@@ -11,21 +11,21 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-app.use(cors()); // ✅ הפעלת CORS לכל הדומיינים
+app.use(cors());
 
 // 🔹 נתיב API להחזרת כל האבנים
-app.get("backend/api/stones", async (req, res) => {
+app.get("/api/stones", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM stones ORDER BY carat DESC");
 
-    // המרת שדות מספריים למספרים ושמירת `measurements1` כמחרוזת
+    // המרת שדות מספריים
     const formattedRows = result.rows.map(row => ({
       ...row,
       carat: row.carat ? parseFloat(row.carat) : null,
       ratio: row.ratio ? parseFloat(row.ratio) : null,
       price_per_carat: row.price_per_carat ? parseFloat(row.price_per_carat) : null,
       total_price: row.total_price ? parseFloat(row.total_price) : null,
-      measurements1: row.measurements1 || null, // ✅ השארת measurements1 כמחרוזת מלאה
+      measurements1: row.measurements1 || null,
     }));
 
     res.json(formattedRows);
@@ -45,7 +45,7 @@ app.get("/api/stones/:stone_id", async (req, res) => {
       return res.status(404).json({ error: "Stone not found" });
     }
 
-    // המרת השדות המספריים, אבל השארת `measurements1` כמחרוזת
+    // המרת שדות מספריים
     const stone = result.rows[0];
     const numericFields = ["carat", "ratio", "price_per_carat", "total_price"];
     numericFields.forEach((field) => {
