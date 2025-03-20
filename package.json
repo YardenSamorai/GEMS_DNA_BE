@@ -1,18 +1,15 @@
 {
-  "name": "backend",
+  "name": "cgemcer_backend",
   "version": "1.0.0",
-  "main": "import-csv.js",
+  "main": "Backend/api/stones/server.js",
   "scripts": {
-    "start": "node index.js",
-    "vercel-start": "node index.js"
+    "start": "node Backend/api/stones/server.js",
+    "vercel-start": "node Backend/api/stones/server.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
   "dependencies": {
+    "express": "^4.18.2",
+    "dotenv": "^16.0.3",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2"
+    "pg": "^8.10.0"
   }
 }
