@@ -14,7 +14,7 @@ const pool = new Pool({
 app.use(cors()); // ✅ הפעלת CORS לכל הדומיינים
 
 // 🔹 נתיב API להחזרת כל האבנים
-app.get("/api/stones", async (req, res) => {
+app.get("backend/api/stones", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM stones ORDER BY carat DESC");
 
