@@ -1,0 +1,20 @@
+{
+    "version": 2,
+    "builds": [
+      {
+        "src": "backend/api/stones/server.js",
+        "use": "@vercel/node"
+      }
+    ],
+    "routes": [
+      {
+        "src": "/api/stones",
+        "dest": "backend/api/stones/server.js"
+      },
+      {
+        "src": "/api/stones/(.*)",
+        "dest": "backend/api/stones/server.js"
+      }
+    ]
+  }
+  
