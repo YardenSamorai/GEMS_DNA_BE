@@ -1,7 +1,12 @@
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
-require("dotenv").config();
+const dotenv = require('dotenv');
+const path = require('path');
+
+dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+
+
 
 const app = express();
 const port = process.env.PORT;
@@ -60,6 +65,8 @@ app.get("/api/stones/:stone_id", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+// Save Info for Card in Dashboard
+app.get('/api/dashboard/overview', getOverview);
 
 app.listen(port, () => {
   console.log(`🚀 Server is running on http://localhost:${port}`);
