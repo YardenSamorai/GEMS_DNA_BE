@@ -65,8 +65,36 @@ app.get("/api/stones/:stone_id", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
-// Save Info for Card in Dashboard
-app.get('/api/dashboard/overview', getOverview);
+
+app.get('/api/jewelry/:modelNumber', async (req, res) => {
+  const { modelNumber } = req.params;
+
+  try {
+    const result = await pool.query(
+      'SELECT * FROM jewelry_products WHERE model_number = $1',
+      [modelNumber]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Jewelry item not found' });
+    }
+
+    const item = result.rows[0];
+
+    // המרת שדות מספריים
+    const numericFields = ['price', 'jewelry_weight', 'total_carat', 'center_stone_carat'];
+    numericFields.forEach(field => {
+      if (item[field] !== null && item[field] !== undefined) {
+        item[field] = parseFloat(item[field]);
+      }
+    });
+
+    res.json(item);
+  } catch (error) {
+    console.error('❌ Error fetching jewelry item:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 app.listen(port, () => {
   console.log(`🚀 Server is running on http://localhost:${port}`);

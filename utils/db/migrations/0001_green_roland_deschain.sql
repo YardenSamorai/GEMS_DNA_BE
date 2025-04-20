@@ -1,0 +1,31 @@
+CREATE TABLE "jewelry_products" (
+	"model_number" varchar(50) PRIMARY KEY NOT NULL,
+	"stock_number" varchar(50),
+	"jewelry_type" varchar(50),
+	"style" varchar(50),
+	"collection" varchar(100),
+	"price" numeric(10, 2),
+	"video_link" text,
+	"all_pictures_link" text,
+	"certificate_link" text,
+	"certificate_number" varchar(100),
+	"title" varchar(150),
+	"description" text,
+	"jewelry_weight" numeric(10, 2),
+	"total_carat" numeric(10, 2),
+	"stone_type" varchar(50),
+	"center_stone_carat" numeric(10, 2),
+	"center_stone_shape" varchar(50),
+	"center_stone_color" varchar(50),
+	"center_stone_clarity" varchar(50),
+	"metal_type" varchar(50),
+	"currency" varchar(10),
+	"availability" varchar(50),
+	"shipping_from" varchar(100),
+	"category" varchar(100),
+	"full_description" text,
+	"jewelry_size" varchar(50),
+	"instructions_main" text
+);
+--> statement-breakpoint
+DROP TABLE "stones" CASCADE;
