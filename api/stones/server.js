@@ -20,7 +20,9 @@ const pool = new Pool({
 console.log("🟢 Backend is running — This is the correct file.");
 app.use(cors());
 
-// 🔐 פונקציית הצפנה
+/* =========================================================
+   Encryption helper
+   ========================================================= */
 const encrypt = (text) => {
   return CryptoJS.AES.encrypt(text, ENCRYPT_SECRET).toString();
 };
