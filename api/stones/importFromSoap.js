@@ -1,100 +1,139 @@
-// Upload DATA from BARAK API to Neon DB calling SOAP_STONES
-const { fetchSoapData } = require('../../utils/soapClient');
-const { parseXml } = require('../../utils/xmlParser');
-const { pool } = require('../../db/client');
+// Upload DATA from BARAK SOAP API to Neon DB into soap_stones table
+
+const { fetchSoapData } = require("../../utils/soapClient");
+const { parseXml } = require("../../utils/xmlParser");
+const { pool } = require("../../db/client");
+
+const CHUNK_SIZE = 300; // ⭐ הכי יציב
 
 const run = async () => {
   try {
-    console.log('🚀 [1/6] Fetching SOAP data...');
+    console.log("🚀 [1/6] Fetching SOAP data...");
     const rawXml = await fetchSoapData();
 
     if (!rawXml) {
-      console.log('❌ No XML received');
+      console.log("❌ No XML received");
       return;
     }
 
-    console.log('📦 [2/6] Parsing XML...');
+    console.log("📦 [2/6] Parsing XML...");
     const parsed = await parseXml(rawXml);
     const stones = parsed?.Stock?.Stone;
 
     if (!stones) {
-      console.log('❌ No stones found inside parsed XML');
+      console.log("❌ No <Stone> elements found");
       return;
     }
 
     const stoneArray = Array.isArray(stones) ? stones : [stones];
     console.log(`📊 [3/6] Total stones found: ${stoneArray.length}`);
 
-    const values = stoneArray.map(stone => [
-      stone.Category || '',
-      stone.SKU || '',
-      stone.Shape || '',
-      parseFloat(stone.Weight) || 0,
-      stone.Color || '',
-      stone.Clarity || '',
-      stone.Lab || '',
-      stone.Origin || '',
-      parseFloat(stone.PricePerCarat) || 0,
-      parseFloat(stone.TotalPrice) || 0,
-      parseFloat(stone.ratio) || 0,
-      stone['Measurements-delimiter'] || '',
-      stone.Video || '',
-      stone.Image || '',
-      stone.Certificate || '',
-      stone.Branch || '',
-      stone.Fluorescence || '',
-      stone.Polish || '',
-      stone.Symmetry || '',
-      parseFloat(stone.Table) || 0,
-      parseFloat(stone.Depth) || 0,
-      stone.Comment || '',
-      stone.Certificateimage || '',
-      stone.fancy_intensity || '',
-      stone.fancy_color || '',
-      stone.fancy_overtone || '',
-      stone.fancy_color_2 || '',
-      stone.fancy_overtone_2 || '',
-      stone.home_page || '',
-      stone.additional_pictures || '',
-      stone.additional_videos || '',
-      stone.Type || '',
-      stone['Cert. Comments'] || '',
-      stone.certificateImageJPG || '',
-      parseFloat(stone['Rap. Price']) || 0,
-      stone['Rap Price %'] || '',
-      stone['Certificate Number'] || '',
-      stone.Cut || '',
-      stone['Pair Stone'] || '',
-      new Date() // created_at
-    ]);
+    // --------------------------
+    // BUILD VALUES FOR EACH ROW
+    // --------------------------
+    const values = stoneArray.map((stone) => {
+      const safeNumber = (value) => {
+        const n = parseFloat(value);
+        return Number.isFinite(n) ? n : null;
+      };
 
-    console.log('🧹 [4/6] Clearing soap_stones table...');
-    await pool.query('TRUNCATE TABLE soap_stones RESTART IDENTITY');
+      return [
+        stone.Category || null,
+        stone.SKU || null,
+        stone.Shape || null,
+        safeNumber(stone.Weight),
+        stone.Color || null,
+        stone.Clarity || null,
+        stone.Lab || null,
+        stone.Fluorescence || null,
+        safeNumber(stone.PricePerCarat),
+        safeNumber(stone.RapPrice),
+        safeNumber(stone["Rap.Price"]),
+        safeNumber(stone.TotalPrice),
+        stone.Location || null,
+        stone.Branch || null,
+        stone.Image || null,
+        stone.additional_pictures || null,
+        stone.Video || null,
+        stone.additional_videos || null,
+        stone.Certificateimage || null,
+        stone.CertificateNumber || null,
+        stone.certificateImageJPG || null,
+        stone.Cut || null,
+        stone.Polish || null,
+        stone.Symmetry || null,
+        safeNumber(stone.Table),
+        safeNumber(stone.Depth),
+        safeNumber(stone.ratio),
+        stone["Measurements-delimiter"] || null,
+        stone.fancy_intensity || null,
+        stone.fancy_color || null,
+        stone.fancy_overtone || null,
+        stone.fancy_color_2 || null,
+        stone.fancy_overtone_2 || null,
+        stone.PairStone || null,
+        stone.home_page || null,
+        stone.TradeShow || null,
+        stone.Comment || null,
+        stone.Type || null,
+        stone["Cert.Comments"] || null,
+        stone.Origin || null,
+        null, // raw_xml
+      ];
+    });
 
-    console.log('🧱 [5/6] Preparing bulk insert query...');
-    const insertQuery = `
-      INSERT INTO soap_stones (
-        category, sku, shape, weight, color, clarity, lab, origin,
-        price_per_carat, total_price, ratio, measurements, video, picture,
-        certificate_pdf, branch, fluorescence, polish, symmetry, table_percent,
-        depth, comment, certificate_image, fancy_intensity, fancy_color,
-        fancy_overtone, fancy_color_2, fancy_overtone_2, home_page,
-        additional_pictures, additional_videos, type, cert_comments,
-        certificate_image_jpg, rap_price, rap_price_percent,
-        certificate_number, cut, pair_stone, created_at
-      ) VALUES ${values.map((_, i) => `(
-        ${Array(40).fill(0).map((_, j) => `$${i * 40 + j + 1}`).join(', ')}
-      )`).join(',')}
-    `;
+    // עמודות לטבלה:
+    const columns = [
+      "category", "sku", "shape", "weight", "color", "clarity", "lab",
+      "fluorescence", "price_per_carat", "rap_price", "rap_list_price",
+      "total_price", "location", "branch", "image", "additional_pictures",
+      "video", "additional_videos", "certificate_image", "certificate_number",
+      "certificate_image_jpg", "cut", "polish", "symmetry", "table_percent",
+      "depth_percent", "ratio", "measurements", "fancy_intensity",
+      "fancy_color", "fancy_overtone", "fancy_color_2", "fancy_overtone_2",
+      "pair_stone", "home_page", "trade_show", "comment", "type",
+      "cert_comments", "origin", "raw_xml",
+    ];
 
-    const flatValues = values.flat();
+    console.log("🧹 [4/6] Clearing soap_stones table...");
+    await pool.query("TRUNCATE TABLE soap_stones RESTART IDENTITY");
 
-    console.log('💾 [6/6] Inserting data into database...');
-    await pool.query(insertQuery, flatValues);
+    console.log("🧱 [5/6] Inserting chunks of data...");
 
-    console.log(`✅ Done! Inserted ${stoneArray.length} stones into soap_stones 🎉`);
+    // --------------------------
+    //  INSERT IN CHUNKS
+    // --------------------------
+    for (let i = 0; i < values.length; i += CHUNK_SIZE) {
+      const chunk = values.slice(i, i + CHUNK_SIZE);
+
+      const placeholders = chunk
+        .map((row, rowIndex) => {
+          const base = rowIndex * columns.length;
+          return `(${columns
+            .map((_, colIndex) => `$${base + colIndex + 1}`)
+            .join(", ")})`;
+        })
+        .join(", ");
+
+      const insertQuery = `
+        INSERT INTO soap_stones (${columns.join(", ")})
+        VALUES ${placeholders}
+      `;
+
+      const flatValues = chunk.flat();
+
+      console.log(
+        `➡️  Inserting chunk ${i / CHUNK_SIZE + 1} (${chunk.length} stones)...`
+      );
+
+      await pool.query(insertQuery, flatValues);
+    }
+
+    console.log(`🎉 DONE! Inserted ${stoneArray.length} stones successfully.`);
   } catch (err) {
-    console.error('❌ Error during process:', err.message);
+    console.error("❌ Error:", err);
+  } finally {
+    await pool.end().catch(() => {});
   }
 };
 
