@@ -1,11 +1,11 @@
 import { defineConfig } from "drizzle-kit";
 
 export default defineConfig({
-  schema: "./db/schema.ts",
+  schema: "./db/**/*.ts",
   out: "./utils/db/migrations",
   dialect: "postgresql",
   dbCredentials: {
-    url: process.env.DATABASE_URL,
+    url: process.env.DATABASE_URL as string,
   },
-  strict: true, // ⬅️ חשוב! יתעלם מטבלאות שלא קיימות ב־schema.ts
+  strict: false, // ⬅️ משנה מ-true ל-false
 });
