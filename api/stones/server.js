@@ -28,24 +28,42 @@ const encrypt = (text) => {
 };
 
 /* =========================================================
-   /api/stones – כל האבנים מטבלת stones (לא selector)
+   /api/stones – כל האבנים מטבלת soap_stones (מיפוי לפורמט הישן)
    ========================================================= */
 app.get("/api/stones", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM stones ORDER BY carat DESC");
+    const result = await pool.query(`
+      SELECT * FROM soap_stones 
+      WHERE sku IS NOT NULL 
+      ORDER BY weight DESC
+    `);
 
+    // מיפוי מ-soap_stones לפורמט של stones (לתאימות עם Frontend)
     const formattedRows = result.rows.map((row) => ({
-      ...row,
-      carat: row.carat ? parseFloat(row.carat) : null,
+      id: row.id,
+      stone_id: row.sku,                    // sku → stone_id
+      carat: row.weight ? parseFloat(row.weight) : null,  // weight → carat
+      clarity: row.clarity || null,
+      shape: row.shape || null,
+      lab: row.lab || null,
+      origin: row.origin || null,
       ratio: row.ratio ? parseFloat(row.ratio) : null,
-      price_per_carat: row.price_per_carat
-        ? parseFloat(row.price_per_carat)
-        : null,
+      price_per_carat: row.price_per_carat ? parseFloat(row.price_per_carat) : null,
       total_price: row.total_price ? parseFloat(row.total_price) : null,
-      measurements1: row.measurements1 || null,
-
-      // ⭐ גם כאן נחזיר category אם קיים
+      measurements1: row.measurements || null,  // measurements → measurements1
+      certificate_number: row.certificate_number || null,
+      cert_image: row.certificate_image || null,  // certificate_image → cert_image
+      video: row.video || null,
+      cert_pdf: null,  // לא קיים ב-soap_stones
       category: row.category || "",
+      // שדות נוספים מ-soap_stones שאולי יעזרו ל-Frontend
+      color: row.color || null,
+      cut: row.cut || null,
+      polish: row.polish || null,
+      symmetry: row.symmetry || null,
+      fluorescence: row.fluorescence || null,
+      image: row.image || null,
+      comment: row.comment || null,
     }));
 
     res.json(formattedRows);
@@ -133,14 +151,14 @@ app.get("/api/soap-stones", async (req, res) => {
 });
 
 /* =========================================================
-   /api/stones/:stone_id – אבן ספציפית
+   /api/stones/:stone_id – אבן ספציפית מ-soap_stones (לפי SKU)
    ========================================================= */
 app.get("/api/stones/:stone_id", async (req, res) => {
   console.log("🚨 /api/stones/:stone_id CALLED");
   try {
     const { stone_id } = req.params;
     const result = await pool.query(
-      "SELECT * FROM stones WHERE stone_id = $1",
+      "SELECT * FROM soap_stones WHERE sku = $1",
       [stone_id]
     );
 
@@ -148,29 +166,59 @@ app.get("/api/stones/:stone_id", async (req, res) => {
       return res.status(404).json({ error: "Stone not found" });
     }
 
-    const stone = result.rows[0];
+    const row = result.rows[0];
 
-    // Convert numeric fields
-    const numericFields = ["carat", "ratio"];
-    numericFields.forEach((field) => {
-      if (stone[field] !== null && stone[field] !== undefined) {
-        stone[field] = parseFloat(stone[field]);
+    // חילוץ מספר תעודה מה-URL (למשל: 2024-087017 מתוך .../2024-087017.pdf)
+    let certificateNumber = row.certificate_number || null;
+    if (!certificateNumber && row.certificate_image) {
+      const match = row.certificate_image.match(/\/([^\/]+)\.pdf$/i);
+      if (match) {
+        certificateNumber = match[1];
       }
-    });
-
-    // Encrypt prices
-    if (stone.price_per_carat !== null && stone.price_per_carat !== undefined) {
-      const raw = stone.price_per_carat;
-      stone.price_per_carat = encrypt(raw.toString());
-      console.log(
-        `💸 Encrypted price_per_carat: ${raw} → ${stone.price_per_carat}`
-      );
     }
 
-    if (stone.total_price !== null && stone.total_price !== undefined) {
-      const raw = stone.total_price;
+    // מיפוי מ-soap_stones לפורמט של stones (לתאימות עם Frontend)
+    const stone = {
+      id: row.id,
+      stone_id: row.sku,                    // sku → stone_id
+      carat: row.weight ? parseFloat(row.weight) : null,  // weight → carat
+      clarity: row.clarity || null,
+      shape: row.shape || null,
+      lab: row.lab || null,
+      origin: row.origin || null,
+      ratio: row.ratio ? parseFloat(row.ratio) : null,
+      measurements1: row.measurements || null,  // measurements → measurements1
+      certificate_number: certificateNumber,   // מספר תעודה (מחולץ מה-URL אם צריך)
+      cert_image: row.certificate_image || null,  // certificate_image → cert_image
+      video: row.video || null,
+      cert_pdf: null,  // לא קיים ב-soap_stones
+      category: row.category || "",
+      // שדות נוספים מ-soap_stones
+      color: row.color || null,
+      cut: row.cut || null,
+      polish: row.polish || null,
+      symmetry: row.symmetry || null,
+      fluorescence: row.fluorescence || null,
+      image: row.image || null,
+      picture: row.image || null,  // Frontend מצפה ל-picture
+      comment: row.comment || null,
+    };
+
+    // Encrypt prices
+    if (row.price_per_carat !== null && row.price_per_carat !== undefined) {
+      const raw = row.price_per_carat;
+      stone.price_per_carat = encrypt(raw.toString());
+      console.log(`💸 Encrypted price_per_carat: ${raw} → ${stone.price_per_carat}`);
+    } else {
+      stone.price_per_carat = null;
+    }
+
+    if (row.total_price !== null && row.total_price !== undefined) {
+      const raw = row.total_price;
       stone.total_price = encrypt(raw.toString());
       console.log(`💰 Encrypted total_price: ${raw} → ${stone.total_price}`);
+    } else {
+      stone.total_price = null;
     }
 
     res.json(stone);
