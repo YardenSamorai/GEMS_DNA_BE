@@ -37,6 +37,10 @@ const run = async () => {
         return Number.isFinite(n) ? n : null;
       };
 
+      // 💰 הכפלת מחירים x2
+      const pricePerCarat = safeNumber(stone.PricePerCarat);
+      const totalPrice = safeNumber(stone.TotalPrice);
+
       return [
         stone.Category || null,
         stone.SKU || null,
@@ -46,10 +50,10 @@ const run = async () => {
         stone.Clarity || null,
         stone.Lab || null,
         stone.Fluorescence || null,
-        safeNumber(stone.PricePerCarat),
+        pricePerCarat !== null ? pricePerCarat * 2 : null,  // 💰 x2
         safeNumber(stone.RapPrice),
         safeNumber(stone["Rap.Price"]),
-        safeNumber(stone.TotalPrice),
+        totalPrice !== null ? totalPrice * 2 : null,        // 💰 x2
         stone.Location || null,
         stone.Branch || null,
         stone.Image || null,
