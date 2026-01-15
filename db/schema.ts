@@ -1,4 +1,4 @@
-import { pgTable, serial, text, numeric, varchar, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, serial, text, numeric, varchar, timestamp, integer } from "drizzle-orm/pg-core";
 
 /* ========== stones ========== */
 
@@ -108,4 +108,22 @@ export const soapStones = pgTable("soap_stones", {
 
   rawXml: text("raw_xml"),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+/* ========== tags (client tags) ========== */
+
+export const tags = pgTable("tags", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  color: text("color").notNull().default("#10b981"), // emerald-500 default
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+/* ========== stone_tags (many-to-many relationship) ========== */
+
+export const stoneTags = pgTable("stone_tags", {
+  id: serial("id").primaryKey(),
+  stoneSku: text("stone_sku").notNull(),
+  tagId: integer("tag_id").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
 });

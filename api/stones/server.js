@@ -19,6 +19,7 @@ const pool = new Pool({
 
 console.log("🟢 Backend is running — This is the correct file.");
 app.use(cors());
+app.use(express.json());
 
 /* =========================================================
    Encryption helper
@@ -266,6 +267,224 @@ app.get("/api/jewelry/:modelNumber", async (req, res) => {
     res.json(item);
   } catch (error) {
     console.error("❌ Error fetching jewelry item:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   /api/tags – ניהול תגיות לקוחות
+   ========================================================= */
+
+// Get all tags
+app.get("/api/tags", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT t.*, COUNT(st.id) as stone_count
+      FROM tags t
+      LEFT JOIN stone_tags st ON t.id = st.tag_id
+      GROUP BY t.id
+      ORDER BY t.name ASC
+    `);
+    res.json(result.rows);
+  } catch (error) {
+    console.error("❌ Error fetching tags:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Create a new tag
+app.post("/api/tags", async (req, res) => {
+  try {
+    const { name, color } = req.body;
+    
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: "Tag name is required" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO tags (name, color) VALUES ($1, $2) RETURNING *`,
+      [name.trim(), color || "#10b981"]
+    );
+    
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    if (error.code === "23505") { // unique_violation
+      return res.status(409).json({ error: "Tag already exists" });
+    }
+    console.error("❌ Error creating tag:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Update a tag
+app.put("/api/tags/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, color } = req.body;
+    
+    const result = await pool.query(
+      `UPDATE tags SET name = COALESCE($1, name), color = COALESCE($2, color) WHERE id = $3 RETURNING *`,
+      [name?.trim(), color, id]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Tag not found" });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("❌ Error updating tag:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Delete a tag
+app.delete("/api/tags/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Delete associated stone_tags first
+    await pool.query(`DELETE FROM stone_tags WHERE tag_id = $1`, [id]);
+    
+    const result = await pool.query(`DELETE FROM tags WHERE id = $1 RETURNING *`, [id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Tag not found" });
+    }
+    
+    res.json({ message: "Tag deleted successfully" });
+  } catch (error) {
+    console.error("❌ Error deleting tag:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   /api/stone-tags – שיוך תגיות לאבנים
+   ========================================================= */
+
+// Get tags for a specific stone
+app.get("/api/stones/:sku/tags", async (req, res) => {
+  try {
+    const { sku } = req.params;
+    
+    const result = await pool.query(`
+      SELECT t.*
+      FROM tags t
+      INNER JOIN stone_tags st ON t.id = st.tag_id
+      WHERE st.stone_sku = $1
+      ORDER BY t.name ASC
+    `, [sku]);
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error("❌ Error fetching stone tags:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Add tag to a stone
+app.post("/api/stones/:sku/tags", async (req, res) => {
+  try {
+    const { sku } = req.params;
+    const { tagId } = req.body;
+    
+    if (!tagId) {
+      return res.status(400).json({ error: "Tag ID is required" });
+    }
+
+    // Check if already exists
+    const existing = await pool.query(
+      `SELECT * FROM stone_tags WHERE stone_sku = $1 AND tag_id = $2`,
+      [sku, tagId]
+    );
+    
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: "Tag already assigned to this stone" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO stone_tags (stone_sku, tag_id) VALUES ($1, $2) RETURNING *`,
+      [sku, tagId]
+    );
+    
+    // Return the full tag info
+    const tag = await pool.query(`SELECT * FROM tags WHERE id = $1`, [tagId]);
+    
+    res.status(201).json(tag.rows[0]);
+  } catch (error) {
+    console.error("❌ Error adding tag to stone:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Remove tag from a stone
+app.delete("/api/stones/:sku/tags/:tagId", async (req, res) => {
+  try {
+    const { sku, tagId } = req.params;
+    
+    const result = await pool.query(
+      `DELETE FROM stone_tags WHERE stone_sku = $1 AND tag_id = $2 RETURNING *`,
+      [sku, tagId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Tag assignment not found" });
+    }
+    
+    res.json({ message: "Tag removed from stone" });
+  } catch (error) {
+    console.error("❌ Error removing tag from stone:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get all stones with a specific tag
+app.get("/api/tags/:id/stones", async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const result = await pool.query(`
+      SELECT ss.*
+      FROM soap_stones ss
+      INNER JOIN stone_tags st ON ss.sku = st.stone_sku
+      WHERE st.tag_id = $1
+      ORDER BY ss.weight DESC
+    `, [id]);
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error("❌ Error fetching stones by tag:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get all stone-tag mappings (for frontend to load all at once)
+app.get("/api/stone-tags", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT st.stone_sku, t.*
+      FROM stone_tags st
+      INNER JOIN tags t ON st.tag_id = t.id
+      ORDER BY st.stone_sku
+    `);
+    
+    // Group by stone_sku
+    const grouped = {};
+    result.rows.forEach(row => {
+      if (!grouped[row.stone_sku]) {
+        grouped[row.stone_sku] = [];
+      }
+      grouped[row.stone_sku].push({
+        id: row.id,
+        name: row.name,
+        color: row.color
+      });
+    });
+    
+    res.json(grouped);
+  } catch (error) {
+    console.error("❌ Error fetching stone tags:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
