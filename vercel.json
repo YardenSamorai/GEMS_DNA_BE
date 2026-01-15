@@ -8,6 +8,18 @@
     ],
     "routes": [
       {
+        "src": "/api/tags",
+        "dest": "backend/api/stones/server.js"
+      },
+      {
+        "src": "/api/tags/(.*)",
+        "dest": "backend/api/stones/server.js"
+      },
+      {
+        "src": "/api/stone-tags",
+        "dest": "backend/api/stones/server.js"
+      },
+      {
         "src": "/api/stones",
         "dest": "backend/api/stones/server.js"
       },
