@@ -8,6 +8,10 @@
     ],
     "routes": [
       {
+        "src": "/api/soap-stones",
+        "dest": "backend/api/stones/server.js"
+      },
+      {
         "src": "/api/tags",
         "dest": "backend/api/stones/server.js"
       },
