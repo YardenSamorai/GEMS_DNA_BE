@@ -141,6 +141,7 @@ app.get("/api/soap-stones", async (req, res) => {
         clarity: row.clarity || "",
         luster: row.luster || "",
         fluorescence: row.fluorescence || "",
+        location: row.branch || "",  // branch מהDB מוצג כ-Location בUI
       };
     });
 
