@@ -2,34 +2,34 @@
     "version": 2,
     "builds": [
       {
-        "src": "backend/api/stones/server.js",
+        "src": "api/stones/server.js",
         "use": "@vercel/node"
       }
     ],
     "routes": [
       {
         "src": "/api/soap-stones",
-        "dest": "backend/api/stones/server.js"
+        "dest": "api/stones/server.js"
       },
       {
         "src": "/api/tags",
-        "dest": "backend/api/stones/server.js"
+        "dest": "api/stones/server.js"
       },
       {
         "src": "/api/tags/(.*)",
-        "dest": "backend/api/stones/server.js"
+        "dest": "api/stones/server.js"
       },
       {
         "src": "/api/stone-tags",
-        "dest": "backend/api/stones/server.js"
+        "dest": "api/stones/server.js"
       },
       {
         "src": "/api/stones",
-        "dest": "backend/api/stones/server.js"
+        "dest": "api/stones/server.js"
       },
       {
         "src": "/api/stones/(.*)",
-        "dest": "backend/api/stones/server.js"
+        "dest": "api/stones/server.js"
       }
     ]
   }
