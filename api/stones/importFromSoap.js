@@ -6,6 +6,24 @@ const { pool } = require("../../db/client");
 
 const CHUNK_SIZE = 300; // ⭐ הכי יציב
 
+// Branch mapping for consistent location names
+const BRANCH_MAP = {
+  HK: "Hong Kong",
+  HKG: "Hong Kong",
+  IL: "Israel",
+  ISR: "Israel",
+  NY: "New York",
+  NYC: "New York",
+  LA: "Los Angeles",
+};
+
+// Helper function to map branch
+const mapBranch = (branch) => {
+  if (!branch) return null;
+  const upperBranch = branch.toUpperCase().trim();
+  return BRANCH_MAP[upperBranch] || branch; // Return mapped value or original if not found
+};
+
 const run = async () => {
   try {
     console.log("🚀 [1/6] Fetching SOAP data...");
@@ -55,7 +73,7 @@ const run = async () => {
         safeNumber(stone["Rap.Price"]),
         totalPrice !== null ? totalPrice * 2 : null,        // 💰 x2
         stone.Location || null,
-        stone.Branch || null,
+        mapBranch(stone.Branch),  // 🗺️ Map branch to consistent names
         stone.Image || null,
         stone.additional_pictures || null,
         stone.Video || null,
