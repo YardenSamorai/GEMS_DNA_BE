@@ -48,8 +48,18 @@ const BRANCH_MAP = {
 // Helper function to map branch
 const mapBranch = (branch) => {
   if (!branch) return null;
-  const upperBranch = branch.toUpperCase().trim();
-  return BRANCH_MAP[upperBranch] || branch; // Return mapped value or original if not found
+  
+  // Clean and trim
+  const cleanBranch = branch.trim();
+  
+  // Validate: if it looks like a URL or is too long, it's probably wrong data
+  if (cleanBranch.includes('http://') || cleanBranch.includes('https://') || cleanBranch.length > 20) {
+    console.warn(`⚠️  Invalid branch value detected (likely URL or corrupted data): "${cleanBranch}"`);
+    return null;
+  }
+  
+  const upperBranch = cleanBranch.toUpperCase();
+  return BRANCH_MAP[upperBranch] || cleanBranch; // Return mapped value or original if not found
 };
 
 const run = async () => {
