@@ -477,6 +477,54 @@ app.delete("/api/stones/:sku/tags/:tagId", async (req, res) => {
 });
 
 /* =========================================================
+   /api/image-proxy – Proxy for loading images (bypass CORS)
+   ========================================================= */
+const fetch = require('node-fetch');
+
+app.get("/api/image-proxy", async (req, res) => {
+  try {
+    const { url } = req.query;
+    
+    if (!url) {
+      return res.status(400).json({ error: "URL parameter required" });
+    }
+
+    console.log("📷 Proxying image:", url);
+
+    // Fetch the image from the external URL
+    const response = await fetch(url, {
+      timeout: 15000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'image/*,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      }
+    });
+
+    if (!response.ok) {
+      console.log("❌ Image fetch failed:", response.status);
+      return res.status(response.status).json({ error: "Failed to fetch image" });
+    }
+
+    // Get content type
+    const contentType = response.headers.get('content-type') || 'image/jpeg';
+    
+    // Get the image buffer
+    const buffer = await response.buffer();
+    
+    // Convert to base64
+    const base64 = buffer.toString('base64');
+    const dataUri = `data:${contentType};base64,${base64}`;
+    
+    console.log("✅ Image proxied successfully, size:", buffer.length);
+    res.json({ image: dataUri });
+  } catch (error) {
+    console.error("❌ Error proxying image:", error.message);
+    res.status(500).json({ error: "Failed to proxy image: " + error.message });
+  }
+});
+
+/* =========================================================
    Start server
    ========================================================= */
 app.listen(port, () => {
