@@ -8,6 +8,10 @@
     ],
     "routes": [
       {
+        "src": "/api/sync",
+        "dest": "api/stones/server.js"
+      },
+      {
         "src": "/api/soap-stones",
         "dest": "api/stones/server.js"
       },

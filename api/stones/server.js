@@ -4,6 +4,8 @@ const { Pool } = require("pg");
 const dotenv = require("dotenv");
 const path = require("path");
 const CryptoJS = require("crypto-js");
+const { fetchSoapData } = require("../../utils/soapClient");
+const { parseXml } = require("../../utils/xmlParser");
 
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -502,6 +504,142 @@ app.get("/api/stone-tags", async (req, res) => {
   } catch (error) {
     console.error("❌ Error fetching stone tags:", error);
     res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   /api/sync - Sync SOAP data to database
+   ========================================================= */
+app.post("/api/sync", async (req, res) => {
+  console.log("🔄 Starting SOAP sync...");
+  
+  try {
+    // Step 1: Fetch SOAP data
+    console.log("🚀 [1/5] Fetching SOAP data...");
+    const rawXml = await fetchSoapData();
+    
+    if (!rawXml) {
+      return res.status(500).json({ success: false, error: "No XML received from SOAP API" });
+    }
+
+    // Step 2: Parse XML
+    console.log("📦 [2/5] Parsing XML...");
+    const parsed = await parseXml(rawXml);
+    const stones = parsed?.Stock?.Stone;
+
+    if (!stones) {
+      return res.status(500).json({ success: false, error: "No stones found in XML" });
+    }
+
+    const stoneArray = Array.isArray(stones) ? stones : [stones];
+    console.log(`📊 [3/5] Total stones found: ${stoneArray.length}`);
+
+    // Step 3: Build values for each row
+    const safeNumber = (value) => {
+      const n = parseFloat(value);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const values = stoneArray.map((stone) => {
+      const pricePerCarat = safeNumber(stone.PricePerCarat);
+      const totalPrice = safeNumber(stone.TotalPrice);
+
+      return [
+        stone.Category || null,
+        stone.SKU || null,
+        stone.Shape || null,
+        safeNumber(stone.Weight),
+        stone.Color || null,
+        stone.Clarity || null,
+        stone.Lab || null,
+        stone.Fluorescence || null,
+        pricePerCarat !== null ? pricePerCarat * 2 : null,
+        safeNumber(stone.RapPrice),
+        safeNumber(stone["Rap.Price"]),
+        totalPrice !== null ? totalPrice * 2 : null,
+        stone.Location || null,
+        stone.Branch || null,
+        stone.Image || null,
+        stone.additional_pictures || null,
+        stone.Video || null,
+        stone.additional_videos || null,
+        stone.Certificateimage || null,
+        stone.CertificateNumber || null,
+        stone.certificateImageJPG || null,
+        stone.Cut || null,
+        stone.Polish || null,
+        stone.Symmetry || null,
+        safeNumber(stone.Table),
+        safeNumber(stone.Depth),
+        safeNumber(stone.ratio),
+        stone["Measurements-delimiter"] || null,
+        stone.fancy_intensity || null,
+        stone.fancy_color || null,
+        stone.fancy_overtone || null,
+        stone.fancy_color_2 || null,
+        stone.fancy_overtone_2 || null,
+        stone.PairStone || null,
+        stone.home_page || null,
+        stone.TradeShow || null,
+        stone.Comment || null,
+        stone.Type || null,
+        stone["Cert.Comments"] || null,
+        stone.Origin || null,
+        null,
+      ];
+    });
+
+    const columns = [
+      "category", "sku", "shape", "weight", "color", "clarity", "lab",
+      "fluorescence", "price_per_carat", "rap_price", "rap_list_price",
+      "total_price", "location", "branch", "image", "additional_pictures",
+      "video", "additional_videos", "certificate_image", "certificate_number",
+      "certificate_image_jpg", "cut", "polish", "symmetry", "table_percent",
+      "depth_percent", "ratio", "measurements", "fancy_intensity",
+      "fancy_color", "fancy_overtone", "fancy_color_2", "fancy_overtone_2",
+      "pair_stone", "home_page", "trade_show", "comment", "type",
+      "cert_comments", "origin", "raw_xml",
+    ];
+
+    // Step 4: Clear table and insert data
+    console.log("🧹 [4/5] Clearing soap_stones table...");
+    await pool.query("TRUNCATE TABLE soap_stones RESTART IDENTITY");
+
+    console.log("🧱 [5/5] Inserting data in chunks...");
+    const CHUNK_SIZE = 300;
+    
+    for (let i = 0; i < values.length; i += CHUNK_SIZE) {
+      const chunk = values.slice(i, i + CHUNK_SIZE);
+
+      const placeholders = chunk
+        .map((row, rowIndex) => {
+          const base = rowIndex * columns.length;
+          return `(${columns.map((_, colIndex) => `$${base + colIndex + 1}`).join(", ")})`;
+        })
+        .join(", ");
+
+      const insertQuery = `INSERT INTO soap_stones (${columns.join(", ")}) VALUES ${placeholders}`;
+      const flatValues = chunk.flat();
+
+      await pool.query(insertQuery, flatValues);
+      console.log(`➡️ Inserted chunk ${Math.floor(i / CHUNK_SIZE) + 1}`);
+    }
+
+    console.log(`🎉 Sync complete! Inserted ${stoneArray.length} stones.`);
+    
+    res.json({
+      success: true,
+      message: `Successfully synced ${stoneArray.length} stones`,
+      count: stoneArray.length,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error("❌ Sync error:", error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message || "Sync failed" 
+    });
   }
 });
 
