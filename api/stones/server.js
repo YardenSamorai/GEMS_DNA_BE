@@ -163,6 +163,7 @@ app.get("/api/stones/:stone_id", async (req, res) => {
       id: row.id,
       stone_id: row.sku,
       sku: row.sku,
+      category: row.category || null, // For determining stone type
       shape: row.shape || null,
       carat: row.weight ? parseFloat(row.weight) : null,
       clarity: row.clarity || null,
@@ -175,6 +176,7 @@ app.get("/api/stones/:stone_id", async (req, res) => {
       video: row.video || null,
       certificate_number: row.certificate_number || null,
       certificate_url: row.certificate_image || null,
+      treatment: row.comment || null, // For emeralds
       
       // Diamond-specific fields
       cut: row.cut || null,
