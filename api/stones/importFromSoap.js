@@ -36,6 +36,7 @@ const BRANCH_MAP = {
   VG: "New York",
   JG: "New York",
   JV: "New York",
+  EY: "New York",
   
   // Legacy mappings (for backwards compatibility)
   HKG: "Hong Kong",
