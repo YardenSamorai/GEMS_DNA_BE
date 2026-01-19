@@ -8,13 +8,39 @@ const CHUNK_SIZE = 300; // ⭐ הכי יציב
 
 // Branch mapping for consistent location names
 const BRANCH_MAP = {
-  HK: "Hong Kong",
-  HKG: "Hong Kong",
+  // Israel
   IL: "Israel",
-  ISR: "Israel",
-  NY: "New York",
-  NYC: "New York",
+  EM: "Israel",
+  JI: "Israel",
+  
+  // Los Angeles
   LA: "Los Angeles",
+  EL: "Los Angeles",
+  
+  // Hong Kong
+  HK: "Hong Kong",
+  ES: "Hong Kong",
+  HS: "Hong Kong",
+  JH: "Hong Kong",
+  JS: "Hong Kong",
+  
+  // New York
+  NY: "New York",
+  EN: "New York",
+  ET: "New York",
+  DT: "New York",
+  JT: "New York",
+  EG: "New York",
+  EV: "New York",
+  GN: "New York",
+  VG: "New York",
+  JG: "New York",
+  JV: "New York",
+  
+  // Legacy mappings (for backwards compatibility)
+  HKG: "Hong Kong",
+  ISR: "Israel",
+  NYC: "New York",
 };
 
 // Helper function to map branch
