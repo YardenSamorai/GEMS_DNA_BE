@@ -134,14 +134,14 @@ app.get("/api/soap-stones", async (req, res) => {
 });
 
 /* =========================================================
-   /api/stones/:stone_id – אבן ספציפית
+   /api/stones/:stone_id – אבן ספציפית (מ-soap_stones)
    ========================================================= */
 app.get("/api/stones/:stone_id", async (req, res) => {
   console.log("🚨 /api/stones/:stone_id CALLED");
   try {
     const { stone_id } = req.params;
     const result = await pool.query(
-      "SELECT * FROM stones WHERE stone_id = $1",
+      "SELECT * FROM soap_stones WHERE sku = $1",
       [stone_id]
     );
 
@@ -149,29 +149,63 @@ app.get("/api/stones/:stone_id", async (req, res) => {
       return res.status(404).json({ error: "Stone not found" });
     }
 
-    const stone = result.rows[0];
+    const row = result.rows[0];
+    
+    // Select main image
+    let imageUrl = row.image;
+    if (!imageUrl && row.additional_pictures) {
+      const first = row.additional_pictures.split(";")[0];
+      imageUrl = first ? first.trim() : null;
+    }
 
-    // Convert numeric fields
-    const numericFields = ["carat", "ratio"];
-    numericFields.forEach((field) => {
-      if (stone[field] !== null && stone[field] !== undefined) {
-        stone[field] = parseFloat(stone[field]);
-      }
-    });
+    // Map to frontend format (compatible with old format)
+    const stone = {
+      id: row.id,
+      stone_id: row.sku,
+      sku: row.sku,
+      shape: row.shape || null,
+      carat: row.weight ? parseFloat(row.weight) : null,
+      clarity: row.clarity || null,
+      color: row.color || null,
+      lab: row.lab || null,
+      origin: row.origin || null,
+      ratio: row.ratio ? parseFloat(row.ratio) : null,
+      measurements1: row.measurements || null,
+      picture: imageUrl,
+      video: row.video || null,
+      certificate_number: row.certificate_number || null,
+      certificate_url: row.certificate_image || null,
+      
+      // Diamond-specific fields
+      cut: row.cut || null,
+      polish: row.polish || null,
+      symmetry: row.symmetry || null,
+      table_percent: row.table_percent ? parseFloat(row.table_percent) : null,
+      depth_percent: row.depth_percent ? parseFloat(row.depth_percent) : null,
+      fluorescence: row.fluorescence || null,
+      rap_price: row.rap_price ? parseFloat(row.rap_price) : null,
+      
+      // Fancy-specific fields
+      fancy_intensity: row.fancy_intensity || null,
+      fancy_color: row.fancy_color || null,
+      fancy_overtone: row.fancy_overtone || null,
+      fancy_color_2: row.fancy_color_2 || null,
+      fancy_overtone_2: row.fancy_overtone_2 || null,
+      
+      // Prices (will be encrypted below)
+      price_per_carat: row.price_per_carat ? parseFloat(row.price_per_carat) : null,
+      total_price: row.total_price ? parseFloat(row.total_price) : null,
+    };
 
     // Encrypt prices
     if (stone.price_per_carat !== null && stone.price_per_carat !== undefined) {
       const raw = stone.price_per_carat;
       stone.price_per_carat = encrypt(raw.toString());
-      console.log(
-        `💸 Encrypted price_per_carat: ${raw} → ${stone.price_per_carat}`
-      );
     }
 
     if (stone.total_price !== null && stone.total_price !== undefined) {
       const raw = stone.total_price;
       stone.total_price = encrypt(raw.toString());
-      console.log(`💰 Encrypted total_price: ${raw} → ${stone.total_price}`);
     }
 
     res.json(stone);
