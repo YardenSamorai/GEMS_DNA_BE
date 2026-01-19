@@ -8,6 +8,10 @@
     ],
     "routes": [
       {
+        "src": "/api/image-proxy",
+        "dest": "api/stones/server.js"
+      },
+      {
         "src": "/api/sync/preview",
         "dest": "api/stones/server.js"
       },
