@@ -123,6 +123,21 @@ app.get("/api/soap-stones", async (req, res) => {
         luster: row.luster || "",
         fluorescence: row.fluorescence || "",
         location: row.branch || null,  // branch מהDB מוצג כ-Location בUI (already mapped)
+        
+        // Diamond specific fields
+        cut: row.cut || "",
+        polish: row.polish || "",
+        symmetry: row.symmetry || "",
+        table_percent: row.table_percent !== null && row.table_percent !== undefined ? Number(row.table_percent) : null,
+        depth_percent: row.depth_percent !== null && row.depth_percent !== undefined ? Number(row.depth_percent) : null,
+        rap_price: row.rap_price !== null && row.rap_price !== undefined ? Number(row.rap_price) : null,
+        
+        // Fancy diamond specific fields
+        fancy_intensity: row.fancy_intensity || "",
+        fancy_color: row.fancy_color || "",
+        fancy_overtone: row.fancy_overtone || "",
+        fancy_color_2: row.fancy_color_2 || "",
+        fancy_overtone_2: row.fancy_overtone_2 || "",
       };
     });
 
