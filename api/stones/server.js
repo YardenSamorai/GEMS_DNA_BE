@@ -142,6 +142,21 @@ app.get("/api/soap-stones", async (req, res) => {
         luster: row.luster || "",
         fluorescence: row.fluorescence || "",
         location: row.branch || "",  // branch מהDB מוצג כ-Location בUI
+        
+        // שדות ספציפיים ליהלומים
+        cut: row.cut || "",
+        polish: row.polish || "",
+        symmetry: row.symmetry || "",
+        tablePercent: row.table_percent ? Number(row.table_percent) : (row.table ? Number(row.table) : null),
+        depthPercent: row.depth_percent ? Number(row.depth_percent) : (row.depth ? Number(row.depth) : null),
+        rapPrice: row.rap_price ? Number(row.rap_price) : null,
+        
+        // שדות ספציפיים ל-Fancy
+        fancyIntensity: row.fancy_intensity || "",
+        fancyColor: row.fancy_color || "",
+        fancyOvertone: row.fancy_overtone || "",
+        fancyColor2: row.fancy_color_2 || "",
+        fancyOvertone2: row.fancy_overtone_2 || "",
       };
     });
 
