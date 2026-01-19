@@ -23,6 +23,7 @@ const BRANCH_MAP = {
   HS: "Hong Kong",
   JH: "Hong Kong",
   JS: "Hong Kong",
+  EH: "Hong Kong",
   
   // New York
   NY: "New York",
