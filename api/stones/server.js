@@ -508,6 +508,150 @@ app.get("/api/stone-tags", async (req, res) => {
 });
 
 /* =========================================================
+   /api/sync/preview - Preview SOAP changes before sync
+   ========================================================= */
+app.get("/api/sync/preview", async (req, res) => {
+  console.log("🔍 Fetching SOAP preview...");
+  
+  try {
+    // Fetch current data from DB
+    const currentResult = await pool.query("SELECT sku, weight, price_per_carat, total_price, color, clarity, location, branch FROM soap_stones WHERE sku IS NOT NULL");
+    const currentData = {};
+    currentResult.rows.forEach(row => {
+      currentData[row.sku] = row;
+    });
+
+    // Fetch new SOAP data
+    const rawXml = await fetchSoapData();
+    if (!rawXml) {
+      return res.status(500).json({ success: false, error: "No XML received from SOAP API" });
+    }
+
+    const parsed = await parseXml(rawXml);
+    const stones = parsed?.Stock?.Stone;
+    if (!stones) {
+      return res.status(500).json({ success: false, error: "No stones found in XML" });
+    }
+
+    const stoneArray = Array.isArray(stones) ? stones : [stones];
+    
+    const safeNumber = (value) => {
+      const n = parseFloat(value);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    // Compare and find changes
+    const changes = {
+      new: [],      // New stones not in DB
+      updated: [],  // Stones with changed values
+      removed: [],  // Stones in DB but not in SOAP
+      unchanged: 0  // Count of unchanged stones
+    };
+
+    const soapSkus = new Set();
+
+    stoneArray.forEach(stone => {
+      const sku = stone.SKU;
+      if (!sku) return;
+      
+      soapSkus.add(sku);
+      
+      const soapData = {
+        sku,
+        weight: safeNumber(stone.Weight),
+        price_per_carat: safeNumber(stone.PricePerCarat) * 2, // x2 multiplier
+        total_price: safeNumber(stone.TotalPrice) * 2,        // x2 multiplier
+        color: stone.Color || null,
+        clarity: stone.Clarity || null,
+        location: stone.Location || null,
+        branch: stone.Branch || null
+      };
+
+      const current = currentData[sku];
+      
+      if (!current) {
+        // New stone
+        changes.new.push({
+          sku,
+          fields: soapData
+        });
+      } else {
+        // Check for updates
+        const changedFields = {};
+        let hasChanges = false;
+
+        if (soapData.weight !== parseFloat(current.weight)) {
+          changedFields.weight = { old: parseFloat(current.weight), new: soapData.weight };
+          hasChanges = true;
+        }
+        if (soapData.price_per_carat !== parseFloat(current.price_per_carat)) {
+          changedFields.price_per_carat = { old: parseFloat(current.price_per_carat), new: soapData.price_per_carat };
+          hasChanges = true;
+        }
+        if (soapData.total_price !== parseFloat(current.total_price)) {
+          changedFields.total_price = { old: parseFloat(current.total_price), new: soapData.total_price };
+          hasChanges = true;
+        }
+        if (soapData.color !== current.color) {
+          changedFields.color = { old: current.color, new: soapData.color };
+          hasChanges = true;
+        }
+        if (soapData.clarity !== current.clarity) {
+          changedFields.clarity = { old: current.clarity, new: soapData.clarity };
+          hasChanges = true;
+        }
+        if (soapData.branch !== current.branch) {
+          changedFields.branch = { old: current.branch, new: soapData.branch };
+          hasChanges = true;
+        }
+
+        if (hasChanges) {
+          changes.updated.push({ sku, changes: changedFields });
+        } else {
+          changes.unchanged++;
+        }
+      }
+    });
+
+    // Find removed stones (in DB but not in SOAP)
+    Object.keys(currentData).forEach(sku => {
+      if (!soapSkus.has(sku)) {
+        changes.removed.push({
+          sku,
+          fields: currentData[sku]
+        });
+      }
+    });
+
+    res.json({
+      success: true,
+      summary: {
+        totalInSoap: stoneArray.length,
+        totalInDb: currentResult.rows.length,
+        newStones: changes.new.length,
+        updatedStones: changes.updated.length,
+        removedStones: changes.removed.length,
+        unchangedStones: changes.unchanged
+      },
+      changes: {
+        new: changes.new.slice(0, 50),       // Limit to first 50 for preview
+        updated: changes.updated.slice(0, 50),
+        removed: changes.removed.slice(0, 50)
+      },
+      hasMore: {
+        new: changes.new.length > 50,
+        updated: changes.updated.length > 50,
+        removed: changes.removed.length > 50
+      }
+    });
+
+  } catch (error) {
+    console.error("❌ Preview error:", error);
+    res.status(500).json({ success: false, error: error.message || "Preview failed" });
+  }
+});
+
+/* =========================================================
    /api/sync - Sync SOAP data to database
    ========================================================= */
 app.post("/api/sync", async (req, res) => {
