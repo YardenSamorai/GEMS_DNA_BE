@@ -158,6 +158,16 @@ app.get("/api/stones/:stone_id", async (req, res) => {
       imageUrl = first ? first.trim() : null;
     }
 
+    // Extract certificate number from URL if not provided
+    let certNumber = row.certificate_number || null;
+    if (!certNumber && row.certificate_image) {
+      // Extract from URL like: https://app.barakdiamonds.com/Gemstones/output/Certificates/2023-107020.pdf
+      const match = row.certificate_image.match(/\/([^\/]+)\.pdf$/i);
+      if (match) {
+        certNumber = match[1];
+      }
+    }
+
     // Map to frontend format (compatible with old format)
     const stone = {
       id: row.id,
@@ -174,7 +184,7 @@ app.get("/api/stones/:stone_id", async (req, res) => {
       measurements1: row.measurements || null,
       picture: imageUrl,
       video: row.video || null,
-      certificate_number: row.certificate_number || null,
+      certificate_number: certNumber,
       certificate_url: row.certificate_image || null,
       treatment: row.comment || null, // For emeralds
       
