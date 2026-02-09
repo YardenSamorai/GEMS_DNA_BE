@@ -138,6 +138,9 @@ app.get("/api/soap-stones", async (req, res) => {
         fancyOvertone: row.fancy_overtone || "",
         fancyColor2: row.fancy_color_2 || "",
         fancyOvertone2: row.fancy_overtone_2 || "",
+        
+        // Pair stone
+        pairSku: row.pair_stone || null,
       };
     });
 
@@ -218,6 +221,9 @@ app.get("/api/stones/:stone_id", async (req, res) => {
       fancy_overtone: row.fancy_overtone || null,
       fancy_color_2: row.fancy_color_2 || null,
       fancy_overtone_2: row.fancy_overtone_2 || null,
+      
+      // Pair stone
+      pair_stone: row.pair_stone || null,
       
       // Prices (will be encrypted below)
       price_per_carat: row.price_per_carat ? parseFloat(row.price_per_carat) : null,
