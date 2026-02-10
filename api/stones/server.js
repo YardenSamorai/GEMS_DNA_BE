@@ -483,6 +483,46 @@ app.delete("/api/stones/:sku/tags/:tagId", async (req, res) => {
 });
 
 /* =========================================================
+   /api/sync – Trigger SOAP data sync
+   ========================================================= */
+const { exec } = require('child_process');
+const path = require('path');
+
+app.post("/api/sync", async (req, res) => {
+  try {
+    console.log("🔄 SOAP sync requested via API");
+    
+    // Run the import script in the background
+    const scriptPath = path.join(__dirname, 'importFromSoap.js');
+    const command = `node "${scriptPath}"`;
+    
+    // Return immediately (sync runs in background)
+    res.json({ 
+      success: true, 
+      message: "Sync started. This may take 30-60 seconds.",
+      status: "processing"
+    });
+    
+    // Run sync in background
+    exec(command, { cwd: path.join(__dirname, '../..') }, (error, stdout, stderr) => {
+      if (error) {
+        console.error("❌ Sync error:", error);
+        console.error("Stderr:", stderr);
+        return;
+      }
+      
+      console.log("✅ Sync completed:", stdout);
+    });
+  } catch (error) {
+    console.error("❌ Error starting sync:", error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+/* =========================================================
    /api/image-proxy – Proxy for loading images (bypass CORS)
    ========================================================= */
 const fetch = require('node-fetch');
