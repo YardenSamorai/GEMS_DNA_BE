@@ -67,32 +67,39 @@ const mapBranch = (branch) => {
  * @param {object} options
  * @param {object} options.dbPool - Optional database pool to use (if called from server)
  * @param {boolean} options.closePool - Whether to close the pool when done (default: true)
+ * @param {function} options.onProgress - Optional progress callback: ({ phase, progress, detail, totalStones, processedStones })
  * @returns {Promise<{success: boolean, count: number, message: string}>}
  */
 const run = async (options = {}) => {
   const dbPool = options.dbPool || pool;
   const closePool = options.closePool !== undefined ? options.closePool : true;
+  const onProgress = options.onProgress || (() => {});
   
   try {
+    onProgress({ phase: 'connecting', progress: 5, detail: 'Connecting to SOAP API...', totalStones: 0, processedStones: 0 });
     console.log("🚀 [1/6] Fetching SOAP data...");
     const rawXml = await fetchSoapData();
 
     if (!rawXml) {
       console.log("❌ No XML received");
+      onProgress({ phase: 'error', progress: 0, detail: 'No XML received from SOAP API', totalStones: 0, processedStones: 0 });
       return { success: false, count: 0, message: "No XML received from SOAP API" };
     }
 
+    onProgress({ phase: 'parsing', progress: 20, detail: 'Parsing stone data...', totalStones: 0, processedStones: 0 });
     console.log("📦 [2/6] Parsing XML...");
     const parsed = await parseXml(rawXml);
     const stones = parsed?.Stock?.Stone;
 
     if (!stones) {
       console.log("❌ No <Stone> elements found");
+      onProgress({ phase: 'error', progress: 0, detail: 'No stone data found in response', totalStones: 0, processedStones: 0 });
       return { success: false, count: 0, message: "No stone data found in SOAP response" };
     }
 
     const stoneArray = Array.isArray(stones) ? stones : [stones];
     console.log(`📊 [3/6] Total stones found: ${stoneArray.length}`);
+    onProgress({ phase: 'processing', progress: 30, detail: `Found ${stoneArray.length} stones, processing...`, totalStones: stoneArray.length, processedStones: 0 });
 
     // --------------------------
     // BUILD VALUES FOR EACH ROW
@@ -165,16 +172,20 @@ const run = async (options = {}) => {
       "cert_comments", "origin", "raw_xml",
     ];
 
+    onProgress({ phase: 'clearing', progress: 35, detail: 'Clearing old data...', totalStones: stoneArray.length, processedStones: 0 });
     console.log("🧹 [4/6] Clearing soap_stones table...");
     await dbPool.query("TRUNCATE TABLE soap_stones RESTART IDENTITY");
 
     console.log("🧱 [5/6] Inserting chunks of data...");
+    const totalChunks = Math.ceil(values.length / CHUNK_SIZE);
+    let processedStones = 0;
 
     // --------------------------
     //  INSERT IN CHUNKS
     // --------------------------
     for (let i = 0; i < values.length; i += CHUNK_SIZE) {
       const chunk = values.slice(i, i + CHUNK_SIZE);
+      const chunkIndex = Math.floor(i / CHUNK_SIZE) + 1;
 
       const placeholders = chunk
         .map((row, rowIndex) => {
@@ -193,12 +204,24 @@ const run = async (options = {}) => {
       const flatValues = chunk.flat();
 
       console.log(
-        `➡️  Inserting chunk ${i / CHUNK_SIZE + 1} (${chunk.length} stones)...`
+        `➡️  Inserting chunk ${chunkIndex}/${totalChunks} (${chunk.length} stones)...`
       );
 
       await dbPool.query(insertQuery, flatValues);
+      
+      processedStones += chunk.length;
+      // Progress: 35% (start of insert) to 95% (end of insert)
+      const insertProgress = 35 + Math.round((chunkIndex / totalChunks) * 60);
+      onProgress({ 
+        phase: 'inserting', 
+        progress: Math.min(insertProgress, 95), 
+        detail: `Saving stones... (${processedStones}/${stoneArray.length})`, 
+        totalStones: stoneArray.length, 
+        processedStones 
+      });
     }
 
+    onProgress({ phase: 'complete', progress: 100, detail: `Successfully synced ${stoneArray.length} stones!`, totalStones: stoneArray.length, processedStones: stoneArray.length });
     console.log(`🎉 DONE! Inserted ${stoneArray.length} stones successfully.`);
     return { success: true, count: stoneArray.length, message: `Successfully synced ${stoneArray.length} stones` };
   } catch (err) {

@@ -483,20 +483,65 @@ app.delete("/api/stones/:sku/tags/:tagId", async (req, res) => {
 });
 
 /* =========================================================
-   /api/sync – Trigger SOAP data sync
+   /api/sync – Trigger SOAP data sync (with progress tracking)
    ========================================================= */
 const { run: runSoapImport } = require('./importFromSoap');
 
+// In-memory sync progress state
+let syncProgress = {
+  active: false,
+  phase: 'idle',
+  progress: 0,
+  detail: '',
+  totalStones: 0,
+  processedStones: 0,
+  startedAt: null,
+};
+
+app.get("/api/sync/progress", (req, res) => {
+  res.json(syncProgress);
+});
+
 app.post("/api/sync", async (req, res) => {
+  if (syncProgress.active) {
+    return res.status(409).json({ 
+      success: false, 
+      error: "A sync is already in progress",
+      progress: syncProgress 
+    });
+  }
+
   try {
     console.log("🔄 SOAP sync requested via API");
     
+    syncProgress = {
+      active: true,
+      phase: 'starting',
+      progress: 0,
+      detail: 'Starting sync...',
+      totalStones: 0,
+      processedStones: 0,
+      startedAt: Date.now(),
+    };
+
+    const onProgress = (update) => {
+      syncProgress = { ...syncProgress, ...update };
+    };
+
     // Run the import directly (not via exec) using the server's db pool
     // closePool: false so we don't kill the server's connection pool
-    const result = await runSoapImport({ dbPool: pool, closePool: false });
+    const result = await runSoapImport({ dbPool: pool, closePool: false, onProgress });
     
     if (result.success) {
       console.log(`✅ Sync completed: ${result.count} stones`);
+      syncProgress = { 
+        ...syncProgress, 
+        active: false, 
+        phase: 'complete', 
+        progress: 100, 
+        detail: `Successfully synced ${result.count} stones!`,
+        processedStones: result.count,
+      };
       res.json({ 
         success: true, 
         message: result.message,
@@ -505,6 +550,13 @@ app.post("/api/sync", async (req, res) => {
       });
     } else {
       console.error("❌ Sync failed:", result.message);
+      syncProgress = { 
+        ...syncProgress, 
+        active: false, 
+        phase: 'error', 
+        progress: 0, 
+        detail: result.message 
+      };
       res.status(500).json({ 
         success: false, 
         error: result.message,
@@ -513,6 +565,13 @@ app.post("/api/sync", async (req, res) => {
     }
   } catch (error) {
     console.error("❌ Error during sync:", error);
+    syncProgress = { 
+      ...syncProgress, 
+      active: false, 
+      phase: 'error', 
+      progress: 0, 
+      detail: error.message 
+    };
     res.status(500).json({ 
       success: false, 
       error: error.message 
