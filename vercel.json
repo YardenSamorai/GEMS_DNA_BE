@@ -1,5 +1,10 @@
 {
     "version": 2,
+    "functions": {
+      "api/stones/server.js": {
+        "maxDuration": 60
+      }
+    },
     "builds": [
       {
         "src": "api/stones/server.js",

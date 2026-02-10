@@ -62,14 +62,24 @@ const mapBranch = (branch) => {
   return BRANCH_MAP[upperBranch] || cleanBranch; // Return mapped value or original if not found
 };
 
-const run = async () => {
+/**
+ * Run the SOAP import
+ * @param {object} options
+ * @param {object} options.dbPool - Optional database pool to use (if called from server)
+ * @param {boolean} options.closePool - Whether to close the pool when done (default: true)
+ * @returns {Promise<{success: boolean, count: number, message: string}>}
+ */
+const run = async (options = {}) => {
+  const dbPool = options.dbPool || pool;
+  const closePool = options.closePool !== undefined ? options.closePool : true;
+  
   try {
     console.log("🚀 [1/6] Fetching SOAP data...");
     const rawXml = await fetchSoapData();
 
     if (!rawXml) {
       console.log("❌ No XML received");
-      return;
+      return { success: false, count: 0, message: "No XML received from SOAP API" };
     }
 
     console.log("📦 [2/6] Parsing XML...");
@@ -78,7 +88,7 @@ const run = async () => {
 
     if (!stones) {
       console.log("❌ No <Stone> elements found");
-      return;
+      return { success: false, count: 0, message: "No stone data found in SOAP response" };
     }
 
     const stoneArray = Array.isArray(stones) ? stones : [stones];
@@ -156,7 +166,7 @@ const run = async () => {
     ];
 
     console.log("🧹 [4/6] Clearing soap_stones table...");
-    await pool.query("TRUNCATE TABLE soap_stones RESTART IDENTITY");
+    await dbPool.query("TRUNCATE TABLE soap_stones RESTART IDENTITY");
 
     console.log("🧱 [5/6] Inserting chunks of data...");
 
@@ -186,15 +196,28 @@ const run = async () => {
         `➡️  Inserting chunk ${i / CHUNK_SIZE + 1} (${chunk.length} stones)...`
       );
 
-      await pool.query(insertQuery, flatValues);
+      await dbPool.query(insertQuery, flatValues);
     }
 
     console.log(`🎉 DONE! Inserted ${stoneArray.length} stones successfully.`);
+    return { success: true, count: stoneArray.length, message: `Successfully synced ${stoneArray.length} stones` };
   } catch (err) {
     console.error("❌ Error:", err);
+    return { success: false, count: 0, message: err.message || "Unknown error during sync" };
   } finally {
-    await pool.end().catch(() => {});
+    if (closePool) {
+      await pool.end().catch(() => {});
+    }
   }
 };
 
-run();
+// Export run function for use by server.js
+module.exports = { run };
+
+// Only auto-run when executed directly (node importFromSoap.js)
+if (require.main === module) {
+  run().then((result) => {
+    console.log("📋 Result:", result);
+    process.exit(result.success ? 0 : 1);
+  });
+}
