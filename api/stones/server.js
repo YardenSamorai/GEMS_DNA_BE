@@ -141,6 +141,10 @@ app.get("/api/soap-stones", async (req, res) => {
         
         // Pair stone
         pairSku: row.pair_stone || null,
+        
+        // Grouping
+        groupingType: row.grouping_type || "",
+        box: row.box || "",
       };
     });
 

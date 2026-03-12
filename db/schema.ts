@@ -106,6 +106,9 @@ export const soapStones = pgTable("soap_stones", {
   certComments: text("cert_comments"),
   origin: text("origin"),
 
+  groupingType: text("grouping_type"),
+  box: text("box"),
+
   rawXml: text("raw_xml"),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });

@@ -155,6 +155,8 @@ const run = async (options = {}) => {
         stone.Type || null,
         stone["Cert.Comments"] || null,
         stone.Origin || null,
+        stone.GroupingType || null,
+        stone.Box || null,
         null, // raw_xml
       ];
     });
@@ -169,7 +171,7 @@ const run = async (options = {}) => {
       "depth_percent", "ratio", "measurements", "fancy_intensity",
       "fancy_color", "fancy_overtone", "fancy_color_2", "fancy_overtone_2",
       "pair_stone", "home_page", "trade_show", "comment", "type",
-      "cert_comments", "origin", "raw_xml",
+      "cert_comments", "origin", "grouping_type", "box", "raw_xml",
     ];
 
     onProgress({ phase: 'clearing', progress: 35, detail: 'Clearing old data...', totalStones: stoneArray.length, processedStones: 0 });
