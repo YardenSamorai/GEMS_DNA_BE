@@ -104,11 +104,73 @@ const run = async (options = {}) => {
     // --------------------------
     // BUILD VALUES FOR EACH ROW
     // --------------------------
+    // Known clarity grades for shift detection
+    const CLARITY_GRADES = /^(FL|IF|VVS[12]|VS[12]|SI[123]|I[123])$/i;
+
+    let shiftFixCount = 0;
+
+    const fixShiftedFields = (stone) => {
+      // Detect: Color contains a quote AND Lab looks like a clarity grade
+      const colorVal = String(stone.Color || '');
+      const labVal = String(stone.Lab || '');
+      if (!colorVal.includes('"') || !CLARITY_GRADES.test(labVal.trim())) return;
+
+      shiftFixCount++;
+      console.warn(`⚠️  Fixing shifted fields for ${stone.SKU}: color="${stone.Color}" → lab="${stone.Lab}"`);
+
+      // Merge the broken color
+      const fixedColor = (colorVal + ', ' + (stone.Clarity || '')).replace(/"/g, '').trim();
+
+      // Shift all fields back by one (clarity ← lab ← fluorescence ← ...)
+      stone.Color = fixedColor;
+      stone.Clarity = stone.Lab;
+      stone.Lab = stone.Fluorescence;
+      stone.Fluorescence = stone.PricePerCarat;
+      stone.PricePerCarat = stone.RapPrice;
+      stone.RapPrice = stone["Rap.Price"];
+      stone["Rap.Price"] = stone.TotalPrice;
+      stone.TotalPrice = stone.Location;
+      stone.Location = stone.Branch;
+      stone.Branch = stone.Image;
+      stone.Image = stone.additional_pictures;
+      stone.additional_pictures = stone.Video;
+      stone.Video = stone.additional_videos;
+      stone.additional_videos = stone.Certificateimage;
+      stone.Certificateimage = stone.CertificateNumber;
+      stone.CertificateNumber = stone.certificateImageJPG;
+      stone.certificateImageJPG = stone.Cut;
+      stone.Cut = stone.Polish;
+      stone.Polish = stone.Symmetry;
+      stone.Symmetry = stone.Table;
+      stone.Table = stone.Depth;
+      stone.Depth = stone.ratio;
+      stone.ratio = stone["Measurements-delimiter"];
+      stone["Measurements-delimiter"] = stone.fancy_intensity;
+      stone.fancy_intensity = stone.fancy_color;
+      stone.fancy_color = stone.fancy_overtone;
+      stone.fancy_overtone = stone.fancy_color_2;
+      stone.fancy_color_2 = stone.fancy_overtone_2;
+      stone.fancy_overtone_2 = stone.PairStone;
+      stone.PairStone = stone.home_page;
+      stone.home_page = stone.TradeShow;
+      stone.TradeShow = stone.Comment;
+      stone.Comment = stone.Type;
+      stone.Type = stone["Cert.Comments"];
+      stone["Cert.Comments"] = stone.Origin;
+      stone.Origin = stone.GroupingType;
+      stone.GroupingType = stone.Box;
+      stone.Box = stone.Stones;
+      stone.Stones = null;
+    };
+
     const values = stoneArray.map((stone) => {
       const safeNumber = (value) => {
         const n = parseFloat(value);
         return Number.isFinite(n) ? n : null;
       };
+
+      // 🛡️ Fix shifted fields (e.g. Color with comma breaks SOAP XML parsing)
+      fixShiftedFields(stone);
 
       // 💰 הכפלת מחירים x2
       const pricePerCarat = safeNumber(stone.PricePerCarat);
@@ -161,6 +223,10 @@ const run = async (options = {}) => {
         null, // raw_xml
       ];
     });
+
+    if (shiftFixCount > 0) {
+      console.log(`🛡️  Fixed ${shiftFixCount} stone(s) with shifted fields in this chunk`);
+    }
 
     // עמודות לטבלה:
     const columns = [
