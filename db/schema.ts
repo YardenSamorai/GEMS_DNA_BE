@@ -108,6 +108,7 @@ export const soapStones = pgTable("soap_stones", {
 
   groupingType: text("grouping_type"),
   box: text("box"),
+  stones: integer("stones"),
 
   rawXml: text("raw_xml"),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),

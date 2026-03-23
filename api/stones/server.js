@@ -145,6 +145,7 @@ app.get("/api/soap-stones", async (req, res) => {
         // Grouping
         groupingType: row.grouping_type || "",
         box: row.box || "",
+        stones: row.stones != null ? Number(row.stones) : null,
       };
     });
 
