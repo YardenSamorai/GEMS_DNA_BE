@@ -121,7 +121,13 @@ const run = async (options = {}) => {
       // Merge the broken color
       const fixedColor = (colorVal + ', ' + (stone.Clarity || '')).replace(/"/g, '').trim();
 
-      // Shift all fields back by one (clarity ← lab ← fluorescence ← ...)
+      // Shift all fields back by one, following the SOAP XML element order:
+      // Color,Clarity,Lab,Fluorescence,PricePerCarat,RapPrice,Rap.Price,TotalPrice,
+      // Location,Image,Video,Certificateimage,CertificateNumber,Cut,Polish,Symmetry,
+      // Table,Depth,ratio,Measurements-delimiter,PairStone,fancy_intensity,fancy_color,
+      // fancy_overtone,fancy_color_2,fancy_overtone_2,home_page,additional_pictures,
+      // Branch,additional_videos,Comment,Type,Cert.Comments,certificateImageJPG,
+      // Origin,TradeShow,GroupingType,Box,Stones
       stone.Color = fixedColor;
       stone.Clarity = stone.Lab;
       stone.Lab = stone.Fluorescence;
@@ -130,34 +136,34 @@ const run = async (options = {}) => {
       stone.RapPrice = stone["Rap.Price"];
       stone["Rap.Price"] = stone.TotalPrice;
       stone.TotalPrice = stone.Location;
-      stone.Location = stone.Branch;
-      stone.Branch = stone.Image;
-      stone.Image = stone.additional_pictures;
-      stone.additional_pictures = stone.Video;
-      stone.Video = stone.additional_videos;
-      stone.additional_videos = stone.Certificateimage;
+      stone.Location = stone.Image;
+      stone.Image = stone.Video;
+      stone.Video = stone.Certificateimage;
       stone.Certificateimage = stone.CertificateNumber;
-      stone.CertificateNumber = stone.certificateImageJPG;
-      stone.certificateImageJPG = stone.Cut;
+      stone.CertificateNumber = stone.Cut;
       stone.Cut = stone.Polish;
       stone.Polish = stone.Symmetry;
       stone.Symmetry = stone.Table;
       stone.Table = stone.Depth;
       stone.Depth = stone.ratio;
       stone.ratio = stone["Measurements-delimiter"];
-      stone["Measurements-delimiter"] = stone.fancy_intensity;
+      stone["Measurements-delimiter"] = stone.PairStone;
+      stone.PairStone = stone.fancy_intensity;
       stone.fancy_intensity = stone.fancy_color;
       stone.fancy_color = stone.fancy_overtone;
       stone.fancy_overtone = stone.fancy_color_2;
       stone.fancy_color_2 = stone.fancy_overtone_2;
-      stone.fancy_overtone_2 = stone.PairStone;
-      stone.PairStone = stone.home_page;
-      stone.home_page = stone.TradeShow;
-      stone.TradeShow = stone.Comment;
+      stone.fancy_overtone_2 = stone.home_page;
+      stone.home_page = stone.additional_pictures;
+      stone.additional_pictures = stone.Branch;
+      stone.Branch = stone.additional_videos;
+      stone.additional_videos = stone.Comment;
       stone.Comment = stone.Type;
       stone.Type = stone["Cert.Comments"];
-      stone["Cert.Comments"] = stone.Origin;
-      stone.Origin = stone.GroupingType;
+      stone["Cert.Comments"] = stone.certificateImageJPG;
+      stone.certificateImageJPG = stone.Origin;
+      stone.Origin = stone.TradeShow;
+      stone.TradeShow = stone.GroupingType;
       stone.GroupingType = stone.Box;
       stone.Box = stone.Stones;
       stone.Stones = null;
