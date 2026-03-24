@@ -178,6 +178,13 @@ const run = async (options = {}) => {
       // 🛡️ Fix shifted fields (e.g. Color with comma breaks SOAP XML parsing)
       fixShiftedFields(stone);
 
+      // 🛡️ Validate GroupingType - only keep known values
+      const VALID_GROUPING_TYPES = ['Single', 'Pair', 'Set', 'Parcel', 'Fancy', 'Side Stones', 'Melee'];
+      if (stone.GroupingType && !VALID_GROUPING_TYPES.some(v => v.toLowerCase() === stone.GroupingType.trim().toLowerCase())) {
+        console.warn(`⚠️  Invalid GroupingType "${stone.GroupingType}" for ${stone.SKU} → set to null`);
+        stone.GroupingType = null;
+      }
+
       // 💰 הכפלת מחירים x2
       const pricePerCarat = safeNumber(stone.PricePerCarat);
       const totalPrice = safeNumber(stone.TotalPrice);
