@@ -2,7 +2,8 @@
     "version": 2,
     "functions": {
       "api/stones/server.js": {
-        "maxDuration": 60
+        "maxDuration": 60,
+        "memory": 1024
       }
     },
     "builds": [
@@ -14,6 +15,10 @@
     "routes": [
       {
         "src": "/api/image-proxy",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/import-csv(.*)",
         "dest": "api/stones/server.js"
       },
       {

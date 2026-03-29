@@ -175,14 +175,62 @@ const run = async (options = {}) => {
         return Number.isFinite(n) ? n : null;
       };
 
+      // Save raw field snapshot BEFORE any fixes for debugging
+      const rawSnapshot = JSON.stringify(stone);
+
       // 🛡️ Fix shifted fields (e.g. Color with comma breaks SOAP XML parsing)
       fixShiftedFields(stone);
 
-      // 🛡️ Validate GroupingType - only keep known values
+      // Handle xml2js object values: extract text content if field is an object with _ property
+      const textVal = (v) => {
+        if (v == null) return null;
+        if (typeof v === 'object' && v._ !== undefined) return String(v._);
+        if (typeof v === 'string') return v;
+        return String(v);
+      };
+
+      // 🛡️ Detect tail-field shifts: if Stones contains a valid GroupingType
+      //    instead of a number, fields are shifted forward and need correction
       const VALID_GROUPING_TYPES = ['Single', 'Pair', 'Set', 'Parcel', 'Fancy', 'Side Stones', 'Melee'];
-      if (stone.GroupingType && !VALID_GROUPING_TYPES.some(v => v.toLowerCase() === stone.GroupingType.trim().toLowerCase())) {
-        console.warn(`⚠️  Invalid GroupingType "${stone.GroupingType}" for ${stone.SKU} → set to null`);
+      const isValidGT = (v) => v && VALID_GROUPING_TYPES.some(g => g.toLowerCase() === String(v).trim().toLowerCase());
+      const normalizeGT = (v) => VALID_GROUPING_TYPES.find(g => g.toLowerCase() === String(v).trim().toLowerCase()) || v;
+
+      const stonesStr = String(stone.Stones || '').trim();
+      const boxStr = String(stone.Box || '').trim();
+      if (stonesStr && isValidGT(stonesStr)) {
+        // Shift by 2: GroupingType is in Stones, TradeShow is in Box, Origin is in GroupingType
+        console.warn(`⚠️  Tail shift (2) for ${stone.SKU}: Stones="${stonesStr}" → GroupingType`);
+        const realGroupingType = stonesStr;
+        const realTradeShow = boxStr;
+        const realOrigin = String(stone.GroupingType || '').trim();
+        stone.Stones = null;
+        stone.Box = null;
+        stone.GroupingType = realGroupingType;
+        if (realTradeShow && !stone.TradeShow) stone.TradeShow = realTradeShow;
+        if (realOrigin && !stone.Origin) stone.Origin = realOrigin;
+      } else if (boxStr && isValidGT(boxStr) && !isValidGT(String(stone.GroupingType || '').trim())) {
+        // Shift by 1: GroupingType is in Box, TradeShow is in GroupingType
+        console.warn(`⚠️  Tail shift (1) for ${stone.SKU}: Box="${boxStr}" → GroupingType`);
+        const realGroupingType = boxStr;
+        const realTradeShow = String(stone.GroupingType || '').trim();
+        stone.Box = String(stone.Stones || '').trim() || null;
+        stone.Stones = null;
+        stone.GroupingType = realGroupingType;
+        if (realTradeShow && !stone.TradeShow) stone.TradeShow = realTradeShow;
+      }
+
+      // Handle xml2js object values
+      if (stone.GroupingType && typeof stone.GroupingType === 'object') {
+        stone.GroupingType = textVal(stone.GroupingType);
+      }
+
+      // 🛡️ Validate GroupingType - normalize to standard casing
+      const gtVal = stone.GroupingType ? String(stone.GroupingType).trim() : null;
+      if (gtVal && !isValidGT(gtVal)) {
+        console.warn(`⚠️  Invalid GroupingType "${gtVal}" for ${stone.SKU} → set to null`);
         stone.GroupingType = null;
+      } else if (gtVal) {
+        stone.GroupingType = normalizeGT(gtVal);
       }
 
       // 💰 הכפלת מחירים x2
@@ -233,13 +281,31 @@ const run = async (options = {}) => {
         stone.GroupingType || null,
         stone.Box || null,
         safeNumber(stone.Stones),
-        null, // raw_xml
+        rawSnapshot,
       ];
     });
 
     if (shiftFixCount > 0) {
       console.log(`🛡️  Fixed ${shiftFixCount} stone(s) with shifted fields in this chunk`);
     }
+
+    // Log GroupingType distribution for verification
+    const gtCounts = {};
+    const debugSkus = ['T-310H', 'T310H'];
+    values.forEach(row => {
+      const gt = row[40] || 'NULL';
+      gtCounts[gt] = (gtCounts[gt] || 0) + 1;
+
+      const sku = row[1];
+      if (sku && debugSkus.some(d => sku.toUpperCase().includes(d.replace('-', '')))) {
+        const rawData = row[43]; // raw_xml column
+        let rawParsed;
+        try { rawParsed = JSON.parse(rawData); } catch { rawParsed = null; }
+        const allGroupingKeys = rawParsed ? Object.keys(rawParsed).filter(k => k.toLowerCase().includes('group')) : [];
+        console.log(`🔍 DEBUG ${sku}: grouping_type=${gt}, raw GroupingType keys=[${allGroupingKeys}], raw values=[${allGroupingKeys.map(k => rawParsed[k])}]`);
+      }
+    });
+    console.log('📊 GroupingType distribution:', gtCounts);
 
     // עמודות לטבלה:
     const columns = [
