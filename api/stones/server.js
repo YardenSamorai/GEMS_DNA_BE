@@ -954,6 +954,65 @@ app.post("/api/import-csv", async (req, res) => {
 });
 
 /* =========================================================
+   Saved Filters
+   ========================================================= */
+
+// Auto-create table on startup
+pool.query(`
+  CREATE TABLE IF NOT EXISTS saved_filters (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    inventory_mode TEXT NOT NULL DEFAULT 'diamonds',
+    filters JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT NOW()
+  )
+`).catch(err => console.error("saved_filters table creation error:", err));
+
+app.get("/api/saved-filters", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const result = await pool.query(
+      "SELECT * FROM saved_filters WHERE user_id = $1 ORDER BY created_at DESC",
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching saved filters:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/saved-filters", async (req, res) => {
+  try {
+    const { userId, name, inventoryMode, filters } = req.body;
+    if (!userId || !name?.trim()) {
+      return res.status(400).json({ error: "userId and name are required" });
+    }
+    const result = await pool.query(
+      "INSERT INTO saved_filters (user_id, name, inventory_mode, filters) VALUES ($1, $2, $3, $4) RETURNING *",
+      [userId, name.trim(), inventoryMode || 'diamonds', JSON.stringify(filters || {})]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("Error creating saved filter:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/api/saved-filters/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query("DELETE FROM saved_filters WHERE id = $1", [id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error deleting saved filter:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
    Start server
    ========================================================= */
 app.listen(port, () => {

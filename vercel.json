@@ -46,6 +46,14 @@
         "dest": "api/stones/server.js"
       },
       {
+        "src": "/api/saved-filters",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/saved-filters/(.*)",
+        "dest": "api/stones/server.js"
+      },
+      {
         "src": "/api/stones",
         "dest": "api/stones/server.js"
       },
