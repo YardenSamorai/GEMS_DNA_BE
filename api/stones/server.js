@@ -255,6 +255,178 @@ app.get("/api/stones/:stone_id", async (req, res) => {
 });
 
 /* =========================================================
+   /api/jewelry – all jewelry items (inventory list)
+   ========================================================= */
+app.get("/api/jewelry", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM jewelry_products ORDER BY model_number ASC");
+    const items = result.rows.map(row => ({
+      model_number: row.model_number,
+      stock_number: row.stock_number,
+      jewelry_type: row.jewelry_type,
+      style: row.style,
+      collection: row.collection,
+      price: row.price !== null ? parseFloat(row.price) : null,
+      video_link: row.video_link,
+      all_pictures_link: row.all_pictures_link,
+      certificate_link: row.certificate_link,
+      certificate_number: row.certificate_number,
+      title: row.title,
+      description: row.description,
+      jewelry_weight: row.jewelry_weight !== null ? parseFloat(row.jewelry_weight) : null,
+      total_carat: row.total_carat !== null ? parseFloat(row.total_carat) : null,
+      stone_type: row.stone_type,
+      center_stone_carat: row.center_stone_carat !== null ? parseFloat(row.center_stone_carat) : null,
+      center_stone_shape: row.center_stone_shape,
+      center_stone_color: row.center_stone_color,
+      center_stone_clarity: row.center_stone_clarity,
+      metal_type: row.metal_type,
+      currency: row.currency,
+      availability: row.availability,
+      shipping_from: row.shipping_from,
+      category: row.category,
+      full_description: row.full_description,
+      jewelry_size: row.jewelry_size,
+      instructions_main: row.instructions_main,
+    }));
+    res.json({ jewelry: items });
+  } catch (error) {
+    console.error("Error fetching jewelry:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   /api/jewelry/import-csv – Upload jewelry CSV
+   ========================================================= */
+let jewelryImportProgress = { active: false, phase: 'idle', progress: 0, detail: '', total: 0, processed: 0 };
+
+app.get("/api/jewelry/import-csv/progress", (req, res) => {
+  res.json(jewelryImportProgress);
+});
+
+app.post("/api/jewelry/import-csv", async (req, res) => {
+  if (jewelryImportProgress.active) {
+    return res.status(409).json({ success: false, error: "A jewelry import is already in progress" });
+  }
+
+  try {
+    const { csvContent } = req.body;
+    if (!csvContent) {
+      return res.status(400).json({ success: false, error: "No CSV content provided" });
+    }
+
+    console.log("Jewelry CSV import requested");
+    jewelryImportProgress = { active: true, phase: 'parsing', progress: 10, detail: 'Parsing CSV...', total: 0, processed: 0 };
+
+    const rows = parseCsv(csvContent, { columns: true, skip_empty_lines: true, relax_quotes: true, relax_column_count: true });
+    console.log(`Parsed ${rows.length} jewelry rows from CSV`);
+    jewelryImportProgress = { ...jewelryImportProgress, phase: 'processing', progress: 20, detail: `Parsed ${rows.length} items`, total: rows.length };
+
+    const columns = [
+      'model_number','stock_number','jewelry_type','style','collection',
+      'price','video_link','all_pictures_link','certificate_link','certificate_number',
+      'title','description','jewelry_weight','total_carat','stone_type',
+      'center_stone_carat','center_stone_shape','center_stone_color','center_stone_clarity',
+      'metal_type','currency','availability','shipping_from','category',
+      'full_description','jewelry_size','instructions_main'
+    ];
+
+    const values = rows.map(r => [
+      r['Model Number'] || null,
+      r['Stock Number'] || null,
+      r['Jewelry Type'] || null,
+      r['Style'] || null,
+      r['Collection'] || null,
+      csvSafeNum(r['Price']),
+      r['Video_Link'] || null,
+      r['All_Pictures_Link'] || null,
+      r['Certificate_Link'] || null,
+      r['Certificate Number'] || null,
+      r['Title'] || null,
+      r['Description'] || null,
+      csvSafeNum(r['Jewelry_Weight']),
+      csvSafeNum(r['Total_Carat']),
+      (r['Stone_Type'] || '').trim() || null,
+      csvSafeNum(r['Center_Stone_Carat']),
+      (r['Center_Stone_Shape'] || '').trim() || null,
+      (r['Center_Stone_Color'] || '').trim() || null,
+      (r['Center_Stone_Clarity'] || '').trim() || null,
+      r['Metal_Type'] || null,
+      r['Currency'] || null,
+      r['Availability'] || null,
+      r['Shipping_From'] || null,
+      r['Category'] || null,
+      r['full_description'] || null,
+      r['jewelry_size'] || null,
+      r['Instructions_main'] || null,
+    ]).filter(v => v[0] !== null);
+
+    jewelryImportProgress = { ...jewelryImportProgress, phase: 'clearing', progress: 40, detail: 'Preparing database...' };
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS jewelry_products (
+        model_number VARCHAR(50) PRIMARY KEY,
+        stock_number VARCHAR(50),
+        jewelry_type VARCHAR(50),
+        style VARCHAR(50),
+        collection VARCHAR(100),
+        price NUMERIC(10,2),
+        video_link TEXT,
+        all_pictures_link TEXT,
+        certificate_link TEXT,
+        certificate_number VARCHAR(100),
+        title VARCHAR(250),
+        description TEXT,
+        jewelry_weight NUMERIC(10,2),
+        total_carat NUMERIC(10,3),
+        stone_type VARCHAR(50),
+        center_stone_carat NUMERIC(10,3),
+        center_stone_shape VARCHAR(50),
+        center_stone_color VARCHAR(50),
+        center_stone_clarity VARCHAR(50),
+        metal_type VARCHAR(50),
+        currency VARCHAR(10),
+        availability VARCHAR(50),
+        shipping_from VARCHAR(100),
+        category VARCHAR(100),
+        full_description TEXT,
+        jewelry_size VARCHAR(50),
+        instructions_main TEXT
+      );
+    `);
+
+    await pool.query('DELETE FROM jewelry_products');
+
+    jewelryImportProgress = { ...jewelryImportProgress, phase: 'inserting', progress: 50, detail: 'Saving jewelry to database...' };
+    const CHUNK = 100;
+    const totalChunks = Math.ceil(values.length / CHUNK);
+    for (let i = 0; i < values.length; i += CHUNK) {
+      const chunk = values.slice(i, i + CHUNK);
+      const chunkIdx = Math.floor(i / CHUNK) + 1;
+      const ph = chunk.map((row, ri) =>
+        '(' + columns.map((_, ci) => '$' + (ri * columns.length + ci + 1)).join(',') + ')'
+      ).join(',');
+      await pool.query('INSERT INTO jewelry_products (' + columns.join(',') + ') VALUES ' + ph + ' ON CONFLICT (model_number) DO UPDATE SET ' +
+        columns.slice(1).map(c => `${c} = EXCLUDED.${c}`).join(', '),
+        chunk.flat()
+      );
+      const pct = 50 + Math.round((chunkIdx / totalChunks) * 45);
+      jewelryImportProgress = { ...jewelryImportProgress, progress: pct, processed: Math.min(i + CHUNK, values.length), detail: `Inserted ${Math.min(i + CHUNK, values.length)} / ${values.length} items` };
+    }
+
+    jewelryImportProgress = { active: false, phase: 'complete', progress: 100, detail: `Successfully imported ${values.length} jewelry items!`, total: values.length, processed: values.length };
+    console.log(`Jewelry CSV import completed: ${values.length} items`);
+
+    res.json({ success: true, count: values.length, status: "completed" });
+  } catch (error) {
+    console.error("Jewelry CSV import error:", error);
+    jewelryImportProgress = { active: false, phase: 'error', progress: 0, detail: error.message, total: 0, processed: 0 };
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/* =========================================================
    /api/jewelry/:modelNumber – תכשיט + הצפנה
    ========================================================= */
 app.get("/api/jewelry/:modelNumber", async (req, res) => {
