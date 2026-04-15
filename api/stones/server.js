@@ -1013,6 +1013,109 @@ app.delete("/api/saved-filters/:id", async (req, res) => {
 });
 
 /* =========================================================
+   Label Templates (per user)
+   ========================================================= */
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS label_templates (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT 'Default',
+    elements JSONB NOT NULL DEFAULT '[]',
+    is_active BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+  )
+`).catch(err => console.error("label_templates table creation error:", err));
+
+app.get("/api/label-templates", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const result = await pool.query(
+      "SELECT * FROM label_templates WHERE user_id = $1 ORDER BY created_at ASC",
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching label templates:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/label-templates", async (req, res) => {
+  try {
+    const { userId, name, elements, isActive } = req.body;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const result = await pool.query(
+      "INSERT INTO label_templates (user_id, name, elements, is_active) VALUES ($1, $2, $3, $4) RETURNING *",
+      [userId, (name || "New Template").trim(), JSON.stringify(elements || []), isActive || false]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("Error creating label template:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.put("/api/label-templates/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, elements, isActive } = req.body;
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    if (name !== undefined) { fields.push(`name = $${idx++}`); values.push(name.trim()); }
+    if (elements !== undefined) { fields.push(`elements = $${idx++}`); values.push(JSON.stringify(elements)); }
+    if (isActive !== undefined) { fields.push(`is_active = $${idx++}`); values.push(isActive); }
+    fields.push(`updated_at = NOW()`);
+
+    if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
+
+    values.push(id);
+    const result = await pool.query(
+      `UPDATE label_templates SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Template not found" });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Error updating label template:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.put("/api/label-templates/set-active/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    await pool.query("UPDATE label_templates SET is_active = false WHERE user_id = $1", [userId]);
+    const result = await pool.query(
+      "UPDATE label_templates SET is_active = true, updated_at = NOW() WHERE id = $1 AND user_id = $2 RETURNING *",
+      [id, userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Template not found" });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Error setting active template:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/api/label-templates/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query("DELETE FROM label_templates WHERE id = $1", [id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error deleting label template:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
    Start server
    ========================================================= */
 app.listen(port, () => {

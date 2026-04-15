@@ -54,6 +54,18 @@
         "dest": "api/stones/server.js"
       },
       {
+        "src": "/api/label-templates/set-active/(.*)",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/label-templates/(.*)",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/label-templates",
+        "dest": "api/stones/server.js"
+      },
+      {
         "src": "/api/stones",
         "dest": "api/stones/server.js"
       },
