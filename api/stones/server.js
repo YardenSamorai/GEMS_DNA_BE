@@ -1359,21 +1359,57 @@ app.get("/api/crm/contacts", async (req, res) => {
       values.push(JSON.stringify([tag]));
     }
 
-    const result = await pool.query(
-      `SELECT c.*,
-        f.name AS folder_name,
-        (SELECT COUNT(*)::int FROM crm_deals d WHERE d.contact_id = c.id) AS deals_count,
-        (SELECT COALESCE(SUM(value),0) FROM crm_deals d WHERE d.contact_id = c.id AND d.stage = 'won') AS total_won
-       FROM crm_contacts c
-       LEFT JOIN crm_folders f ON f.id = c.folder_id
-       WHERE ${conditions.join(" AND ")}
-       ORDER BY c.updated_at DESC`,
-      values
-    );
+    let result;
+    try {
+      result = await pool.query(
+        `SELECT c.*,
+          f.name AS folder_name,
+          (SELECT COUNT(*)::int FROM crm_deals d WHERE d.contact_id = c.id) AS deals_count,
+          (SELECT COALESCE(SUM(value),0) FROM crm_deals d WHERE d.contact_id = c.id AND d.stage = 'won') AS total_won
+         FROM crm_contacts c
+         LEFT JOIN crm_folders f ON f.id = c.folder_id
+         WHERE ${conditions.join(" AND ")}
+         ORDER BY c.updated_at DESC`,
+        values
+      );
+    } catch (joinErr) {
+      // Self-heal: maybe the new columns/tables aren't present yet. Re-run migrations and fall back.
+      console.warn("Contacts JOIN failed, attempting self-heal:", joinErr.message);
+      try {
+        await pool.query(`CREATE TABLE IF NOT EXISTS crm_folders (
+          id SERIAL PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          parent_id INTEGER REFERENCES crm_folders(id) ON DELETE CASCADE,
+          color TEXT,
+          created_at TIMESTAMP DEFAULT NOW(),
+          updated_at TIMESTAMP DEFAULT NOW()
+        )`);
+        await pool.query(`ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS title TEXT`);
+        await pool.query(`ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS website TEXT`);
+        await pool.query(`ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS phone_alt TEXT`);
+        await pool.query(`ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS folder_id INTEGER`);
+        await pool.query(`ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS linked_contact_ids JSONB DEFAULT '[]'`);
+        await pool.query(`ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_back_notes TEXT`);
+      } catch (healErr) {
+        console.error("Self-heal failed:", healErr.message);
+      }
+      // Fallback query without the folder join (still safe even if folder_id missing)
+      result = await pool.query(
+        `SELECT c.*,
+          NULL::text AS folder_name,
+          (SELECT COUNT(*)::int FROM crm_deals d WHERE d.contact_id = c.id) AS deals_count,
+          (SELECT COALESCE(SUM(value),0) FROM crm_deals d WHERE d.contact_id = c.id AND d.stage = 'won') AS total_won
+         FROM crm_contacts c
+         WHERE ${conditions.join(" AND ")}
+         ORDER BY c.updated_at DESC`,
+        values
+      );
+    }
     res.json(result.rows);
   } catch (error) {
-    console.error("Error fetching contacts:", error);
-    res.status(500).json({ error: "Internal server error" });
+    console.error("Error fetching contacts:", error.stack || error.message || error);
+    res.status(500).json({ error: error.message || "Internal server error" });
   }
 });
 
