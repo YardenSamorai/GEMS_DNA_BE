@@ -1218,8 +1218,67 @@ const crmReadyPromise = (async () => {
         sent_at TIMESTAMP DEFAULT NOW()
       )
     `);
+
+    // Folders (hierarchical)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_folders (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        parent_id INTEGER REFERENCES crm_folders(id) ON DELETE CASCADE,
+        color TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_folders_user ON crm_folders(user_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_folders_parent ON crm_folders(parent_id)`);
+
+    // Email broadcast log
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_email_broadcasts (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        subject TEXT,
+        body TEXT,
+        recipients_count INTEGER DEFAULT 0,
+        sent_count INTEGER DEFAULT 0,
+        failed_count INTEGER DEFAULT 0,
+        details JSONB DEFAULT '[]',
+        sent_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Add new columns to crm_contacts (idempotent)
+    const newCols = [
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS title TEXT",
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS website TEXT",
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS phone_alt TEXT",
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS folder_id INTEGER",
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS linked_contact_ids JSONB DEFAULT '[]'",
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_back_notes TEXT",
+    ];
+    for (const sql of newCols) {
+      try { await pool.query(sql); } catch (e) { console.warn("Migration warn:", e.message); }
+    }
+    // FK for folder_id (separate so it doesn't fail if column already added)
+    try {
+      await pool.query(`
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.table_constraints
+            WHERE constraint_name = 'crm_contacts_folder_fk'
+          ) THEN
+            ALTER TABLE crm_contacts
+            ADD CONSTRAINT crm_contacts_folder_fk
+            FOREIGN KEY (folder_id) REFERENCES crm_folders(id) ON DELETE SET NULL;
+          END IF;
+        END $$;
+      `);
+    } catch (e) { console.warn("FK migration warn:", e.message); }
+
     crmReady = true;
-    console.log("✅ CRM tables ready");
+    console.log("CRM tables ready");
   } catch (err) {
     console.error("❌ CRM table creation error:", err);
   }
@@ -1238,7 +1297,10 @@ app.use("/api/crm", ensureCrm);
 
 app.get("/api/crm/contacts", async (req, res) => {
   try {
-    const { userId, search, type, status } = req.query;
+    const {
+      userId, search, type, status, folderId, country, city, company,
+      hasEmail, hasPhone, hasWebsite, lastContactDays, createdSince, createdUntil, tag,
+    } = req.query;
     if (!userId) return res.status(400).json({ error: "userId is required" });
 
     const conditions = ["user_id = $1"];
@@ -1246,7 +1308,7 @@ app.get("/api/crm/contacts", async (req, res) => {
     let idx = 2;
 
     if (search) {
-      conditions.push(`(name ILIKE $${idx} OR company ILIKE $${idx} OR phone ILIKE $${idx} OR email ILIKE $${idx})`);
+      conditions.push(`(name ILIKE $${idx} OR company ILIKE $${idx} OR phone ILIKE $${idx} OR email ILIKE $${idx} OR title ILIKE $${idx})`);
       values.push(`%${search}%`);
       idx++;
     }
@@ -1258,12 +1320,52 @@ app.get("/api/crm/contacts", async (req, res) => {
       conditions.push(`status = $${idx++}`);
       values.push(status);
     }
+    if (folderId) {
+      if (folderId === 'unfiled') {
+        conditions.push(`folder_id IS NULL`);
+      } else {
+        // Include sub-folders recursively
+        conditions.push(`folder_id IN (
+          WITH RECURSIVE descendants AS (
+            SELECT id FROM crm_folders WHERE id = $${idx} AND user_id = $1
+            UNION ALL
+            SELECT f.id FROM crm_folders f INNER JOIN descendants d ON f.parent_id = d.id
+          )
+          SELECT id FROM descendants
+        )`);
+        values.push(parseInt(folderId, 10));
+        idx++;
+      }
+    }
+    if (country) { conditions.push(`country ILIKE $${idx++}`); values.push(country); }
+    if (city) { conditions.push(`city ILIKE $${idx++}`); values.push(city); }
+    if (company) { conditions.push(`company ILIKE $${idx++}`); values.push(`%${company}%`); }
+    if (hasEmail === 'true') conditions.push(`email IS NOT NULL AND email <> ''`);
+    if (hasEmail === 'false') conditions.push(`(email IS NULL OR email = '')`);
+    if (hasPhone === 'true') conditions.push(`phone IS NOT NULL AND phone <> ''`);
+    if (hasPhone === 'false') conditions.push(`(phone IS NULL OR phone = '')`);
+    if (hasWebsite === 'true') conditions.push(`website IS NOT NULL AND website <> ''`);
+    if (hasWebsite === 'false') conditions.push(`(website IS NULL OR website = '')`);
+    if (lastContactDays) {
+      const d = parseInt(lastContactDays, 10);
+      if (!Number.isNaN(d)) {
+        conditions.push(`(last_contact_at IS NULL OR last_contact_at < NOW() - INTERVAL '${d} days')`);
+      }
+    }
+    if (createdSince) { conditions.push(`created_at >= $${idx++}`); values.push(createdSince); }
+    if (createdUntil) { conditions.push(`created_at <= $${idx++}`); values.push(createdUntil); }
+    if (tag) {
+      conditions.push(`tags @> $${idx++}::jsonb`);
+      values.push(JSON.stringify([tag]));
+    }
 
     const result = await pool.query(
       `SELECT c.*,
+        f.name AS folder_name,
         (SELECT COUNT(*)::int FROM crm_deals d WHERE d.contact_id = c.id) AS deals_count,
         (SELECT COALESCE(SUM(value),0) FROM crm_deals d WHERE d.contact_id = c.id AND d.stage = 'won') AS total_won
        FROM crm_contacts c
+       LEFT JOIN crm_folders f ON f.id = c.folder_id
        WHERE ${conditions.join(" AND ")}
        ORDER BY c.updated_at DESC`,
       values
@@ -1314,16 +1416,27 @@ app.get("/api/crm/contacts/:id", async (req, res) => {
 
 app.post("/api/crm/contacts", async (req, res) => {
   try {
-    const { userId, name, type, company, phone, email, country, city, address, source, status, tags, preferences, notes, avatarUrl } = req.body;
+    const {
+      userId, name, type, title, company, phone, phoneAlt, email, website,
+      country, city, address, source, status, tags, preferences, notes, avatarUrl,
+      folderId, linkedContactIds, cardBackNotes,
+    } = req.body;
     if (!userId || !name) return res.status(400).json({ error: "userId and name are required" });
 
     const result = await pool.query(
-      `INSERT INTO crm_contacts (user_id, name, type, company, phone, email, country, city, address, source, status, tags, preferences, notes, avatar_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+      `INSERT INTO crm_contacts (
+         user_id, name, type, title, company, phone, phone_alt, email, website,
+         country, city, address, source, status, tags, preferences, notes, avatar_url,
+         folder_id, linked_contact_ids, card_back_notes
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING *`,
       [
-        userId, name.trim(), type || 'lead', company || null, phone || null, email || null,
+        userId, name.trim(), type || 'lead', title || null, company || null,
+        phone || null, phoneAlt || null, email || null, website || null,
         country || null, city || null, address || null, source || null, status || 'active',
-        JSON.stringify(tags || []), JSON.stringify(preferences || {}), notes || null, avatarUrl || null
+        JSON.stringify(tags || []), JSON.stringify(preferences || {}),
+        notes || null, avatarUrl || null,
+        folderId || null, JSON.stringify(linkedContactIds || []), cardBackNotes || null,
       ]
     );
     res.status(201).json(result.rows[0]);
@@ -1336,7 +1449,11 @@ app.post("/api/crm/contacts", async (req, res) => {
 app.put("/api/crm/contacts/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const allowed = ['name','type','company','phone','email','country','city','address','source','status','tags','preferences','notes','avatar_url','last_contact_at'];
+    const allowed = [
+      'name','type','title','company','phone','phone_alt','email','website',
+      'country','city','address','source','status','tags','preferences','notes','avatar_url','last_contact_at',
+      'folder_id','linked_contact_ids','card_back_notes'
+    ];
     const fields = [];
     const values = [];
     let idx = 1;
@@ -1344,7 +1461,7 @@ app.put("/api/crm/contacts/:id", async (req, res) => {
     for (const key of allowed) {
       const camel = key.replace(/_([a-z])/g, (_,c) => c.toUpperCase());
       if (req.body[camel] !== undefined) {
-        if (key === 'tags' || key === 'preferences') {
+        if (key === 'tags' || key === 'preferences' || key === 'linked_contact_ids') {
           fields.push(`${key} = $${idx++}`);
           values.push(JSON.stringify(req.body[camel]));
         } else {
@@ -2007,44 +2124,68 @@ const normPhone = (p) => (p || "").replace(/[^\d]/g, "");
 
 app.post("/api/crm/scan-card", async (req, res) => {
   try {
-    const { userId, imageBase64 } = req.body;
+    const { userId, imageBase64, imageBase64Front, imageBase64Back } = req.body;
     if (!userId) return res.status(400).json({ error: "userId is required" });
-    if (!imageBase64) return res.status(400).json({ error: "imageBase64 is required" });
+
+    // Backward-compat: imageBase64 = single image; new: imageBase64Front + optional imageBase64Back
+    const front = imageBase64Front || imageBase64;
+    const back = imageBase64Back || null;
+
+    if (!front) return res.status(400).json({ error: "Front image is required" });
     if (!process.env.OPENAI_API_KEY) {
       return res.status(500).json({ error: "OPENAI_API_KEY is not configured on the server" });
     }
 
-    const dataUrl = imageBase64.startsWith("data:")
-      ? imageBase64
-      : `data:image/jpeg;base64,${imageBase64}`;
+    const toDataUrl = (b64) => b64.startsWith("data:") ? b64 : `data:image/jpeg;base64,${b64}`;
 
+    const sideCount = back ? 2 : 1;
     const prompt = `You are an OCR assistant for business cards used at gem and jewelry trade shows.
-Extract structured contact details from the image. Return ONLY valid JSON, no prose.
+You will be shown ${sideCount} image(s) of a business card${back ? " (front and back of the SAME physical card)" : ""}.
 
-Schema (use null for missing fields):
+CRITICAL: Sometimes the two sides of a single card show TWO DIFFERENT PEOPLE (a partner / colleague, with their own name, title, phone and email). In that case you MUST return TWO contacts.
+Otherwise (same person, or back contains only company info / extra phone / address / logo / language translation) return ONE contact and merge the data.
+
+Return ONLY valid JSON in this exact shape:
 {
-  "name": string|null,
-  "jobTitle": string|null,
-  "company": string|null,
-  "phone": string|null,
-  "phoneAlt": string|null,
-  "email": string|null,
-  "website": string|null,
-  "country": string|null,
-  "city": string|null,
-  "address": string|null,
-  "type": "buyer"|"dealer"|"designer"|"supplier"|"lead",
-  "notes": string|null,
-  "language": string|null
+  "contacts": [
+    {
+      "name": string|null,
+      "title": string|null,
+      "company": string|null,
+      "phone": string|null,
+      "phoneAlt": string|null,
+      "email": string|null,
+      "website": string|null,
+      "country": string|null,
+      "city": string|null,
+      "address": string|null,
+      "type": "buyer"|"dealer"|"designer"|"supplier"|"lead",
+      "notes": string|null,
+      "language": string|null,
+      "side": "front"|"back"|"both"
+    }
+  ],
+  "isTwoPeople": boolean,
+  "reason": "1 short sentence explaining why one or two contacts"
 }
 
 Rules:
-- Choose "type" by guessing from job title/company (jeweler/designer = designer; wholesale/diamond dealer = dealer; supplier/manufacturer = supplier; retailer = buyer; otherwise lead).
-- If multiple phones, put the main mobile in "phone" and the office in "phoneAlt".
-- Keep phone numbers exactly as they appear (with + and country code if present).
-- "notes" should contain any extra text on the card that does not fit the other fields (e.g. specialties, services).
-- "language" is ISO code of the dominant language ("en", "he", etc.).
-Output ONLY the JSON object.`;
+- "title" = job title (CEO, Sales Director, Designer, etc.). NEVER put the title inside "notes".
+- Choose "type" by guessing from title/company (jeweler/designer = designer; wholesale/diamond dealer = dealer; supplier/manufacturer = supplier; retailer = buyer; otherwise lead).
+- If multiple phones for the same person, put the main mobile in "phone" and the office in "phoneAlt".
+- Keep phone numbers exactly as printed (with + and country code if present).
+- "website" = the URL on the card (without http:// prefix is OK; we will normalise).
+- "notes" = ONLY extra text that does not fit the other fields (e.g. "Specialises in Burmese rubies"). Never duplicate name/title/phone/email here.
+- For ONE contact spanning both sides: set side="both" and merge fields (do not duplicate).
+- For TWO different people: return two entries with side="front" and side="back".
+- Output ONLY the JSON object, no markdown.`;
+
+    const userContent = [{ type: "text", text: prompt }];
+    userContent.push({ type: "image_url", image_url: { url: toDataUrl(front), detail: "high" } });
+    if (back) {
+      userContent.push({ type: "text", text: "Above is the FRONT side. Below is the BACK side of the same card:" });
+      userContent.push({ type: "image_url", image_url: { url: toDataUrl(back), detail: "high" } });
+    }
 
     const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -2056,15 +2197,7 @@ Output ONLY the JSON object.`;
         model: "gpt-4o-mini",
         temperature: 0,
         response_format: { type: "json_object" },
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: prompt },
-              { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
-            ],
-          },
-        ],
+        messages: [{ role: "user", content: userContent }],
       }),
     });
 
@@ -2073,13 +2206,11 @@ Output ONLY the JSON object.`;
       console.error("OpenAI error:", aiRes.status, errText);
       let friendly = `OCR provider error (${aiRes.status})`;
       if (aiRes.status === 429) {
-        friendly =
-          "OpenAI quota exceeded. Most likely no credit balance on the account. " +
-          "Please add credit at platform.openai.com/settings/organization/billing/overview and try again.";
+        friendly = "OpenAI quota exceeded. Add credit at platform.openai.com/settings/organization/billing/overview.";
       } else if (aiRes.status === 401) {
-        friendly = "OpenAI API key invalid or revoked. Update OPENAI_API_KEY in your server environment.";
+        friendly = "OpenAI API key invalid or revoked.";
       } else if (aiRes.status === 400) {
-        friendly = "OpenAI rejected the image (it may be too large or in an unsupported format). Try a smaller, clearer photo.";
+        friendly = "OpenAI rejected the image. Try a smaller, clearer photo.";
       }
       return res.status(502).json({ error: friendly, providerStatus: aiRes.status });
     }
@@ -2092,39 +2223,509 @@ Output ONLY the JSON object.`;
       return res.status(500).json({ error: "Failed to parse OCR response" });
     }
 
-    // Try to find matching contact by phone or email
-    let matches = [];
-    const phoneDigits = normPhone(parsed.phone);
-    const altDigits = normPhone(parsed.phoneAlt);
-    const email = (parsed.email || "").toLowerCase().trim();
-
-    if (phoneDigits || altDigits || email) {
-      const conditions = [];
-      const values = [userId];
-      let idx = 2;
-      if (phoneDigits && phoneDigits.length >= 7) {
-        conditions.push(`regexp_replace(coalesce(phone,''), '[^0-9]', '', 'g') LIKE $${idx++}`);
-        values.push(`%${phoneDigits.slice(-9)}%`);
-      }
-      if (email) {
-        conditions.push(`LOWER(email) = $${idx++}`);
-        values.push(email);
-      }
-      if (conditions.length > 0) {
-        const r = await pool.query(
-          `SELECT id, name, type, company, phone, email, country, city, last_contact_at
-           FROM crm_contacts
-           WHERE user_id = $1 AND (${conditions.join(" OR ")})
-           ORDER BY updated_at DESC LIMIT 5`,
-          values
-        );
-        matches = r.rows;
+    // Normalise -> always return contacts array
+    let contacts = Array.isArray(parsed.contacts) ? parsed.contacts : [];
+    if (contacts.length === 0) {
+      // Backward-compat: maybe AI returned a flat object
+      if (parsed.name || parsed.email || parsed.phone) {
+        contacts = [{
+          name: parsed.name || null,
+          title: parsed.title || parsed.jobTitle || null,
+          company: parsed.company || null,
+          phone: parsed.phone || null,
+          phoneAlt: parsed.phoneAlt || null,
+          email: parsed.email || null,
+          website: parsed.website || null,
+          country: parsed.country || null,
+          city: parsed.city || null,
+          address: parsed.address || null,
+          type: parsed.type || "lead",
+          notes: parsed.notes || null,
+          language: parsed.language || null,
+          side: back ? "both" : "front",
+        }];
       }
     }
 
-    res.json({ extracted: parsed, matches });
+    // Find matches per contact
+    const enriched = [];
+    for (const c of contacts) {
+      let matches = [];
+      const phoneDigits = normPhone(c.phone);
+      const email = (c.email || "").toLowerCase().trim();
+      if (phoneDigits || email) {
+        const conditions = [];
+        const values = [userId];
+        let idx = 2;
+        if (phoneDigits && phoneDigits.length >= 7) {
+          conditions.push(`regexp_replace(coalesce(phone,''), '[^0-9]', '', 'g') LIKE $${idx++}`);
+          values.push(`%${phoneDigits.slice(-9)}%`);
+        }
+        if (email) {
+          conditions.push(`LOWER(email) = $${idx++}`);
+          values.push(email);
+        }
+        if (conditions.length > 0) {
+          const r = await pool.query(
+            `SELECT id, name, type, title, company, phone, email, country, city, last_contact_at
+             FROM crm_contacts
+             WHERE user_id = $1 AND (${conditions.join(" OR ")})
+             ORDER BY updated_at DESC LIMIT 5`,
+            values
+          );
+          matches = r.rows;
+        }
+      }
+      enriched.push({ extracted: c, matches });
+    }
+
+    res.json({
+      contacts: enriched,
+      isTwoPeople: !!parsed.isTwoPeople && enriched.length > 1,
+      reason: parsed.reason || null,
+      // Backward-compat for old client
+      extracted: enriched[0]?.extracted || null,
+      matches: enriched[0]?.matches || [],
+    });
   } catch (error) {
     console.error("Error scanning card:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   CRM – Folders (hierarchical)
+   ========================================================= */
+
+app.get("/api/crm/folders", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const result = await pool.query(
+      `SELECT f.*,
+        (SELECT COUNT(*)::int FROM crm_contacts c WHERE c.folder_id = f.id) AS direct_count
+       FROM crm_folders f
+       WHERE f.user_id = $1
+       ORDER BY f.name ASC`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Folders fetch error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/crm/folders", async (req, res) => {
+  try {
+    const { userId, name, parentId, color } = req.body;
+    if (!userId || !name) return res.status(400).json({ error: "userId and name are required" });
+    const result = await pool.query(
+      `INSERT INTO crm_folders (user_id, name, parent_id, color)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [userId, String(name).trim(), parentId || null, color || null]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("Folder create error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.put("/api/crm/folders/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, parentId, color } = req.body;
+    const fields = [];
+    const values = [];
+    let idx = 1;
+    if (name !== undefined) { fields.push(`name = $${idx++}`); values.push(String(name).trim()); }
+    if (parentId !== undefined) { fields.push(`parent_id = $${idx++}`); values.push(parentId || null); }
+    if (color !== undefined) { fields.push(`color = $${idx++}`); values.push(color || null); }
+    fields.push(`updated_at = NOW()`);
+    if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
+
+    // Prevent making a folder its own ancestor
+    if (parentId) {
+      const cyc = await pool.query(
+        `WITH RECURSIVE descendants AS (
+           SELECT id FROM crm_folders WHERE id = $1
+           UNION ALL
+           SELECT f.id FROM crm_folders f INNER JOIN descendants d ON f.parent_id = d.id
+         )
+         SELECT 1 FROM descendants WHERE id = $2`,
+        [id, parentId]
+      );
+      if (cyc.rows.length > 0) return res.status(400).json({ error: "Cannot move a folder into its own descendant" });
+    }
+
+    values.push(id);
+    const result = await pool.query(
+      `UPDATE crm_folders SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Folder not found" });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Folder update error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/api/crm/folders/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    // ON DELETE CASCADE deletes children folders; ON DELETE SET NULL on contacts.folder_id moves contacts to root
+    await pool.query("DELETE FROM crm_folders WHERE id = $1", [id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Folder delete error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/crm/contacts/move-to-folder", async (req, res) => {
+  try {
+    const { userId, contactIds, folderId } = req.body;
+    if (!userId || !Array.isArray(contactIds) || contactIds.length === 0) {
+      return res.status(400).json({ error: "userId and non-empty contactIds required" });
+    }
+    const result = await pool.query(
+      `UPDATE crm_contacts SET folder_id = $1, updated_at = NOW()
+       WHERE user_id = $2 AND id = ANY($3::int[]) RETURNING id`,
+      [folderId || null, userId, contactIds.map(Number)]
+    );
+    res.json({ success: true, updated: result.rowCount });
+  } catch (error) {
+    console.error("Move to folder error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   CRM – Title migration (extract titles from notes, one-time)
+   ========================================================= */
+
+app.post("/api/crm/contacts/migrate-titles", async (req, res) => {
+  try {
+    const { userId, dryRun } = req.body;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    // Common job-title keywords (case-insensitive)
+    const TITLE_PATTERNS = [
+      /\b(CEO|CFO|COO|CTO|CMO|CIO|CSO|VP|SVP|EVP)\b/i,
+      /\b(President|Vice President|Founder|Co[- ]?Founder|Owner|Partner|Managing Partner|Director|Managing Director|General Manager)\b/i,
+      /\b(Sales (Director|Manager|Executive|Representative|Rep)|Account (Manager|Executive)|Business Development( Manager)?)\b/i,
+      /\b(Designer|Senior Designer|Lead Designer|Creative Director|Art Director|Goldsmith|Jeweler|Gemologist|Appraiser|Polisher|Cutter|Setter)\b/i,
+      /\b(Marketing (Director|Manager|Coordinator)|Brand Manager|PR Manager)\b/i,
+      /\b(Buyer|Senior Buyer|Head Buyer|Procurement (Manager|Director))\b/i,
+      /\b(Manager|Senior Manager|Head of [A-Za-z ]+|Chief [A-Za-z ]+)\b/i,
+    ];
+
+    const rows = await pool.query(
+      `SELECT id, name, notes FROM crm_contacts
+       WHERE user_id = $1 AND (title IS NULL OR title = '') AND notes IS NOT NULL AND notes <> ''`,
+      [userId]
+    );
+
+    const updates = [];
+    for (const r of rows.rows) {
+      const lines = r.notes.split(/\r?\n/);
+      let foundTitle = null;
+      let remainingLines = [];
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || foundTitle) { remainingLines.push(line); continue; }
+        let matched = false;
+        for (const pat of TITLE_PATTERNS) {
+          const m = trimmed.match(pat);
+          if (m) {
+            // Use the whole line if short, else just the matched phrase
+            foundTitle = trimmed.length <= 60 ? trimmed : m[0];
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) remainingLines.push(line);
+      }
+      if (foundTitle) {
+        const newNotes = remainingLines.join("\n").replace(/\n{3,}/g, "\n\n").trim() || null;
+        updates.push({ id: r.id, name: r.name, title: foundTitle, newNotes });
+      }
+    }
+
+    if (!dryRun) {
+      for (const u of updates) {
+        await pool.query(
+          `UPDATE crm_contacts SET title = $1, notes = $2, updated_at = NOW() WHERE id = $3`,
+          [u.title, u.newNotes, u.id]
+        );
+      }
+    }
+
+    res.json({
+      total: rows.rows.length,
+      migrated: updates.length,
+      preview: updates.slice(0, 20).map(u => ({ id: u.id, name: u.name, title: u.title })),
+      dryRun: !!dryRun,
+    });
+  } catch (error) {
+    console.error("Title migration error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   CRM – Import contacts (preview + execute)
+   ========================================================= */
+
+const normEmail = (e) => (e || "").toLowerCase().trim();
+
+app.post("/api/crm/contacts/import-preview", async (req, res) => {
+  try {
+    const { userId, rows } = req.body;
+    if (!userId || !Array.isArray(rows)) return res.status(400).json({ error: "userId and rows array required" });
+
+    // Fetch all existing contacts once for fast in-memory matching
+    const existing = await pool.query(
+      `SELECT id, name, company, phone, email FROM crm_contacts WHERE user_id = $1`,
+      [userId]
+    );
+    const byPhone = new Map();
+    const byEmail = new Map();
+    for (const e of existing.rows) {
+      const ph = normPhone(e.phone);
+      const em = normEmail(e.email);
+      if (ph && ph.length >= 7) byPhone.set(ph.slice(-9), e);
+      if (em) byEmail.set(em, e);
+    }
+
+    const preview = rows.map((r, idx) => {
+      const ph = normPhone(r.phone);
+      const em = normEmail(r.email);
+      let match = null;
+      if (em && byEmail.has(em)) match = byEmail.get(em);
+      else if (ph && ph.length >= 7 && byPhone.has(ph.slice(-9))) match = byPhone.get(ph.slice(-9));
+      return {
+        rowIdx: idx,
+        data: r,
+        match,
+        action: match ? "merge" : "create", // default suggestion
+      };
+    });
+
+    res.json({
+      total: rows.length,
+      duplicates: preview.filter(p => p.match).length,
+      newCount: preview.filter(p => !p.match).length,
+      preview,
+    });
+  } catch (error) {
+    console.error("Import preview error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/crm/contacts/import-execute", async (req, res) => {
+  try {
+    const { userId, rows, defaultFolderId } = req.body;
+    // rows: [{ data, action: 'create'|'merge'|'skip', matchId? }, ...]
+    if (!userId || !Array.isArray(rows)) return res.status(400).json({ error: "userId and rows array required" });
+
+    let created = 0, merged = 0, skipped = 0, failed = 0;
+    const errors = [];
+
+    for (const r of rows) {
+      try {
+        if (r.action === "skip") { skipped++; continue; }
+        const d = r.data || {};
+        if (!d.name) { skipped++; continue; }
+
+        if (r.action === "merge" && r.matchId) {
+          // Update only fields that are currently empty on the existing contact
+          const existing = await pool.query(`SELECT * FROM crm_contacts WHERE id = $1 AND user_id = $2`, [r.matchId, userId]);
+          if (existing.rows.length === 0) { skipped++; continue; }
+          const cur = existing.rows[0];
+          const setFields = [];
+          const setVals = [];
+          let idx = 1;
+          const fillIfEmpty = (col, camel) => {
+            if (d[camel] && (cur[col] === null || cur[col] === "")) {
+              setFields.push(`${col} = $${idx++}`);
+              setVals.push(d[camel]);
+            }
+          };
+          fillIfEmpty("title", "title");
+          fillIfEmpty("company", "company");
+          fillIfEmpty("phone", "phone");
+          fillIfEmpty("phone_alt", "phoneAlt");
+          fillIfEmpty("email", "email");
+          fillIfEmpty("website", "website");
+          fillIfEmpty("country", "country");
+          fillIfEmpty("city", "city");
+          fillIfEmpty("address", "address");
+          if (d.notes) {
+            const newNotes = (cur.notes || "") + (cur.notes ? "\n---\n" : "") + d.notes;
+            setFields.push(`notes = $${idx++}`); setVals.push(newNotes);
+          }
+          if (defaultFolderId && !cur.folder_id) {
+            setFields.push(`folder_id = $${idx++}`); setVals.push(defaultFolderId);
+          }
+          if (setFields.length > 0) {
+            setFields.push(`updated_at = NOW()`);
+            setVals.push(r.matchId);
+            await pool.query(`UPDATE crm_contacts SET ${setFields.join(", ")} WHERE id = $${idx}`, setVals);
+          }
+          merged++;
+        } else {
+          await pool.query(
+            `INSERT INTO crm_contacts (
+               user_id, name, type, title, company, phone, phone_alt, email, website,
+               country, city, address, source, status, tags, notes, folder_id
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+            [
+              userId, d.name, d.type || "lead", d.title || null, d.company || null,
+              d.phone || null, d.phoneAlt || null, d.email || null, d.website || null,
+              d.country || null, d.city || null, d.address || null, d.source || "import", "active",
+              JSON.stringify(d.tags || []), d.notes || null, defaultFolderId || null,
+            ]
+          );
+          created++;
+        }
+      } catch (e) {
+        failed++;
+        errors.push({ rowIdx: r.rowIdx, error: e.message });
+      }
+    }
+
+    res.json({ created, merged, skipped, failed, errors });
+  } catch (error) {
+    console.error("Import execute error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   CRM – Email broadcast (Resend)
+   ========================================================= */
+
+app.post("/api/crm/email/send-broadcast", async (req, res) => {
+  try {
+    const { userId, contactIds, subject, html, text, fromName, replyTo, dryRun } = req.body;
+    if (!userId || !Array.isArray(contactIds) || contactIds.length === 0) {
+      return res.status(400).json({ error: "userId and contactIds required" });
+    }
+    if (!subject || (!html && !text)) {
+      return res.status(400).json({ error: "subject and (html or text) required" });
+    }
+
+    if (!process.env.RESEND_API_KEY) {
+      return res.status(500).json({
+        error: "RESEND_API_KEY is not configured. Sign up at resend.com (free 3,000/month), add the API key to your server environment, and try again."
+      });
+    }
+    const fromEmail = process.env.RESEND_FROM_EMAIL || "onboarding@resend.dev";
+    const senderName = (fromName || "GEMS DNA").replace(/[\r\n]/g, "");
+    const fromHeader = `${senderName} <${fromEmail}>`;
+
+    // Fetch recipients
+    const recipientsRes = await pool.query(
+      `SELECT id, name, email, company, title FROM crm_contacts
+       WHERE user_id = $1 AND id = ANY($2::int[]) AND email IS NOT NULL AND email <> ''`,
+      [userId, contactIds.map(Number)]
+    );
+    const recipients = recipientsRes.rows;
+
+    if (recipients.length === 0) {
+      return res.status(400).json({ error: "None of the selected contacts have an email address." });
+    }
+
+    if (dryRun) {
+      return res.json({
+        dryRun: true,
+        wouldSend: recipients.length,
+        recipients: recipients.map(r => ({ id: r.id, name: r.name, email: r.email })),
+      });
+    }
+
+    const personalize = (template, c) => {
+      if (!template) return template;
+      const firstName = (c.name || "").split(/\s+/)[0] || "";
+      return template
+        .replace(/\{\{?\s*name\s*\}?\}/gi, c.name || "")
+        .replace(/\{\{?\s*firstName\s*\}?\}/gi, firstName)
+        .replace(/\{\{?\s*company\s*\}?\}/gi, c.company || "")
+        .replace(/\{\{?\s*title\s*\}?\}/gi, c.title || "");
+    };
+
+    const details = [];
+    let sent = 0, failed = 0;
+
+    for (const r of recipients) {
+      try {
+        const body = {
+          from: fromHeader,
+          to: [r.email],
+          subject: personalize(subject, r),
+          ...(html ? { html: personalize(html, r) } : {}),
+          ...(text ? { text: personalize(text, r) } : {}),
+          ...(replyTo ? { reply_to: replyTo } : {}),
+        };
+        const sendRes = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
+          },
+          body: JSON.stringify(body),
+        });
+        if (!sendRes.ok) {
+          const errTxt = await sendRes.text();
+          failed++;
+          details.push({ contactId: r.id, email: r.email, status: "failed", error: errTxt.slice(0, 300) });
+        } else {
+          sent++;
+          details.push({ contactId: r.id, email: r.email, status: "sent" });
+          // Log as interaction
+          await pool.query(
+            `INSERT INTO crm_interactions (user_id, contact_id, type, direction, subject, content, metadata)
+             VALUES ($1, $2, 'email', 'outgoing', $3, $4, $5)`,
+            [userId, r.id, personalize(subject, r), text ? personalize(text, r) : null, JSON.stringify({ broadcast: true })]
+          );
+          await pool.query(`UPDATE crm_contacts SET last_contact_at = NOW(), updated_at = NOW() WHERE id = $1`, [r.id]);
+        }
+      } catch (e) {
+        failed++;
+        details.push({ contactId: r.id, email: r.email, status: "failed", error: e.message });
+      }
+    }
+
+    // Save broadcast log
+    await pool.query(
+      `INSERT INTO crm_email_broadcasts (user_id, subject, body, recipients_count, sent_count, failed_count, details)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [userId, subject, html || text, recipients.length, sent, failed, JSON.stringify(details)]
+    );
+
+    res.json({ sent, failed, total: recipients.length, details });
+  } catch (error) {
+    console.error("Email broadcast error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/crm/email/broadcasts", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const result = await pool.query(
+      `SELECT id, subject, recipients_count, sent_count, failed_count, sent_at
+       FROM crm_email_broadcasts WHERE user_id = $1 ORDER BY sent_at DESC LIMIT 50`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Broadcast log fetch error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
