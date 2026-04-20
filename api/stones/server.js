@@ -1291,6 +1291,9 @@ const crmReadyPromise = (async () => {
       "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_back_notes TEXT",
       "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS outlook_contact_id TEXT",
       "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS outlook_synced_at TIMESTAMP",
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_image_front TEXT",
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_image_back TEXT",
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_image_thumb TEXT",
     ];
     for (const sql of newCols) {
       try { await pool.query(sql); } catch (e) { console.warn("Migration warn:", e.message); }
@@ -1395,11 +1398,23 @@ app.get("/api/crm/contacts", async (req, res) => {
 
     let result;
     try {
+      // Exclude heavy card image columns from list responses (they are loaded on demand from the single-contact endpoint).
+      // Keep card_image_thumb for the table preview, plus boolean flags so the UI knows what's available.
       result = await pool.query(
-        `SELECT c.*,
-          f.name AS folder_name,
-          (SELECT COUNT(*)::int FROM crm_deals d WHERE d.contact_id = c.id) AS deals_count,
-          (SELECT COALESCE(SUM(value),0) FROM crm_deals d WHERE d.contact_id = c.id AND d.stage = 'won') AS total_won
+        `SELECT
+            c.id, c.user_id, c.name, c.type, c.title, c.company,
+            c.phone, c.phone_alt, c.email, c.website,
+            c.country, c.city, c.address,
+            c.source, c.status, c.notes, c.tags, c.preferences,
+            c.folder_id, c.linked_contact_ids, c.card_back_notes,
+            c.outlook_contact_id, c.outlook_synced_at,
+            c.card_image_thumb,
+            (c.card_image_front IS NOT NULL) AS has_card_front,
+            (c.card_image_back IS NOT NULL) AS has_card_back,
+            c.last_contact_at, c.created_at, c.updated_at,
+            f.name AS folder_name,
+            (SELECT COUNT(*)::int FROM crm_deals d WHERE d.contact_id = c.id) AS deals_count,
+            (SELECT COALESCE(SUM(value),0) FROM crm_deals d WHERE d.contact_id = c.id AND d.stage = 'won') AS total_won
          FROM crm_contacts c
          LEFT JOIN crm_folders f ON f.id = c.folder_id
          WHERE ${conditions.join(" AND ")}
@@ -1425,10 +1440,14 @@ app.get("/api/crm/contacts", async (req, res) => {
         await pool.query(`ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS folder_id INTEGER`);
         await pool.query(`ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS linked_contact_ids JSONB DEFAULT '[]'`);
         await pool.query(`ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_back_notes TEXT`);
+        await pool.query(`ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_image_front TEXT`);
+        await pool.query(`ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_image_back TEXT`);
+        await pool.query(`ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_image_thumb TEXT`);
       } catch (healErr) {
         console.error("Self-heal failed:", healErr.message);
       }
-      // Fallback query without the folder join (still safe even if folder_id missing)
+      // Fallback query without the folder join (still safe even if folder_id is missing).
+      // Uses c.* so it works regardless of which optional columns exist.
       result = await pool.query(
         `SELECT c.*,
           NULL::text AS folder_name,
@@ -1490,6 +1509,7 @@ app.post("/api/crm/contacts", async (req, res) => {
       userId, name, type, title, company, phone, phoneAlt, email, website,
       country, city, address, source, status, tags, preferences, notes, avatarUrl,
       folderId, linkedContactIds, cardBackNotes,
+      cardImageFront, cardImageBack, cardImageThumb,
     } = req.body;
     if (!userId || !name) return res.status(400).json({ error: "userId and name are required" });
 
@@ -1497,9 +1517,16 @@ app.post("/api/crm/contacts", async (req, res) => {
       `INSERT INTO crm_contacts (
          user_id, name, type, title, company, phone, phone_alt, email, website,
          country, city, address, source, status, tags, preferences, notes, avatar_url,
-         folder_id, linked_contact_ids, card_back_notes
+         folder_id, linked_contact_ids, card_back_notes,
+         card_image_front, card_image_back, card_image_thumb
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING *`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+       RETURNING id, user_id, name, type, title, company, phone, phone_alt, email, website,
+                 country, city, address, source, status, tags, preferences, notes, avatar_url,
+                 folder_id, linked_contact_ids, card_back_notes, card_image_thumb,
+                 (card_image_front IS NOT NULL) AS has_card_front,
+                 (card_image_back IS NOT NULL) AS has_card_back,
+                 last_contact_at, created_at, updated_at`,
       [
         userId, name.trim(), type || 'lead', title || null, company || null,
         phone || null, phoneAlt || null, email || null, website || null,
@@ -1507,12 +1534,13 @@ app.post("/api/crm/contacts", async (req, res) => {
         JSON.stringify(tags || []), JSON.stringify(preferences || {}),
         notes || null, avatarUrl || null,
         folderId || null, JSON.stringify(linkedContactIds || []), cardBackNotes || null,
+        cardImageFront || null, cardImageBack || null, cardImageThumb || null,
       ]
     );
     res.status(201).json(result.rows[0]);
   } catch (error) {
     console.error("Error creating contact:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: error.message || "Internal server error" });
   }
 });
 
@@ -1522,7 +1550,8 @@ app.put("/api/crm/contacts/:id", async (req, res) => {
     const allowed = [
       'name','type','title','company','phone','phone_alt','email','website',
       'country','city','address','source','status','tags','preferences','notes','avatar_url','last_contact_at',
-      'folder_id','linked_contact_ids','card_back_notes'
+      'folder_id','linked_contact_ids','card_back_notes',
+      'card_image_front','card_image_back','card_image_thumb'
     ];
     const fields = [];
     const values = [];
