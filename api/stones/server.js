@@ -1808,6 +1808,126 @@ app.get("/api/crm/stats", async (req, res) => {
 });
 
 /* =========================================================
+   CRM – Business Card Scanner (OpenAI Vision)
+   ========================================================= */
+
+const normPhone = (p) => (p || "").replace(/[^\d]/g, "");
+
+app.post("/api/crm/scan-card", async (req, res) => {
+  try {
+    const { userId, imageBase64 } = req.body;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    if (!imageBase64) return res.status(400).json({ error: "imageBase64 is required" });
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not configured on the server" });
+    }
+
+    const dataUrl = imageBase64.startsWith("data:")
+      ? imageBase64
+      : `data:image/jpeg;base64,${imageBase64}`;
+
+    const prompt = `You are an OCR assistant for business cards used at gem and jewelry trade shows.
+Extract structured contact details from the image. Return ONLY valid JSON, no prose.
+
+Schema (use null for missing fields):
+{
+  "name": string|null,
+  "jobTitle": string|null,
+  "company": string|null,
+  "phone": string|null,
+  "phoneAlt": string|null,
+  "email": string|null,
+  "website": string|null,
+  "country": string|null,
+  "city": string|null,
+  "address": string|null,
+  "type": "buyer"|"dealer"|"designer"|"supplier"|"lead",
+  "notes": string|null,
+  "language": string|null
+}
+
+Rules:
+- Choose "type" by guessing from job title/company (jeweler/designer = designer; wholesale/diamond dealer = dealer; supplier/manufacturer = supplier; retailer = buyer; otherwise lead).
+- If multiple phones, put the main mobile in "phone" and the office in "phoneAlt".
+- Keep phone numbers exactly as they appear (with + and country code if present).
+- "notes" should contain any extra text on the card that does not fit the other fields (e.g. specialties, services).
+- "language" is ISO code of the dominant language ("en", "he", etc.).
+Output ONLY the JSON object.`;
+
+    const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        temperature: 0,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
+            ],
+          },
+        ],
+      }),
+    });
+
+    if (!aiRes.ok) {
+      const errText = await aiRes.text();
+      console.error("OpenAI error:", aiRes.status, errText);
+      return res.status(502).json({ error: `OCR provider error (${aiRes.status})` });
+    }
+
+    const aiData = await aiRes.json();
+    let parsed;
+    try {
+      parsed = JSON.parse(aiData.choices?.[0]?.message?.content || "{}");
+    } catch (e) {
+      return res.status(500).json({ error: "Failed to parse OCR response" });
+    }
+
+    // Try to find matching contact by phone or email
+    let matches = [];
+    const phoneDigits = normPhone(parsed.phone);
+    const altDigits = normPhone(parsed.phoneAlt);
+    const email = (parsed.email || "").toLowerCase().trim();
+
+    if (phoneDigits || altDigits || email) {
+      const conditions = [];
+      const values = [userId];
+      let idx = 2;
+      if (phoneDigits && phoneDigits.length >= 7) {
+        conditions.push(`regexp_replace(coalesce(phone,''), '[^0-9]', '', 'g') LIKE $${idx++}`);
+        values.push(`%${phoneDigits.slice(-9)}%`);
+      }
+      if (email) {
+        conditions.push(`LOWER(email) = $${idx++}`);
+        values.push(email);
+      }
+      if (conditions.length > 0) {
+        const r = await pool.query(
+          `SELECT id, name, type, company, phone, email, country, city, last_contact_at
+           FROM crm_contacts
+           WHERE user_id = $1 AND (${conditions.join(" OR ")})
+           ORDER BY updated_at DESC LIMIT 5`,
+          values
+        );
+        matches = r.rows;
+      }
+    }
+
+    res.json({ extracted: parsed, matches });
+  } catch (error) {
+    console.error("Error scanning card:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
    Start server
    ========================================================= */
 app.listen(port, () => {

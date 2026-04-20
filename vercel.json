@@ -116,6 +116,10 @@
       {
         "src": "/api/crm/whatsapp-log",
         "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/scan-card",
+        "dest": "api/stones/server.js"
       }
     ]
   }
