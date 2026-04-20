@@ -28,6 +28,17 @@ const encrypt = (text) => {
   return CryptoJS.AES.encrypt(text, ENCRYPT_SECRET).toString();
 };
 
+const decrypt = (cipher) => {
+  if (!cipher) return null;
+  try {
+    const bytes = CryptoJS.AES.decrypt(cipher, ENCRYPT_SECRET);
+    return bytes.toString(CryptoJS.enc.Utf8) || null;
+  } catch (e) {
+    console.error("Decrypt failed:", e.message);
+    return null;
+  }
+};
+
 /* =========================================================
    /api/stones – כל האבנים מטבלת stones (לא selector)
    ========================================================= */
@@ -1234,6 +1245,27 @@ const crmReadyPromise = (async () => {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_folders_user ON crm_folders(user_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_folders_parent ON crm_folders(parent_id)`);
 
+    // Per-user OAuth/integration tokens (Outlook, etc.)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_integrations (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        account_email TEXT,
+        account_name TEXT,
+        access_token_enc TEXT,
+        refresh_token_enc TEXT,
+        expires_at TIMESTAMP,
+        scope TEXT,
+        last_sync_at TIMESTAMP,
+        metadata JSONB DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(user_id, provider)
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_integrations_user ON crm_integrations(user_id)`);
+
     // Email broadcast log
     await pool.query(`
       CREATE TABLE IF NOT EXISTS crm_email_broadcasts (
@@ -1257,6 +1289,8 @@ const crmReadyPromise = (async () => {
       "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS folder_id INTEGER",
       "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS linked_contact_ids JSONB DEFAULT '[]'",
       "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_back_notes TEXT",
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS outlook_contact_id TEXT",
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS outlook_synced_at TIMESTAMP",
     ];
     for (const sql of newCols) {
       try { await pool.query(sql); } catch (e) { console.warn("Migration warn:", e.message); }
@@ -2647,7 +2681,7 @@ app.post("/api/crm/contacts/import-execute", async (req, res) => {
 
 app.post("/api/crm/email/send-broadcast", async (req, res) => {
   try {
-    const { userId, contactIds, subject, html, text, fromName, replyTo, dryRun } = req.body;
+    const { userId, contactIds, subject, html, text, fromName, replyTo, dryRun, provider } = req.body;
     if (!userId || !Array.isArray(contactIds) || contactIds.length === 0) {
       return res.status(400).json({ error: "userId and contactIds required" });
     }
@@ -2655,11 +2689,23 @@ app.post("/api/crm/email/send-broadcast", async (req, res) => {
       return res.status(400).json({ error: "subject and (html or text) required" });
     }
 
-    if (!process.env.RESEND_API_KEY) {
-      return res.status(500).json({
-        error: "RESEND_API_KEY is not configured. Sign up at resend.com (free 3,000/month), add the API key to your server environment, and try again."
-      });
+    const sendProvider = provider === "outlook" ? "outlook" : "resend";
+
+    let outlookAccessToken = null;
+    if (sendProvider === "outlook") {
+      try {
+        outlookAccessToken = await getValidOutlookToken(userId);
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
+    } else {
+      if (!process.env.RESEND_API_KEY) {
+        return res.status(500).json({
+          error: "RESEND_API_KEY is not configured. Sign up at resend.com (free 3,000/month), add the API key to your server environment, and try again."
+        });
+      }
     }
+
     const fromEmail = process.env.RESEND_FROM_EMAIL || "onboarding@resend.dev";
     const senderName = (fromName || "GEMS DNA").replace(/[\r\n]/g, "");
     const fromHeader = `${senderName} <${fromEmail}>`;
@@ -2679,6 +2725,7 @@ app.post("/api/crm/email/send-broadcast", async (req, res) => {
     if (dryRun) {
       return res.json({
         dryRun: true,
+        provider: sendProvider,
         wouldSend: recipients.length,
         recipients: recipients.map(r => ({ id: r.id, name: r.name, email: r.email })),
       });
@@ -2699,34 +2746,58 @@ app.post("/api/crm/email/send-broadcast", async (req, res) => {
 
     for (const r of recipients) {
       try {
-        const body = {
-          from: fromHeader,
-          to: [r.email],
-          subject: personalize(subject, r),
-          ...(html ? { html: personalize(html, r) } : {}),
-          ...(text ? { text: personalize(text, r) } : {}),
-          ...(replyTo ? { reply_to: replyTo } : {}),
-        };
-        const sendRes = await fetch("https://api.resend.com/emails", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
-          },
-          body: JSON.stringify(body),
-        });
-        if (!sendRes.ok) {
-          const errTxt = await sendRes.text();
+        const subj = personalize(subject, r);
+        const personalizedHtml = html ? personalize(html, r) : null;
+        const personalizedText = text ? personalize(text, r) : null;
+
+        let ok = false, errTxt = "";
+
+        if (sendProvider === "outlook") {
+          const sendRes = await fetch("https://graph.microsoft.com/v1.0/me/sendMail", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${outlookAccessToken}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              message: {
+                subject: subj,
+                body: { contentType: personalizedHtml ? "HTML" : "Text", content: personalizedHtml || personalizedText },
+                toRecipients: [{ emailAddress: { address: r.email, name: r.name } }],
+              },
+              saveToSentItems: true,
+            }),
+          });
+          ok = sendRes.ok;
+          if (!ok) errTxt = (await sendRes.text()).slice(0, 300);
+        } else {
+          const body = {
+            from: fromHeader,
+            to: [r.email],
+            subject: subj,
+            ...(personalizedHtml ? { html: personalizedHtml } : {}),
+            ...(personalizedText ? { text: personalizedText } : {}),
+            ...(replyTo ? { reply_to: replyTo } : {}),
+          };
+          const sendRes = await fetch("https://api.resend.com/emails", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
+            },
+            body: JSON.stringify(body),
+          });
+          ok = sendRes.ok;
+          if (!ok) errTxt = (await sendRes.text()).slice(0, 300);
+        }
+
+        if (!ok) {
           failed++;
-          details.push({ contactId: r.id, email: r.email, status: "failed", error: errTxt.slice(0, 300) });
+          details.push({ contactId: r.id, email: r.email, status: "failed", error: errTxt });
         } else {
           sent++;
           details.push({ contactId: r.id, email: r.email, status: "sent" });
-          // Log as interaction
           await pool.query(
             `INSERT INTO crm_interactions (user_id, contact_id, type, direction, subject, content, metadata)
              VALUES ($1, $2, 'email', 'outgoing', $3, $4, $5)`,
-            [userId, r.id, personalize(subject, r), text ? personalize(text, r) : null, JSON.stringify({ broadcast: true })]
+            [userId, r.id, subj, personalizedText, JSON.stringify({ broadcast: true, provider: sendProvider })]
           );
           await pool.query(`UPDATE crm_contacts SET last_contact_at = NOW(), updated_at = NOW() WHERE id = $1`, [r.id]);
         }
@@ -2740,13 +2811,13 @@ app.post("/api/crm/email/send-broadcast", async (req, res) => {
     await pool.query(
       `INSERT INTO crm_email_broadcasts (user_id, subject, body, recipients_count, sent_count, failed_count, details)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [userId, subject, html || text, recipients.length, sent, failed, JSON.stringify(details)]
+      [userId, subject, html || text, recipients.length, sent, failed, JSON.stringify({ provider: sendProvider, details })]
     );
 
-    res.json({ sent, failed, total: recipients.length, details });
+    res.json({ sent, failed, total: recipients.length, provider: sendProvider, details });
   } catch (error) {
     console.error("Email broadcast error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: error.message || "Internal server error" });
   }
 });
 
@@ -2763,6 +2834,510 @@ app.get("/api/crm/email/broadcasts", async (req, res) => {
   } catch (error) {
     console.error("Broadcast log fetch error:", error);
     res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   CRM – Outlook / Microsoft Graph integration
+   ========================================================= */
+
+const OUTLOOK_TENANT = process.env.OUTLOOK_TENANT || "common";
+const OUTLOOK_CLIENT_ID = process.env.OUTLOOK_CLIENT_ID;
+const OUTLOOK_CLIENT_SECRET = process.env.OUTLOOK_CLIENT_SECRET;
+const OUTLOOK_REDIRECT_URI = process.env.OUTLOOK_REDIRECT_URI; // e.g. https://gems-dna-be.onrender.com/api/crm/outlook/callback
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://gems-dna-fe.vercel.app";
+const OUTLOOK_SCOPES = [
+  "offline_access",
+  "User.Read",
+  "Contacts.ReadWrite",
+  "Mail.Send",
+  "Mail.Read",
+];
+
+const outlookConfigured = () => !!(OUTLOOK_CLIENT_ID && OUTLOOK_CLIENT_SECRET && OUTLOOK_REDIRECT_URI);
+
+// Save (encrypted) integration record. Upsert by (user_id, provider).
+const saveIntegration = async ({ userId, provider, accessToken, refreshToken, expiresIn, scope, accountEmail, accountName, metadata }) => {
+  const expiresAt = expiresIn ? new Date(Date.now() + (expiresIn - 60) * 1000) : null;
+  const accessEnc = accessToken ? encrypt(accessToken) : null;
+  const refreshEnc = refreshToken ? encrypt(refreshToken) : null;
+  await pool.query(
+    `INSERT INTO crm_integrations (user_id, provider, account_email, account_name, access_token_enc, refresh_token_enc, expires_at, scope, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (user_id, provider) DO UPDATE SET
+       account_email = EXCLUDED.account_email,
+       account_name = EXCLUDED.account_name,
+       access_token_enc = EXCLUDED.access_token_enc,
+       refresh_token_enc = COALESCE(EXCLUDED.refresh_token_enc, crm_integrations.refresh_token_enc),
+       expires_at = EXCLUDED.expires_at,
+       scope = EXCLUDED.scope,
+       metadata = EXCLUDED.metadata,
+       updated_at = NOW()`,
+    [userId, provider, accountEmail || null, accountName || null, accessEnc, refreshEnc, expiresAt, scope || null, JSON.stringify(metadata || {})]
+  );
+};
+
+const getIntegration = async (userId, provider) => {
+  const r = await pool.query(
+    `SELECT * FROM crm_integrations WHERE user_id = $1 AND provider = $2 LIMIT 1`,
+    [userId, provider]
+  );
+  if (r.rows.length === 0) return null;
+  const row = r.rows[0];
+  return {
+    ...row,
+    access_token: decrypt(row.access_token_enc),
+    refresh_token: decrypt(row.refresh_token_enc),
+  };
+};
+
+// Refresh access token if expired
+const getValidOutlookToken = async (userId) => {
+  const integ = await getIntegration(userId, "outlook");
+  if (!integ) throw new Error("Outlook is not connected for this user");
+  if (!integ.access_token) throw new Error("Outlook tokens are missing — please reconnect");
+
+  const expiresSoon = !integ.expires_at || new Date(integ.expires_at).getTime() < Date.now() + 30000;
+  if (!expiresSoon) return integ.access_token;
+
+  if (!integ.refresh_token) throw new Error("Outlook session expired — please reconnect");
+
+  const tokenRes = await fetch(`https://login.microsoftonline.com/${OUTLOOK_TENANT}/oauth2/v2.0/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: OUTLOOK_CLIENT_ID,
+      client_secret: OUTLOOK_CLIENT_SECRET,
+      grant_type: "refresh_token",
+      refresh_token: integ.refresh_token,
+      scope: OUTLOOK_SCOPES.join(" "),
+    }).toString(),
+  });
+  if (!tokenRes.ok) {
+    const err = await tokenRes.text();
+    throw new Error(`Failed to refresh Outlook token: ${err.slice(0, 300)}`);
+  }
+  const td = await tokenRes.json();
+  await saveIntegration({
+    userId,
+    provider: "outlook",
+    accessToken: td.access_token,
+    refreshToken: td.refresh_token || integ.refresh_token,
+    expiresIn: td.expires_in,
+    scope: td.scope || integ.scope,
+    accountEmail: integ.account_email,
+    accountName: integ.account_name,
+  });
+  return td.access_token;
+};
+
+// 1. Auth URL
+app.get("/api/crm/outlook/auth-url", (req, res) => {
+  if (!outlookConfigured()) {
+    return res.status(500).json({
+      error: "Outlook is not configured on the server. The administrator needs to set OUTLOOK_CLIENT_ID, OUTLOOK_CLIENT_SECRET and OUTLOOK_REDIRECT_URI."
+    });
+  }
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: "userId is required" });
+
+  const state = encrypt(JSON.stringify({ userId, ts: Date.now() }));
+  const params = new URLSearchParams({
+    client_id: OUTLOOK_CLIENT_ID,
+    response_type: "code",
+    redirect_uri: OUTLOOK_REDIRECT_URI,
+    response_mode: "query",
+    scope: OUTLOOK_SCOPES.join(" "),
+    state,
+    prompt: "select_account",
+  });
+  const url = `https://login.microsoftonline.com/${OUTLOOK_TENANT}/oauth2/v2.0/authorize?${params.toString()}`;
+  res.json({ url });
+});
+
+// 2. Callback (Microsoft redirects here)
+app.get("/api/crm/outlook/callback", async (req, res) => {
+  const { code, state, error: authErr, error_description } = req.query;
+  const redirectBack = (status, msg) => {
+    const u = new URL(`${FRONTEND_URL}/crm/settings`);
+    u.searchParams.set("outlook", status);
+    if (msg) u.searchParams.set("msg", String(msg).slice(0, 200));
+    res.redirect(u.toString());
+  };
+
+  if (authErr) return redirectBack("error", error_description || authErr);
+  if (!code || !state) return redirectBack("error", "Missing code or state");
+
+  try {
+    const decoded = JSON.parse(decrypt(state));
+    const userId = decoded.userId;
+    if (!userId) return redirectBack("error", "Invalid state");
+    if (Date.now() - decoded.ts > 10 * 60 * 1000) return redirectBack("error", "Auth link expired");
+
+    // Exchange code for tokens
+    const tokenRes = await fetch(`https://login.microsoftonline.com/${OUTLOOK_TENANT}/oauth2/v2.0/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: OUTLOOK_CLIENT_ID,
+        client_secret: OUTLOOK_CLIENT_SECRET,
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: OUTLOOK_REDIRECT_URI,
+        scope: OUTLOOK_SCOPES.join(" "),
+      }).toString(),
+    });
+    if (!tokenRes.ok) {
+      const t = await tokenRes.text();
+      console.error("Outlook token exchange failed:", t);
+      return redirectBack("error", `Token exchange failed (${tokenRes.status})`);
+    }
+    const td = await tokenRes.json();
+
+    // Get user profile (email + name)
+    let accountEmail = null, accountName = null;
+    try {
+      const meRes = await fetch("https://graph.microsoft.com/v1.0/me", {
+        headers: { Authorization: `Bearer ${td.access_token}` },
+      });
+      if (meRes.ok) {
+        const me = await meRes.json();
+        accountEmail = me.mail || me.userPrincipalName || null;
+        accountName = me.displayName || null;
+      }
+    } catch (_) {}
+
+    await saveIntegration({
+      userId,
+      provider: "outlook",
+      accessToken: td.access_token,
+      refreshToken: td.refresh_token,
+      expiresIn: td.expires_in,
+      scope: td.scope,
+      accountEmail,
+      accountName,
+    });
+
+    return redirectBack("connected", accountEmail || "Outlook account connected");
+  } catch (e) {
+    console.error("Outlook callback error:", e);
+    return redirectBack("error", e.message);
+  }
+});
+
+// 3. Status
+app.get("/api/crm/outlook/status", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const integ = await getIntegration(userId, "outlook");
+    if (!integ) return res.json({ connected: false, configured: outlookConfigured() });
+    res.json({
+      connected: true,
+      configured: outlookConfigured(),
+      accountEmail: integ.account_email,
+      accountName: integ.account_name,
+      lastSyncAt: integ.last_sync_at,
+      expiresAt: integ.expires_at,
+    });
+  } catch (e) {
+    console.error("Outlook status error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 4. Disconnect
+app.post("/api/crm/outlook/disconnect", async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    await pool.query(`DELETE FROM crm_integrations WHERE user_id = $1 AND provider = 'outlook'`, [userId]);
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Outlook disconnect error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ----- Two-way contact sync ----- */
+const outlookContactToCrm = (oc) => {
+  const phones = [...(oc.businessPhones || []), ...(oc.homePhones || []), oc.mobilePhone].filter(Boolean);
+  const emails = (oc.emailAddresses || []).map((e) => e.address).filter(Boolean);
+  const addr = (oc.businessAddress || oc.homeAddress || {});
+  return {
+    name: oc.displayName || [oc.givenName, oc.surname].filter(Boolean).join(" ") || (emails[0] || "Unnamed"),
+    title: oc.jobTitle || null,
+    company: oc.companyName || null,
+    phone: phones[0] || null,
+    phoneAlt: phones[1] || null,
+    email: emails[0] || null,
+    website: (oc.websites && oc.websites[0]?.address) || null,
+    country: addr.countryOrRegion || null,
+    city: addr.city || null,
+    address: [addr.street, addr.postalCode].filter(Boolean).join(", ") || null,
+    notes: oc.personalNotes || null,
+  };
+};
+
+const crmContactToOutlook = (c) => {
+  const out = { displayName: c.name };
+  const [given, ...rest] = (c.name || "").split(/\s+/);
+  if (given) out.givenName = given;
+  if (rest.length) out.surname = rest.join(" ");
+  if (c.title) out.jobTitle = c.title;
+  if (c.company) out.companyName = c.company;
+  const businessPhones = [c.phone, c.phone_alt].filter(Boolean);
+  if (businessPhones.length) out.businessPhones = businessPhones;
+  if (c.email) out.emailAddresses = [{ address: c.email, name: c.name }];
+  if (c.notes) out.personalNotes = c.notes;
+  if (c.country || c.city || c.address) {
+    out.businessAddress = {
+      ...(c.address ? { street: c.address } : {}),
+      ...(c.city ? { city: c.city } : {}),
+      ...(c.country ? { countryOrRegion: c.country } : {}),
+    };
+  }
+  return out;
+};
+
+app.post("/api/crm/outlook/sync-contacts", async (req, res) => {
+  try {
+    const { userId, direction } = req.body;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const dir = direction || "two-way"; // 'pull' | 'push' | 'two-way'
+
+    const accessToken = await getValidOutlookToken(userId);
+
+    let pulledNew = 0, pulledUpdated = 0, pushedNew = 0, pushedUpdated = 0;
+
+    /* ---- PULL Outlook -> CRM ---- */
+    if (dir === "pull" || dir === "two-way") {
+      let url = "https://graph.microsoft.com/v1.0/me/contacts?$top=100&$select=id,displayName,givenName,surname,jobTitle,companyName,businessPhones,homePhones,mobilePhone,emailAddresses,businessAddress,homeAddress,websites,personalNotes,lastModifiedDateTime";
+      let pages = 0;
+      while (url && pages < 20) {
+        const r = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+        if (!r.ok) {
+          const t = await r.text();
+          throw new Error(`Outlook contacts fetch failed (${r.status}): ${t.slice(0, 200)}`);
+        }
+        const data = await r.json();
+        for (const oc of (data.value || [])) {
+          const mapped = outlookContactToCrm(oc);
+          // Find existing by outlook_contact_id, then by email/phone
+          const existRes = await pool.query(
+            `SELECT id, name, title, company, phone, phone_alt, email, website, country, city, address, notes
+               FROM crm_contacts
+              WHERE user_id = $1 AND (
+                outlook_contact_id = $2
+                OR (LOWER(email) = LOWER($3) AND $3 <> '' AND $3 IS NOT NULL)
+              ) LIMIT 1`,
+            [userId, oc.id, mapped.email || ""]
+          );
+          if (existRes.rows.length === 0) {
+            await pool.query(
+              `INSERT INTO crm_contacts (
+                 user_id, name, type, title, company, phone, phone_alt, email, website,
+                 country, city, address, source, status, notes, outlook_contact_id, outlook_synced_at
+               ) VALUES ($1,$2,'lead',$3,$4,$5,$6,$7,$8,$9,$10,$11,'outlook','active',$12,$13,NOW())`,
+              [userId, mapped.name, mapped.title, mapped.company, mapped.phone, mapped.phoneAlt,
+               mapped.email, mapped.website, mapped.country, mapped.city, mapped.address, mapped.notes, oc.id]
+            );
+            pulledNew++;
+          } else {
+            // Fill empty fields only (non-destructive merge)
+            const cur = existRes.rows[0];
+            const sets = [];
+            const vals = [];
+            let i = 1;
+            const fillIfEmpty = (col, val) => {
+              if (val && (cur[col] === null || cur[col] === "")) {
+                sets.push(`${col} = $${i++}`); vals.push(val);
+              }
+            };
+            fillIfEmpty("title", mapped.title);
+            fillIfEmpty("company", mapped.company);
+            fillIfEmpty("phone", mapped.phone);
+            fillIfEmpty("phone_alt", mapped.phoneAlt);
+            fillIfEmpty("email", mapped.email);
+            fillIfEmpty("website", mapped.website);
+            fillIfEmpty("country", mapped.country);
+            fillIfEmpty("city", mapped.city);
+            fillIfEmpty("address", mapped.address);
+            // Always update the link
+            sets.push(`outlook_contact_id = $${i++}`); vals.push(oc.id);
+            sets.push(`outlook_synced_at = NOW()`);
+            sets.push(`updated_at = NOW()`);
+            vals.push(cur.id);
+            await pool.query(`UPDATE crm_contacts SET ${sets.join(", ")} WHERE id = $${i}`, vals);
+            pulledUpdated++;
+          }
+        }
+        url = data["@odata.nextLink"] || null;
+        pages++;
+      }
+    }
+
+    /* ---- PUSH CRM -> Outlook ---- */
+    if (dir === "push" || dir === "two-way") {
+      // Push CRM contacts that have an email and either no outlook_contact_id, or were updated since last sync
+      const pushRows = await pool.query(
+        `SELECT * FROM crm_contacts
+          WHERE user_id = $1
+            AND (
+              outlook_contact_id IS NULL
+              OR (outlook_synced_at IS NULL OR updated_at > outlook_synced_at)
+            )
+            AND name IS NOT NULL
+          ORDER BY updated_at DESC
+          LIMIT 200`,
+        [userId]
+      );
+      for (const c of pushRows.rows) {
+        const body = JSON.stringify(crmContactToOutlook(c));
+        try {
+          if (c.outlook_contact_id) {
+            const u = `https://graph.microsoft.com/v1.0/me/contacts/${encodeURIComponent(c.outlook_contact_id)}`;
+            const r = await fetch(u, {
+              method: "PATCH",
+              headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+              body,
+            });
+            if (r.ok) {
+              await pool.query(`UPDATE crm_contacts SET outlook_synced_at = NOW() WHERE id = $1`, [c.id]);
+              pushedUpdated++;
+            }
+          } else {
+            const r = await fetch("https://graph.microsoft.com/v1.0/me/contacts", {
+              method: "POST",
+              headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+              body,
+            });
+            if (r.ok) {
+              const created = await r.json();
+              await pool.query(
+                `UPDATE crm_contacts SET outlook_contact_id = $1, outlook_synced_at = NOW() WHERE id = $2`,
+                [created.id, c.id]
+              );
+              pushedNew++;
+            }
+          }
+        } catch (e) {
+          console.warn("Push contact failed:", c.id, e.message);
+        }
+      }
+    }
+
+    await pool.query(
+      `UPDATE crm_integrations SET last_sync_at = NOW(), updated_at = NOW() WHERE user_id = $1 AND provider = 'outlook'`,
+      [userId]
+    );
+
+    res.json({ direction: dir, pulledNew, pulledUpdated, pushedNew, pushedUpdated });
+  } catch (e) {
+    console.error("Outlook sync error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ----- Send a single email through Outlook ----- */
+app.post("/api/crm/outlook/send-email", async (req, res) => {
+  try {
+    const { userId, to, subject, html, text } = req.body;
+    if (!userId || !to || !subject || (!html && !text)) {
+      return res.status(400).json({ error: "userId, to, subject and html|text are required" });
+    }
+    const accessToken = await getValidOutlookToken(userId);
+    const recipients = (Array.isArray(to) ? to : [to]).map((addr) => ({ emailAddress: { address: addr } }));
+    const r = await fetch("https://graph.microsoft.com/v1.0/me/sendMail", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: {
+          subject,
+          body: { contentType: html ? "HTML" : "Text", content: html || text },
+          toRecipients: recipients,
+        },
+        saveToSentItems: true,
+      }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      return res.status(502).json({ error: `Outlook send failed (${r.status}): ${t.slice(0, 200)}` });
+    }
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Outlook send error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ----- Import recent inbox emails as interactions ----- */
+app.post("/api/crm/outlook/import-emails", async (req, res) => {
+  try {
+    const { userId, days } = req.body;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const lookbackDays = Math.min(Math.max(parseInt(days, 10) || 7, 1), 90);
+
+    const accessToken = await getValidOutlookToken(userId);
+
+    // Build email -> contact lookup map
+    const contactsRes = await pool.query(
+      `SELECT id, email FROM crm_contacts WHERE user_id = $1 AND email IS NOT NULL AND email <> ''`,
+      [userId]
+    );
+    const emailToId = new Map();
+    for (const c of contactsRes.rows) emailToId.set(c.email.toLowerCase().trim(), c.id);
+    if (emailToId.size === 0) return res.json({ imported: 0, scanned: 0, message: "No contacts with email" });
+
+    const since = new Date(Date.now() - lookbackDays * 86400 * 1000).toISOString();
+    let scanned = 0, imported = 0;
+
+    for (const folder of ["inbox", "sentitems"]) {
+      let url = `https://graph.microsoft.com/v1.0/me/mailFolders/${folder}/messages?$top=50&$select=id,subject,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime&$filter=receivedDateTime ge ${since}`;
+      let pages = 0;
+      while (url && pages < 5) {
+        const r = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+        if (!r.ok) break;
+        const data = await r.json();
+        for (const msg of (data.value || [])) {
+          scanned++;
+          const fromAddr = (msg.from?.emailAddress?.address || "").toLowerCase();
+          const toAddrs = (msg.toRecipients || []).map((t) => (t.emailAddress?.address || "").toLowerCase());
+          const direction = folder === "sentitems" ? "outgoing" : "incoming";
+          const counterpart = direction === "outgoing" ? toAddrs : [fromAddr];
+          for (const addr of counterpart) {
+            const cId = emailToId.get(addr);
+            if (!cId) continue;
+            // Avoid duplicates by metadata.outlookMessageId
+            const dupe = await pool.query(
+              `SELECT 1 FROM crm_interactions WHERE contact_id = $1 AND metadata->>'outlookMessageId' = $2 LIMIT 1`,
+              [cId, msg.id]
+            );
+            if (dupe.rows.length > 0) continue;
+            await pool.query(
+              `INSERT INTO crm_interactions (user_id, contact_id, type, direction, subject, content, metadata, occurred_at)
+               VALUES ($1, $2, 'email', $3, $4, $5, $6, $7)`,
+              [
+                userId, cId, direction,
+                msg.subject || null,
+                msg.bodyPreview || null,
+                JSON.stringify({ outlookMessageId: msg.id, source: "outlook" }),
+                msg.receivedDateTime || msg.sentDateTime || new Date().toISOString(),
+              ]
+            );
+            await pool.query(`UPDATE crm_contacts SET last_contact_at = NOW(), updated_at = NOW() WHERE id = $1`, [cId]);
+            imported++;
+          }
+        }
+        url = data["@odata.nextLink"] || null;
+        pages++;
+      }
+    }
+
+    res.json({ imported, scanned, lookbackDays });
+  } catch (e) {
+    console.error("Outlook import-emails error:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 

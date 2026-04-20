@@ -140,6 +140,10 @@
       {
         "src": "/api/crm/email/(.*)",
         "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/outlook/(.*)",
+        "dest": "api/stones/server.js"
       }
     ]
   }
