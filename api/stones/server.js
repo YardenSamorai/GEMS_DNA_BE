@@ -1119,107 +1119,120 @@ app.delete("/api/label-templates/:id", async (req, res) => {
    CRM – Contacts, Interactions, Deals, Tasks, WhatsApp Log
    ========================================================= */
 
-pool.query(`
-  CREATE TABLE IF NOT EXISTS crm_contacts (
-    id SERIAL PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    type TEXT NOT NULL DEFAULT 'lead',
-    company TEXT,
-    phone TEXT,
-    email TEXT,
-    country TEXT,
-    city TEXT,
-    address TEXT,
-    source TEXT,
-    status TEXT DEFAULT 'active',
-    tags JSONB DEFAULT '[]',
-    preferences JSONB DEFAULT '{}',
-    notes TEXT,
-    avatar_url TEXT,
-    last_contact_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-  )
-`).catch(err => console.error("crm_contacts table creation error:", err));
+let crmReady = false;
+const crmReadyPromise = (async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_contacts (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'lead',
+        company TEXT,
+        phone TEXT,
+        email TEXT,
+        country TEXT,
+        city TEXT,
+        address TEXT,
+        source TEXT,
+        status TEXT DEFAULT 'active',
+        tags JSONB DEFAULT '[]',
+        preferences JSONB DEFAULT '{}',
+        notes TEXT,
+        avatar_url TEXT,
+        last_contact_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_deals (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        contact_id INTEGER NOT NULL REFERENCES crm_contacts(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        stage TEXT NOT NULL DEFAULT 'lead',
+        value NUMERIC(14,2) DEFAULT 0,
+        currency TEXT DEFAULT 'USD',
+        probability INTEGER DEFAULT 0,
+        expected_close DATE,
+        actual_close DATE,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_interactions (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        contact_id INTEGER NOT NULL REFERENCES crm_contacts(id) ON DELETE CASCADE,
+        deal_id INTEGER,
+        type TEXT NOT NULL,
+        direction TEXT DEFAULT 'outgoing',
+        subject TEXT,
+        content TEXT,
+        metadata JSONB DEFAULT '{}',
+        occurred_at TIMESTAMP DEFAULT NOW(),
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_deal_items (
+        id SERIAL PRIMARY KEY,
+        deal_id INTEGER NOT NULL REFERENCES crm_deals(id) ON DELETE CASCADE,
+        stone_id TEXT,
+        sku TEXT,
+        category TEXT,
+        snapshot JSONB DEFAULT '{}',
+        custom_price NUMERIC(14,2),
+        quantity INTEGER DEFAULT 1,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_tasks (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        contact_id INTEGER REFERENCES crm_contacts(id) ON DELETE CASCADE,
+        deal_id INTEGER REFERENCES crm_deals(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        description TEXT,
+        due_date TIMESTAMP,
+        priority TEXT DEFAULT 'normal',
+        status TEXT DEFAULT 'pending',
+        completed_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_whatsapp_log (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        contact_id INTEGER REFERENCES crm_contacts(id) ON DELETE SET NULL,
+        phone TEXT,
+        message TEXT NOT NULL,
+        related_items JSONB DEFAULT '[]',
+        sent_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    crmReady = true;
+    console.log("✅ CRM tables ready");
+  } catch (err) {
+    console.error("❌ CRM table creation error:", err);
+  }
+})();
 
-pool.query(`
-  CREATE TABLE IF NOT EXISTS crm_interactions (
-    id SERIAL PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    contact_id INTEGER NOT NULL REFERENCES crm_contacts(id) ON DELETE CASCADE,
-    deal_id INTEGER,
-    type TEXT NOT NULL,
-    direction TEXT DEFAULT 'outgoing',
-    subject TEXT,
-    content TEXT,
-    metadata JSONB DEFAULT '{}',
-    occurred_at TIMESTAMP DEFAULT NOW(),
-    created_at TIMESTAMP DEFAULT NOW()
-  )
-`).catch(err => console.error("crm_interactions table creation error:", err));
-
-pool.query(`
-  CREATE TABLE IF NOT EXISTS crm_deals (
-    id SERIAL PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    contact_id INTEGER NOT NULL REFERENCES crm_contacts(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    stage TEXT NOT NULL DEFAULT 'lead',
-    value NUMERIC(14,2) DEFAULT 0,
-    currency TEXT DEFAULT 'USD',
-    probability INTEGER DEFAULT 0,
-    expected_close DATE,
-    actual_close DATE,
-    notes TEXT,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-  )
-`).catch(err => console.error("crm_deals table creation error:", err));
-
-pool.query(`
-  CREATE TABLE IF NOT EXISTS crm_deal_items (
-    id SERIAL PRIMARY KEY,
-    deal_id INTEGER NOT NULL REFERENCES crm_deals(id) ON DELETE CASCADE,
-    stone_id TEXT,
-    sku TEXT,
-    category TEXT,
-    snapshot JSONB DEFAULT '{}',
-    custom_price NUMERIC(14,2),
-    quantity INTEGER DEFAULT 1,
-    notes TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-  )
-`).catch(err => console.error("crm_deal_items table creation error:", err));
-
-pool.query(`
-  CREATE TABLE IF NOT EXISTS crm_tasks (
-    id SERIAL PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    contact_id INTEGER REFERENCES crm_contacts(id) ON DELETE CASCADE,
-    deal_id INTEGER REFERENCES crm_deals(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    description TEXT,
-    due_date TIMESTAMP,
-    priority TEXT DEFAULT 'normal',
-    status TEXT DEFAULT 'pending',
-    completed_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-  )
-`).catch(err => console.error("crm_tasks table creation error:", err));
-
-pool.query(`
-  CREATE TABLE IF NOT EXISTS crm_whatsapp_log (
-    id SERIAL PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    contact_id INTEGER REFERENCES crm_contacts(id) ON DELETE SET NULL,
-    phone TEXT,
-    message TEXT NOT NULL,
-    related_items JSONB DEFAULT '[]',
-    sent_at TIMESTAMP DEFAULT NOW()
-  )
-`).catch(err => console.error("crm_whatsapp_log table creation error:", err));
+const ensureCrm = async (req, res, next) => {
+  if (!crmReady) {
+    try { await crmReadyPromise; } catch (_) {}
+  }
+  if (!crmReady) return res.status(503).json({ error: "CRM tables not ready" });
+  next();
+};
+app.use("/api/crm", ensureCrm);
 
 /* ---------- Contacts CRUD ---------- */
 
