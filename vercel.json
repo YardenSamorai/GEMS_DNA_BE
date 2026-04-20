@@ -120,6 +120,14 @@
       {
         "src": "/api/crm/scan-card",
         "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/verify-business",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/tags",
+        "dest": "api/stones/server.js"
       }
     ]
   }

@@ -1380,6 +1380,198 @@ app.delete("/api/crm/contacts/:id", async (req, res) => {
   }
 });
 
+/* ---------- Bulk operations on contacts ---------- */
+app.post("/api/crm/contacts/bulk-delete", async (req, res) => {
+  try {
+    const { userId, ids } = req.body;
+    if (!userId || !Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: "userId and non-empty ids array are required" });
+    }
+    const result = await pool.query(
+      "DELETE FROM crm_contacts WHERE user_id = $1 AND id = ANY($2::int[]) RETURNING id",
+      [userId, ids.map(Number)]
+    );
+    res.json({ success: true, deleted: result.rowCount });
+  } catch (error) {
+    console.error("Bulk delete error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/crm/contacts/bulk-tag", async (req, res) => {
+  // Action: 'add' | 'remove'
+  try {
+    const { userId, ids, tag, action } = req.body;
+    if (!userId || !Array.isArray(ids) || !tag || !["add", "remove"].includes(action)) {
+      return res.status(400).json({ error: "userId, ids, tag, and action(add|remove) are required" });
+    }
+    const safeTag = String(tag).trim();
+    if (!safeTag) return res.status(400).json({ error: "Tag cannot be empty" });
+
+    const sql =
+      action === "add"
+        ? `UPDATE crm_contacts
+             SET tags = (
+               CASE WHEN tags @> $1::jsonb THEN tags
+                    ELSE tags || $1::jsonb END
+             ),
+             updated_at = NOW()
+           WHERE user_id = $2 AND id = ANY($3::int[])
+           RETURNING id`
+        : `UPDATE crm_contacts
+             SET tags = COALESCE((SELECT jsonb_agg(elem) FROM jsonb_array_elements(tags) elem WHERE elem <> $1::jsonb), '[]'::jsonb),
+             updated_at = NOW()
+           WHERE user_id = $2 AND id = ANY($3::int[])
+           RETURNING id`;
+
+    const result = await pool.query(sql, [JSON.stringify(safeTag), userId, ids.map(Number)]);
+    res.json({ success: true, updated: result.rowCount });
+  } catch (error) {
+    console.error("Bulk tag error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/crm/tags", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const result = await pool.query(
+      `SELECT tag, COUNT(*)::int AS count
+         FROM crm_contacts c, jsonb_array_elements_text(c.tags) AS tag
+         WHERE c.user_id = $1
+         GROUP BY tag
+         ORDER BY count DESC, tag ASC`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Tags fetch error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* ---------- Verify business online (OpenAI Web Search) ---------- */
+app.post("/api/crm/verify-business", async (req, res) => {
+  try {
+    const { contact } = req.body;
+    if (!contact || (!contact.name && !contact.company)) {
+      return res.status(400).json({ error: "Contact name or company is required" });
+    }
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not configured" });
+    }
+
+    const detailsLines = [
+      contact.name ? `Person: ${contact.name}` : null,
+      contact.company ? `Company: ${contact.company}` : null,
+      contact.email ? `Email: ${contact.email}` : null,
+      contact.phone ? `Phone: ${contact.phone}` : null,
+      contact.website ? `Website: ${contact.website}` : null,
+      contact.country || contact.city ? `Location: ${[contact.city, contact.country].filter(Boolean).join(", ")}` : null,
+    ].filter(Boolean).join("\n");
+
+    const prompt = `You are a business verification assistant for a diamond/jewelry trading CRM.
+Search the public web (Google, LinkedIn, official websites, business directories such as Rapaport, Polygon, IDEX, JCK, GIA, etc.) and verify the following contact.
+
+Return a STRICT JSON object with this shape:
+{
+  "verified": true | false,
+  "confidence": "high" | "medium" | "low",
+  "summary": "1-2 sentence plain-language summary of what you found",
+  "discoveredFields": {
+    "company": "...optional, if found and improved...",
+    "website": "...",
+    "phone": "...",
+    "email": "...",
+    "country": "...",
+    "city": "...",
+    "address": "...",
+    "linkedin": "...",
+    "instagram": "...",
+    "industry": "...",
+    "yearsActive": "...",
+    "notes": "interesting context (e.g. 'Listed on Rapaport member directory since 2015')"
+  },
+  "warnings": ["any red flags, e.g. inactive site, mismatched country, etc."],
+  "sources": [{"label": "site name", "url": "https://..."}]
+}
+
+Only include fields you are reasonably confident about. Omit fields that are unknown rather than guessing.
+If you cannot find anything credible, set verified=false, confidence="low" and explain in summary.
+
+Contact data to verify:
+${detailsLines}`;
+
+    const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini-search-preview",
+        messages: [
+          { role: "system", content: "You are a meticulous research assistant. You always reply with valid JSON only — no markdown, no commentary." },
+          { role: "user", content: prompt },
+        ],
+        web_search_options: {},
+        response_format: { type: "json_object" },
+      }),
+    });
+
+    if (!aiRes.ok) {
+      // Fallback to non-search model if search variant unavailable
+      const errText = await aiRes.text();
+      console.warn("Search model failed, trying fallback:", aiRes.status, errText);
+
+      const fallback = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: "You are a meticulous research assistant. Respond with valid JSON only." },
+            { role: "user", content: prompt + "\n\nNote: Web search is unavailable — base your response only on widely-known public information you already have." },
+          ],
+          response_format: { type: "json_object" },
+        }),
+      });
+
+      if (!fallback.ok) {
+        const fbErr = await fallback.text();
+        console.error("Fallback OpenAI error:", fallback.status, fbErr);
+        let friendly = `Verification failed (${fallback.status})`;
+        if (fallback.status === 429) friendly = "OpenAI quota exceeded. Add credit at platform.openai.com.";
+        if (fallback.status === 401) friendly = "OpenAI API key invalid.";
+        return res.status(502).json({ error: friendly });
+      }
+      const fbData = await fallback.json();
+      try {
+        const parsed = JSON.parse(fbData.choices?.[0]?.message?.content || "{}");
+        return res.json({ ...parsed, _searchUsed: false });
+      } catch (e) {
+        return res.status(502).json({ error: "Could not parse verification response" });
+      }
+    }
+
+    const data = await aiRes.json();
+    let parsed;
+    try {
+      parsed = JSON.parse(data.choices?.[0]?.message?.content || "{}");
+    } catch (e) {
+      return res.status(502).json({ error: "Could not parse verification response" });
+    }
+    res.json({ ...parsed, _searchUsed: true });
+  } catch (error) {
+    console.error("Verify business error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 /* ---------- Interactions ---------- */
 
 app.post("/api/crm/interactions", async (req, res) => {
