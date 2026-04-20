@@ -72,6 +72,50 @@
       {
         "src": "/api/stones/(.*)",
         "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/stats",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/contacts",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/contacts/(.*)",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/interactions",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/interactions/(.*)",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/deals",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/deals/(.*)",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/deal-items/(.*)",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/tasks",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/tasks/(.*)",
+        "dest": "api/stones/server.js"
+      },
+      {
+        "src": "/api/crm/whatsapp-log",
+        "dest": "api/stones/server.js"
       }
     ]
   }

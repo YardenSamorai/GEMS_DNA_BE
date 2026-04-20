@@ -1116,6 +1116,685 @@ app.delete("/api/label-templates/:id", async (req, res) => {
 });
 
 /* =========================================================
+   CRM – Contacts, Interactions, Deals, Tasks, WhatsApp Log
+   ========================================================= */
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS crm_contacts (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'lead',
+    company TEXT,
+    phone TEXT,
+    email TEXT,
+    country TEXT,
+    city TEXT,
+    address TEXT,
+    source TEXT,
+    status TEXT DEFAULT 'active',
+    tags JSONB DEFAULT '[]',
+    preferences JSONB DEFAULT '{}',
+    notes TEXT,
+    avatar_url TEXT,
+    last_contact_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+  )
+`).catch(err => console.error("crm_contacts table creation error:", err));
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS crm_interactions (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    contact_id INTEGER NOT NULL REFERENCES crm_contacts(id) ON DELETE CASCADE,
+    deal_id INTEGER,
+    type TEXT NOT NULL,
+    direction TEXT DEFAULT 'outgoing',
+    subject TEXT,
+    content TEXT,
+    metadata JSONB DEFAULT '{}',
+    occurred_at TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMP DEFAULT NOW()
+  )
+`).catch(err => console.error("crm_interactions table creation error:", err));
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS crm_deals (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    contact_id INTEGER NOT NULL REFERENCES crm_contacts(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    stage TEXT NOT NULL DEFAULT 'lead',
+    value NUMERIC(14,2) DEFAULT 0,
+    currency TEXT DEFAULT 'USD',
+    probability INTEGER DEFAULT 0,
+    expected_close DATE,
+    actual_close DATE,
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+  )
+`).catch(err => console.error("crm_deals table creation error:", err));
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS crm_deal_items (
+    id SERIAL PRIMARY KEY,
+    deal_id INTEGER NOT NULL REFERENCES crm_deals(id) ON DELETE CASCADE,
+    stone_id TEXT,
+    sku TEXT,
+    category TEXT,
+    snapshot JSONB DEFAULT '{}',
+    custom_price NUMERIC(14,2),
+    quantity INTEGER DEFAULT 1,
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+  )
+`).catch(err => console.error("crm_deal_items table creation error:", err));
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS crm_tasks (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    contact_id INTEGER REFERENCES crm_contacts(id) ON DELETE CASCADE,
+    deal_id INTEGER REFERENCES crm_deals(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    description TEXT,
+    due_date TIMESTAMP,
+    priority TEXT DEFAULT 'normal',
+    status TEXT DEFAULT 'pending',
+    completed_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+  )
+`).catch(err => console.error("crm_tasks table creation error:", err));
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS crm_whatsapp_log (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    contact_id INTEGER REFERENCES crm_contacts(id) ON DELETE SET NULL,
+    phone TEXT,
+    message TEXT NOT NULL,
+    related_items JSONB DEFAULT '[]',
+    sent_at TIMESTAMP DEFAULT NOW()
+  )
+`).catch(err => console.error("crm_whatsapp_log table creation error:", err));
+
+/* ---------- Contacts CRUD ---------- */
+
+app.get("/api/crm/contacts", async (req, res) => {
+  try {
+    const { userId, search, type, status } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const conditions = ["user_id = $1"];
+    const values = [userId];
+    let idx = 2;
+
+    if (search) {
+      conditions.push(`(name ILIKE $${idx} OR company ILIKE $${idx} OR phone ILIKE $${idx} OR email ILIKE $${idx})`);
+      values.push(`%${search}%`);
+      idx++;
+    }
+    if (type && type !== 'all') {
+      conditions.push(`type = $${idx++}`);
+      values.push(type);
+    }
+    if (status && status !== 'all') {
+      conditions.push(`status = $${idx++}`);
+      values.push(status);
+    }
+
+    const result = await pool.query(
+      `SELECT c.*,
+        (SELECT COUNT(*)::int FROM crm_deals d WHERE d.contact_id = c.id) AS deals_count,
+        (SELECT COALESCE(SUM(value),0) FROM crm_deals d WHERE d.contact_id = c.id AND d.stage = 'won') AS total_won
+       FROM crm_contacts c
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY c.updated_at DESC`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching contacts:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/crm/contacts/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const contact = await pool.query(
+      "SELECT * FROM crm_contacts WHERE id = $1 AND user_id = $2",
+      [id, userId]
+    );
+    if (contact.rows.length === 0) return res.status(404).json({ error: "Contact not found" });
+
+    const interactions = await pool.query(
+      "SELECT * FROM crm_interactions WHERE contact_id = $1 ORDER BY occurred_at DESC LIMIT 100",
+      [id]
+    );
+    const deals = await pool.query(
+      "SELECT * FROM crm_deals WHERE contact_id = $1 ORDER BY updated_at DESC",
+      [id]
+    );
+    const tasks = await pool.query(
+      "SELECT * FROM crm_tasks WHERE contact_id = $1 ORDER BY due_date ASC NULLS LAST",
+      [id]
+    );
+
+    res.json({
+      ...contact.rows[0],
+      interactions: interactions.rows,
+      deals: deals.rows,
+      tasks: tasks.rows,
+    });
+  } catch (error) {
+    console.error("Error fetching contact:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/crm/contacts", async (req, res) => {
+  try {
+    const { userId, name, type, company, phone, email, country, city, address, source, status, tags, preferences, notes, avatarUrl } = req.body;
+    if (!userId || !name) return res.status(400).json({ error: "userId and name are required" });
+
+    const result = await pool.query(
+      `INSERT INTO crm_contacts (user_id, name, type, company, phone, email, country, city, address, source, status, tags, preferences, notes, avatar_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+      [
+        userId, name.trim(), type || 'lead', company || null, phone || null, email || null,
+        country || null, city || null, address || null, source || null, status || 'active',
+        JSON.stringify(tags || []), JSON.stringify(preferences || {}), notes || null, avatarUrl || null
+      ]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("Error creating contact:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.put("/api/crm/contacts/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const allowed = ['name','type','company','phone','email','country','city','address','source','status','tags','preferences','notes','avatar_url','last_contact_at'];
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    for (const key of allowed) {
+      const camel = key.replace(/_([a-z])/g, (_,c) => c.toUpperCase());
+      if (req.body[camel] !== undefined) {
+        if (key === 'tags' || key === 'preferences') {
+          fields.push(`${key} = $${idx++}`);
+          values.push(JSON.stringify(req.body[camel]));
+        } else {
+          fields.push(`${key} = $${idx++}`);
+          values.push(req.body[camel]);
+        }
+      }
+    }
+    fields.push(`updated_at = NOW()`);
+    if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
+
+    values.push(id);
+    const result = await pool.query(
+      `UPDATE crm_contacts SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Contact not found" });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Error updating contact:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/api/crm/contacts/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query("DELETE FROM crm_contacts WHERE id = $1", [id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error deleting contact:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* ---------- Interactions ---------- */
+
+app.post("/api/crm/interactions", async (req, res) => {
+  try {
+    const { userId, contactId, dealId, type, direction, subject, content, metadata, occurredAt } = req.body;
+    if (!userId || !contactId || !type) return res.status(400).json({ error: "userId, contactId and type are required" });
+
+    const result = await pool.query(
+      `INSERT INTO crm_interactions (user_id, contact_id, deal_id, type, direction, subject, content, metadata, occurred_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9, NOW())) RETURNING *`,
+      [userId, contactId, dealId || null, type, direction || 'outgoing', subject || null, content || null, JSON.stringify(metadata || {}), occurredAt || null]
+    );
+    await pool.query("UPDATE crm_contacts SET last_contact_at = NOW(), updated_at = NOW() WHERE id = $1", [contactId]);
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("Error creating interaction:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/api/crm/interactions/:id", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM crm_interactions WHERE id = $1", [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error deleting interaction:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* ---------- Deals ---------- */
+
+app.get("/api/crm/deals", async (req, res) => {
+  try {
+    const { userId, stage, contactId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const conditions = ["d.user_id = $1"];
+    const values = [userId];
+    let idx = 2;
+
+    if (stage && stage !== 'all') { conditions.push(`d.stage = $${idx++}`); values.push(stage); }
+    if (contactId) { conditions.push(`d.contact_id = $${idx++}`); values.push(contactId); }
+
+    const result = await pool.query(
+      `SELECT d.*, c.name AS contact_name, c.company AS contact_company, c.type AS contact_type,
+        (SELECT COUNT(*)::int FROM crm_deal_items i WHERE i.deal_id = d.id) AS items_count
+       FROM crm_deals d
+       LEFT JOIN crm_contacts c ON c.id = d.contact_id
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY d.updated_at DESC`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching deals:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/crm/deals/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const deal = await pool.query(
+      `SELECT d.*, c.name AS contact_name, c.company AS contact_company, c.phone AS contact_phone, c.email AS contact_email
+       FROM crm_deals d LEFT JOIN crm_contacts c ON c.id = d.contact_id WHERE d.id = $1`,
+      [id]
+    );
+    if (deal.rows.length === 0) return res.status(404).json({ error: "Deal not found" });
+    const items = await pool.query("SELECT * FROM crm_deal_items WHERE deal_id = $1 ORDER BY created_at ASC", [id]);
+    const interactions = await pool.query("SELECT * FROM crm_interactions WHERE deal_id = $1 ORDER BY occurred_at DESC", [id]);
+    res.json({ ...deal.rows[0], items: items.rows, interactions: interactions.rows });
+  } catch (error) {
+    console.error("Error fetching deal:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/crm/deals", async (req, res) => {
+  try {
+    const { userId, contactId, title, stage, value, currency, probability, expectedClose, notes, items } = req.body;
+    if (!userId || !contactId || !title) return res.status(400).json({ error: "userId, contactId and title are required" });
+
+    const result = await pool.query(
+      `INSERT INTO crm_deals (user_id, contact_id, title, stage, value, currency, probability, expected_close, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [userId, contactId, title.trim(), stage || 'lead', value || 0, currency || 'USD', probability || 0, expectedClose || null, notes || null]
+    );
+    const deal = result.rows[0];
+
+    if (Array.isArray(items) && items.length > 0) {
+      for (const item of items) {
+        await pool.query(
+          `INSERT INTO crm_deal_items (deal_id, stone_id, sku, category, snapshot, custom_price, quantity, notes)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [deal.id, item.stoneId || null, item.sku || null, item.category || null, JSON.stringify(item.snapshot || {}), item.customPrice || null, item.quantity || 1, item.notes || null]
+        );
+      }
+    }
+    res.status(201).json(deal);
+  } catch (error) {
+    console.error("Error creating deal:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.put("/api/crm/deals/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const allowed = ['title','stage','value','currency','probability','expected_close','actual_close','notes'];
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    for (const key of allowed) {
+      const camel = key.replace(/_([a-z])/g, (_,c) => c.toUpperCase());
+      if (req.body[camel] !== undefined) {
+        fields.push(`${key} = $${idx++}`);
+        values.push(req.body[camel]);
+      }
+    }
+    if (req.body.stage === 'won' && !req.body.actualClose) {
+      fields.push(`actual_close = $${idx++}`);
+      values.push(new Date().toISOString().slice(0,10));
+    }
+    fields.push(`updated_at = NOW()`);
+    if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
+
+    values.push(id);
+    const result = await pool.query(
+      `UPDATE crm_deals SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Deal not found" });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Error updating deal:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/api/crm/deals/:id", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM crm_deals WHERE id = $1", [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error deleting deal:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* ---------- Deal items ---------- */
+
+app.post("/api/crm/deals/:id/items", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { items } = req.body;
+    if (!Array.isArray(items)) return res.status(400).json({ error: "items array is required" });
+
+    const inserted = [];
+    for (const item of items) {
+      const r = await pool.query(
+        `INSERT INTO crm_deal_items (deal_id, stone_id, sku, category, snapshot, custom_price, quantity, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [id, item.stoneId || null, item.sku || null, item.category || null, JSON.stringify(item.snapshot || {}), item.customPrice || null, item.quantity || 1, item.notes || null]
+      );
+      inserted.push(r.rows[0]);
+    }
+    await pool.query("UPDATE crm_deals SET updated_at = NOW() WHERE id = $1", [id]);
+    res.status(201).json(inserted);
+  } catch (error) {
+    console.error("Error adding deal items:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.put("/api/crm/deal-items/:itemId", async (req, res) => {
+  try {
+    const { itemId } = req.params;
+    const allowed = ['custom_price','quantity','notes'];
+    const fields = [];
+    const values = [];
+    let idx = 1;
+    for (const key of allowed) {
+      const camel = key.replace(/_([a-z])/g, (_,c) => c.toUpperCase());
+      if (req.body[camel] !== undefined) {
+        fields.push(`${key} = $${idx++}`);
+        values.push(req.body[camel]);
+      }
+    }
+    if (fields.length === 0) return res.status(400).json({ error: "No fields to update" });
+    values.push(itemId);
+    const result = await pool.query(
+      `UPDATE crm_deal_items SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Error updating deal item:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/api/crm/deal-items/:itemId", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM crm_deal_items WHERE id = $1", [req.params.itemId]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error deleting deal item:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* ---------- Tasks ---------- */
+
+app.get("/api/crm/tasks", async (req, res) => {
+  try {
+    const { userId, status, contactId, dealId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const conditions = ["t.user_id = $1"];
+    const values = [userId];
+    let idx = 2;
+    if (status && status !== 'all') { conditions.push(`t.status = $${idx++}`); values.push(status); }
+    if (contactId) { conditions.push(`t.contact_id = $${idx++}`); values.push(contactId); }
+    if (dealId) { conditions.push(`t.deal_id = $${idx++}`); values.push(dealId); }
+
+    const result = await pool.query(
+      `SELECT t.*, c.name AS contact_name, d.title AS deal_title
+       FROM crm_tasks t
+       LEFT JOIN crm_contacts c ON c.id = t.contact_id
+       LEFT JOIN crm_deals d ON d.id = t.deal_id
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY t.status ASC, t.due_date ASC NULLS LAST`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching tasks:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/crm/tasks", async (req, res) => {
+  try {
+    const { userId, contactId, dealId, title, description, dueDate, priority, status } = req.body;
+    if (!userId || !title) return res.status(400).json({ error: "userId and title are required" });
+
+    const result = await pool.query(
+      `INSERT INTO crm_tasks (user_id, contact_id, deal_id, title, description, due_date, priority, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [userId, contactId || null, dealId || null, title.trim(), description || null, dueDate || null, priority || 'normal', status || 'pending']
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("Error creating task:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.put("/api/crm/tasks/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const allowed = ['title','description','due_date','priority','status'];
+    const fields = [];
+    const values = [];
+    let idx = 1;
+    for (const key of allowed) {
+      const camel = key.replace(/_([a-z])/g, (_,c) => c.toUpperCase());
+      if (req.body[camel] !== undefined) {
+        fields.push(`${key} = $${idx++}`);
+        values.push(req.body[camel]);
+      }
+    }
+    if (req.body.status === 'done') {
+      fields.push(`completed_at = NOW()`);
+    }
+    fields.push(`updated_at = NOW()`);
+    if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
+    values.push(id);
+    const result = await pool.query(
+      `UPDATE crm_tasks SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Error updating task:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/api/crm/tasks/:id", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM crm_tasks WHERE id = $1", [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error deleting task:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* ---------- WhatsApp Log ---------- */
+
+app.post("/api/crm/whatsapp-log", async (req, res) => {
+  try {
+    const { userId, contactId, phone, message, relatedItems } = req.body;
+    if (!userId || !message) return res.status(400).json({ error: "userId and message are required" });
+
+    const result = await pool.query(
+      `INSERT INTO crm_whatsapp_log (user_id, contact_id, phone, message, related_items)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [userId, contactId || null, phone || null, message, JSON.stringify(relatedItems || [])]
+    );
+
+    if (contactId) {
+      await pool.query(
+        `INSERT INTO crm_interactions (user_id, contact_id, type, direction, subject, content, metadata)
+         VALUES ($1,$2,'whatsapp','outgoing','WhatsApp message',$3,$4)`,
+        [userId, contactId, message, JSON.stringify({ phone, relatedItems: relatedItems || [] })]
+      );
+      await pool.query("UPDATE crm_contacts SET last_contact_at = NOW(), updated_at = NOW() WHERE id = $1", [contactId]);
+    }
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("Error logging WhatsApp message:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/crm/whatsapp-log", async (req, res) => {
+  try {
+    const { userId, contactId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const conditions = ["user_id = $1"];
+    const values = [userId];
+    let idx = 2;
+    if (contactId) { conditions.push(`contact_id = $${idx++}`); values.push(contactId); }
+
+    const result = await pool.query(
+      `SELECT * FROM crm_whatsapp_log WHERE ${conditions.join(" AND ")} ORDER BY sent_at DESC LIMIT 200`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching whatsapp log:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* ---------- CRM Dashboard Stats ---------- */
+
+app.get("/api/crm/stats", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const [contacts, deals, tasks, recentInteractions, topContacts, monthlyWon] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE type = 'lead')::int AS leads,
+          COUNT(*) FILTER (WHERE type = 'buyer')::int AS buyers,
+          COUNT(*) FILTER (WHERE type = 'dealer')::int AS dealers,
+          COUNT(*) FILTER (WHERE type = 'designer')::int AS designers,
+          COUNT(*) FILTER (WHERE type = 'supplier')::int AS suppliers
+        FROM crm_contacts WHERE user_id = $1
+      `, [userId]),
+      pool.query(`
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE stage NOT IN ('won','lost'))::int AS active,
+          COUNT(*) FILTER (WHERE stage = 'won')::int AS won,
+          COUNT(*) FILTER (WHERE stage = 'lost')::int AS lost,
+          COALESCE(SUM(value) FILTER (WHERE stage NOT IN ('won','lost')),0) AS pipeline_value,
+          COALESCE(SUM(value) FILTER (WHERE stage = 'won'),0) AS won_value
+        FROM crm_deals WHERE user_id = $1
+      `, [userId]),
+      pool.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+          COUNT(*) FILTER (WHERE status = 'pending' AND due_date < NOW())::int AS overdue,
+          COUNT(*) FILTER (WHERE status = 'pending' AND due_date::date = CURRENT_DATE)::int AS today
+        FROM crm_tasks WHERE user_id = $1
+      `, [userId]),
+      pool.query(`
+        SELECT i.*, c.name AS contact_name FROM crm_interactions i
+        LEFT JOIN crm_contacts c ON c.id = i.contact_id
+        WHERE i.user_id = $1
+        ORDER BY i.occurred_at DESC LIMIT 10
+      `, [userId]),
+      pool.query(`
+        SELECT c.id, c.name, c.company, c.type,
+          COALESCE(SUM(d.value) FILTER (WHERE d.stage = 'won'),0) AS total_won,
+          COUNT(d.id) FILTER (WHERE d.stage = 'won')::int AS deals_won
+        FROM crm_contacts c
+        LEFT JOIN crm_deals d ON d.contact_id = c.id
+        WHERE c.user_id = $1
+        GROUP BY c.id
+        HAVING COUNT(d.id) FILTER (WHERE d.stage = 'won') > 0
+        ORDER BY total_won DESC LIMIT 5
+      `, [userId]),
+      pool.query(`
+        SELECT
+          to_char(date_trunc('month', actual_close), 'YYYY-MM') AS month,
+          COALESCE(SUM(value),0) AS value,
+          COUNT(*)::int AS count
+        FROM crm_deals
+        WHERE user_id = $1 AND stage = 'won' AND actual_close >= NOW() - INTERVAL '12 months'
+        GROUP BY 1 ORDER BY 1
+      `, [userId]),
+    ]);
+
+    res.json({
+      contacts: contacts.rows[0],
+      deals: deals.rows[0],
+      tasks: tasks.rows[0],
+      recentInteractions: recentInteractions.rows,
+      topContacts: topContacts.rows,
+      monthlyWon: monthlyWon.rows,
+    });
+  } catch (error) {
+    console.error("Error fetching CRM stats:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
    Start server
    ========================================================= */
 app.listen(port, () => {
