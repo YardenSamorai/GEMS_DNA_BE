@@ -1281,6 +1281,21 @@ const crmReadyPromise = (async () => {
       )
     `);
 
+    // Saved email templates (per-user, reusable HTML templates)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_email_templates (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        subject TEXT,
+        html TEXT,
+        thumbnail TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_email_templates_user ON crm_email_templates(user_id)`);
+
     // Add new columns to crm_contacts (idempotent)
     const newCols = [
       "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS title TEXT",
@@ -2863,6 +2878,81 @@ app.get("/api/crm/email/broadcasts", async (req, res) => {
   } catch (error) {
     console.error("Broadcast log fetch error:", error);
     res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   CRM – Email templates (saved HTML templates per user)
+   ========================================================= */
+
+app.get("/api/crm/email/templates", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const result = await pool.query(
+      `SELECT id, name, subject, html, thumbnail, created_at, updated_at
+       FROM crm_email_templates WHERE user_id = $1 ORDER BY updated_at DESC`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Email templates fetch error:", error);
+    res.status(500).json({ error: error.message || "Internal server error" });
+  }
+});
+
+app.post("/api/crm/email/templates", async (req, res) => {
+  try {
+    const { userId, name, subject, html, thumbnail } = req.body || {};
+    if (!userId || !name) return res.status(400).json({ error: "userId and name are required" });
+    const result = await pool.query(
+      `INSERT INTO crm_email_templates (user_id, name, subject, html, thumbnail)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, subject, html, thumbnail, created_at, updated_at`,
+      [userId, name, subject || "", html || "", thumbnail || null]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Email template create error:", error);
+    res.status(500).json({ error: error.message || "Internal server error" });
+  }
+});
+
+app.put("/api/crm/email/templates/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, subject, html, thumbnail } = req.body || {};
+    const fields = [];
+    const values = [];
+    let i = 1;
+    if (name !== undefined) { fields.push(`name = $${i++}`); values.push(name); }
+    if (subject !== undefined) { fields.push(`subject = $${i++}`); values.push(subject); }
+    if (html !== undefined) { fields.push(`html = $${i++}`); values.push(html); }
+    if (thumbnail !== undefined) { fields.push(`thumbnail = $${i++}`); values.push(thumbnail); }
+    if (fields.length === 0) return res.status(400).json({ error: "No fields to update" });
+    fields.push(`updated_at = NOW()`);
+    values.push(id);
+    const result = await pool.query(
+      `UPDATE crm_email_templates SET ${fields.join(", ")} WHERE id = $${i}
+       RETURNING id, name, subject, html, thumbnail, created_at, updated_at`,
+      values
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Template not found" });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Email template update error:", error);
+    res.status(500).json({ error: error.message || "Internal server error" });
+  }
+});
+
+app.delete("/api/crm/email/templates/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(`DELETE FROM crm_email_templates WHERE id = $1`, [id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Email template delete error:", error);
+    res.status(500).json({ error: error.message || "Internal server error" });
   }
 });
 
