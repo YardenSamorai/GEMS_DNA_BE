@@ -1879,7 +1879,17 @@ Output ONLY the JSON object.`;
     if (!aiRes.ok) {
       const errText = await aiRes.text();
       console.error("OpenAI error:", aiRes.status, errText);
-      return res.status(502).json({ error: `OCR provider error (${aiRes.status})` });
+      let friendly = `OCR provider error (${aiRes.status})`;
+      if (aiRes.status === 429) {
+        friendly =
+          "OpenAI quota exceeded. Most likely no credit balance on the account. " +
+          "Please add credit at platform.openai.com/settings/organization/billing/overview and try again.";
+      } else if (aiRes.status === 401) {
+        friendly = "OpenAI API key invalid or revoked. Update OPENAI_API_KEY in your server environment.";
+      } else if (aiRes.status === 400) {
+        friendly = "OpenAI rejected the image (it may be too large or in an unsupported format). Try a smaller, clearer photo.";
+      }
+      return res.status(502).json({ error: friendly, providerStatus: aiRes.status });
     }
 
     const aiData = await aiRes.json();
