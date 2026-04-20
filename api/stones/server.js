@@ -3100,7 +3100,7 @@ const outlookContactToCrm = (oc) => {
     phone: phones[0] || null,
     phoneAlt: phones[1] || null,
     email: emails[0] || null,
-    website: (oc.websites && oc.websites[0]?.address) || null,
+    website: oc.businessHomePage || (oc.websites && oc.websites[0]?.address) || null,
     country: addr.countryOrRegion || null,
     city: addr.city || null,
     address: [addr.street, addr.postalCode].filter(Boolean).join(", ") || null,
@@ -3118,6 +3118,7 @@ const crmContactToOutlook = (c) => {
   const businessPhones = [c.phone, c.phone_alt].filter(Boolean);
   if (businessPhones.length) out.businessPhones = businessPhones;
   if (c.email) out.emailAddresses = [{ address: c.email, name: c.name }];
+  if (c.website) out.businessHomePage = c.website;
   if (c.notes) out.personalNotes = c.notes;
   if (c.country || c.city || c.address) {
     out.businessAddress = {
@@ -3141,7 +3142,7 @@ app.post("/api/crm/outlook/sync-contacts", async (req, res) => {
 
     /* ---- PULL Outlook -> CRM ---- */
     if (dir === "pull" || dir === "two-way") {
-      let url = "https://graph.microsoft.com/v1.0/me/contacts?$top=100&$select=id,displayName,givenName,surname,jobTitle,companyName,businessPhones,homePhones,mobilePhone,emailAddresses,businessAddress,homeAddress,websites,personalNotes,lastModifiedDateTime";
+      let url = "https://graph.microsoft.com/v1.0/me/contacts?$top=100&$select=id,displayName,givenName,surname,jobTitle,companyName,businessPhones,homePhones,mobilePhone,emailAddresses,businessAddress,homeAddress,businessHomePage,personalNotes,lastModifiedDateTime";
       let pages = 0;
       while (url && pages < 20) {
         const r = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
