@@ -1309,6 +1309,15 @@ const crmReadyPromise = (async () => {
       "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_image_front TEXT",
       "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_image_back TEXT",
       "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS card_image_thumb TEXT",
+      // DNA-lead support: contacts visible to all users + which stone the lead is for
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS shared BOOLEAN DEFAULT FALSE",
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS dna_sku TEXT",
+      "ALTER TABLE crm_deals ADD COLUMN IF NOT EXISTS shared BOOLEAN DEFAULT FALSE",
+      "ALTER TABLE crm_deals ADD COLUMN IF NOT EXISTS dna_sku TEXT",
+      "CREATE INDEX IF NOT EXISTS idx_crm_contacts_shared ON crm_contacts(shared) WHERE shared = TRUE",
+      "CREATE INDEX IF NOT EXISTS idx_crm_deals_shared ON crm_deals(shared) WHERE shared = TRUE",
+      "CREATE INDEX IF NOT EXISTS idx_crm_contacts_email_lower ON crm_contacts(LOWER(email))",
+      "CREATE INDEX IF NOT EXISTS idx_crm_contacts_phone_norm ON crm_contacts(regexp_replace(COALESCE(phone,''),'[^0-9]','','g'))",
     ];
     for (const sql of newCols) {
       try { await pool.query(sql); } catch (e) { console.warn("Migration warn:", e.message); }
@@ -1355,7 +1364,9 @@ app.get("/api/crm/contacts", async (req, res) => {
     } = req.query;
     if (!userId) return res.status(400).json({ error: "userId is required" });
 
-    const conditions = ["user_id = $1"];
+    // Broadcast: each user sees their own contacts AND any contact flagged as shared
+    // (currently used for DNA-lead inquiries that arrive from the public DNA page).
+    const conditions = ["(user_id = $1 OR shared = TRUE)"];
     const values = [userId];
     let idx = 2;
 
@@ -1488,7 +1499,7 @@ app.get("/api/crm/contacts/:id", async (req, res) => {
     if (!userId) return res.status(400).json({ error: "userId is required" });
 
     const contact = await pool.query(
-      "SELECT * FROM crm_contacts WHERE id = $1 AND user_id = $2",
+      "SELECT * FROM crm_contacts WHERE id = $1 AND (user_id = $2 OR shared = TRUE)",
       [id, userId]
     );
     if (contact.rows.length === 0) return res.status(404).json({ error: "Contact not found" });
@@ -1619,7 +1630,7 @@ app.post("/api/crm/contacts/bulk-delete", async (req, res) => {
       return res.status(400).json({ error: "userId and non-empty ids array are required" });
     }
     const result = await pool.query(
-      "DELETE FROM crm_contacts WHERE user_id = $1 AND id = ANY($2::int[]) RETURNING id",
+      "DELETE FROM crm_contacts WHERE (user_id = $1 OR shared = TRUE) AND id = ANY($2::int[]) RETURNING id",
       [userId, ids.map(Number)]
     );
     res.json({ success: true, deleted: result.rowCount });
@@ -1647,18 +1658,218 @@ app.post("/api/crm/contacts/bulk-tag", async (req, res) => {
                     ELSE tags || $1::jsonb END
              ),
              updated_at = NOW()
-           WHERE user_id = $2 AND id = ANY($3::int[])
+           WHERE (user_id = $2 OR shared = TRUE) AND id = ANY($3::int[])
            RETURNING id`
         : `UPDATE crm_contacts
              SET tags = COALESCE((SELECT jsonb_agg(elem) FROM jsonb_array_elements(tags) elem WHERE elem <> $1::jsonb), '[]'::jsonb),
              updated_at = NOW()
-           WHERE user_id = $2 AND id = ANY($3::int[])
+           WHERE (user_id = $2 OR shared = TRUE) AND id = ANY($3::int[])
            RETURNING id`;
 
     const result = await pool.query(sql, [JSON.stringify(safeTag), userId, ids.map(Number)]);
     res.json({ success: true, updated: result.rowCount });
   } catch (error) {
     console.error("Bulk tag error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   DNA → CRM bridge — public endpoints (no Clerk auth required)
+   ========================================================= */
+
+// Simple in-memory rate limiter: max 3 submissions per IP per minute
+const dnaLeadHits = new Map(); // ip -> [timestamps]
+const DNA_RATE_LIMIT = 3;
+const DNA_RATE_WINDOW_MS = 60_000;
+
+const checkDnaRateLimit = (ip) => {
+  const now = Date.now();
+  const arr = (dnaLeadHits.get(ip) || []).filter((t) => now - t < DNA_RATE_WINDOW_MS);
+  if (arr.length >= DNA_RATE_LIMIT) return false;
+  arr.push(now);
+  dnaLeadHits.set(ip, arr);
+  return true;
+};
+
+const normalisePhone = (s) => String(s || "").replace(/[^0-9]/g, "");
+const normaliseEmail = (s) => String(s || "").trim().toLowerCase();
+const cleanString = (s, max = 200) => String(s || "").trim().slice(0, max);
+const titleCase = (s) => String(s || "")
+  .split(/\s+/)
+  .filter(Boolean)
+  .map((w) => w[0]?.toUpperCase() + w.slice(1).toLowerCase())
+  .join(" ");
+
+// POST /api/crm/dna-lead — Public DNA "I'm interested" form
+app.post("/api/crm/dna-lead", async (req, res) => {
+  try {
+    const ip = (req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown")
+      .toString().split(",")[0].trim();
+
+    if (!checkDnaRateLimit(ip)) {
+      return res.status(429).json({ error: "Too many submissions. Please try again in a minute." });
+    }
+
+    const {
+      firstName, lastName, email, phone, company, title, message, sku, snapshot, hp,
+    } = req.body || {};
+
+    // Honeypot — bots fill this hidden field; humans don't see it
+    if (hp) return res.status(200).json({ success: true }); // pretend success, drop silently
+
+    const cleanFirst = cleanString(firstName, 80);
+    const cleanLast = cleanString(lastName, 80);
+    const cleanEmail = normaliseEmail(email).slice(0, 200);
+    const cleanPhone = cleanString(phone, 60);
+    const cleanCompany = cleanString(company, 200);
+    const cleanTitle = cleanString(title, 120);
+    const cleanMessage = cleanString(message, 1000);
+    const cleanSku = cleanString(sku, 60);
+
+    if (!cleanFirst && !cleanLast) {
+      return res.status(400).json({ error: "Name is required" });
+    }
+    if (!cleanEmail && !cleanPhone) {
+      return res.status(400).json({ error: "Email or phone is required" });
+    }
+    if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({ error: "Email is not valid" });
+    }
+
+    const fullName = titleCase([cleanFirst, cleanLast].filter(Boolean).join(" "));
+    const phoneNorm = normalisePhone(cleanPhone);
+
+    // ---- Find existing shared contact by email or normalised phone ----
+    let contact = null;
+    if (cleanEmail) {
+      const r = await pool.query(
+        `SELECT * FROM crm_contacts WHERE shared = TRUE AND LOWER(email) = $1 LIMIT 1`,
+        [cleanEmail]
+      );
+      if (r.rows.length) contact = r.rows[0];
+    }
+    if (!contact && phoneNorm) {
+      const r = await pool.query(
+        `SELECT * FROM crm_contacts
+           WHERE shared = TRUE
+             AND regexp_replace(COALESCE(phone,''),'[^0-9]','','g') = $1
+           LIMIT 1`,
+        [phoneNorm]
+      );
+      if (r.rows.length) contact = r.rows[0];
+    }
+
+    let isNew = false;
+    if (contact) {
+      // Update missing fields only — never overwrite human-edited data
+      contact = (await pool.query(
+        `UPDATE crm_contacts SET
+            name = CASE WHEN COALESCE(NULLIF(name,''),'') = '' THEN $2 ELSE name END,
+            email = COALESCE(NULLIF(email,''), $3),
+            phone = COALESCE(NULLIF(phone,''), $4),
+            company = COALESCE(NULLIF(company,''), $5),
+            title = COALESCE(NULLIF(title,''), $6),
+            dna_sku = COALESCE(dna_sku, $7),
+            last_contact_at = NOW(),
+            updated_at = NOW()
+          WHERE id = $1 RETURNING *`,
+        [contact.id, fullName, cleanEmail || null, cleanPhone || null, cleanCompany || null, cleanTitle || null, cleanSku || null]
+      )).rows[0];
+    } else {
+      isNew = true;
+      contact = (await pool.query(
+        `INSERT INTO crm_contacts
+           (user_id, shared, name, type, email, phone, company, title, source, dna_sku, tags, last_contact_at)
+         VALUES ($1, TRUE, $2, 'lead', $3, $4, $5, $6, 'dna_lead', $7, $8::jsonb, NOW())
+         RETURNING *`,
+        [
+          'dna_public',                      // sentinel user_id; the row is shared anyway
+          fullName,
+          cleanEmail || null,
+          cleanPhone || null,
+          cleanCompany || null,
+          cleanTitle || null,
+          cleanSku || null,
+          JSON.stringify(['DNA Lead']),
+        ]
+      )).rows[0];
+    }
+
+    // ---- Create the deal in 'lead' stage with snapshot of the stone ----
+    const dealTitle = cleanSku
+      ? `DNA inquiry · ${cleanSku}`
+      : `DNA inquiry · ${fullName}`;
+
+    const deal = (await pool.query(
+      `INSERT INTO crm_deals
+         (user_id, contact_id, title, stage, value, currency, notes, shared, dna_sku)
+       VALUES ($1, $2, $3, 'lead', $4, 'USD', $5, TRUE, $6)
+       RETURNING *`,
+      [
+        'dna_public',
+        contact.id,
+        dealTitle,
+        snapshot?.priceTotal ? Math.round(Number(snapshot.priceTotal) / 2) : 0, // neto guess
+        cleanMessage || null,
+        cleanSku || null,
+      ]
+    )).rows[0];
+
+    // Attach the stone to the deal as a deal_item with snapshot
+    if (cleanSku) {
+      await pool.query(
+        `INSERT INTO crm_deal_items (deal_id, sku, category, snapshot)
+         VALUES ($1, $2, $3, $4::jsonb)`,
+        [deal.id, cleanSku, snapshot?.category || null, JSON.stringify(snapshot || {})]
+      );
+    }
+
+    // Log an interaction so it appears in the timeline
+    const subject = `Inquiry from DNA${cleanSku ? ` (${cleanSku})` : ''}`;
+    const content = [
+      cleanMessage,
+      cleanSku ? `Stone: ${cleanSku}` : null,
+      `IP: ${ip}`,
+    ].filter(Boolean).join('\n');
+
+    await pool.query(
+      `INSERT INTO crm_interactions
+         (user_id, contact_id, deal_id, type, direction, subject, content, metadata)
+       VALUES ($1, $2, $3, 'dna_inquiry', 'incoming', $4, $5, $6::jsonb)`,
+      ['dna_public', contact.id, deal.id, subject, content, JSON.stringify({ source: 'dna', sku: cleanSku, snapshot })]
+    );
+
+    res.status(201).json({
+      success: true,
+      isNew,
+      contactId: contact.id,
+      dealId: deal.id,
+    });
+  } catch (error) {
+    console.error("DNA lead error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// GET /api/crm/dna-leads/unread-count?since=ISO  → { count, latest }
+// Lets the CRM sidebar show a badge with new DNA leads
+app.get("/api/crm/dna-leads/unread-count", async (req, res) => {
+  try {
+    const { since } = req.query;
+    const sinceDate = since ? new Date(since) : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    if (isNaN(sinceDate.getTime())) {
+      return res.status(400).json({ error: "Invalid 'since' timestamp" });
+    }
+    const r = await pool.query(
+      `SELECT COUNT(*)::int AS count, MAX(created_at) AS latest
+         FROM crm_contacts
+         WHERE shared = TRUE AND source = 'dna_lead' AND created_at > $1`,
+      [sinceDate.toISOString()]
+    );
+    res.json({ count: r.rows[0].count || 0, latest: r.rows[0].latest });
+  } catch (error) {
+    console.error("DNA unread count error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -1840,7 +2051,8 @@ app.get("/api/crm/deals", async (req, res) => {
     const { userId, stage, contactId } = req.query;
     if (!userId) return res.status(400).json({ error: "userId is required" });
 
-    const conditions = ["d.user_id = $1"];
+    // Broadcast: each user sees their own deals AND any deal flagged as shared (DNA leads)
+    const conditions = ["(d.user_id = $1 OR d.shared = TRUE)"];
     const values = [userId];
     let idx = 2;
 
