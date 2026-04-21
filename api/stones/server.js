@@ -1545,6 +1545,8 @@ app.get("/api/crm/contacts", async (req, res) => {
       // are fetched on demand from /api/crm/contacts/:id.
       // Single LEFT JOIN with one aggregate query replaces 2 per-row correlated subqueries
       // (was O(N×M); now ~O(N+M)).
+      // The list endpoint NEVER returns card_image_thumb (heavy base64 ~5-50KB each).
+      // The FE fetches thumbnails in a separate, batched, background request via /api/crm/contacts/thumbs.
       result = await pool.query(
         `SELECT
             c.id, c.user_id, c.name, c.type, c.title, c.company,
@@ -1553,9 +1555,9 @@ app.get("/api/crm/contacts", async (req, res) => {
             c.source, c.status, c.tags,
             c.folder_id,
             c.dna_sku, c.shared,
-            c.card_image_thumb,
             (c.card_image_front IS NOT NULL) AS has_card_front,
             (c.card_image_back IS NOT NULL) AS has_card_back,
+            (c.card_image_thumb IS NOT NULL) AS has_card_thumb,
             c.last_contact_at, c.updated_at,
             f.name AS folder_name,
             COALESCE(da.deals_count, 0) AS deals_count,
@@ -1805,6 +1807,42 @@ app.post("/api/crm/contacts/bulk-tag", async (req, res) => {
     res.json({ success: true, updated: result.rowCount });
   } catch (error) {
     console.error("Bulk tag error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// GET /api/health — tiny wake-up endpoint used by FE to defrost cold Render instances
+app.get("/api/health", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({ ok: true, ts: Date.now() });
+});
+
+/* ---------- Lazy thumbnail loader (batched) ---------- */
+// GET /api/crm/contacts/thumbs?ids=1,2,3
+// Returns [{ id, thumb }] only for IDs that actually have a thumb.
+// Used by the contacts list UI to render thumbnails in the background
+// after the (lean) list payload has already painted.
+app.get("/api/crm/contacts/thumbs", async (req, res) => {
+  try {
+    const ids = String(req.query.ids || "")
+      .split(",")
+      .map((x) => parseInt(x, 10))
+      .filter((x) => Number.isFinite(x));
+    if (ids.length === 0) return res.json([]);
+    // Cap to keep payloads sane
+    const capped = ids.slice(0, 200);
+    const r = await pool.query(
+      `SELECT id, card_image_thumb AS thumb
+         FROM crm_contacts
+        WHERE id = ANY($1::int[])
+          AND card_image_thumb IS NOT NULL`,
+      [capped]
+    );
+    // Cache hint: thumbs change rarely
+    res.set("Cache-Control", "private, max-age=60");
+    res.json(r.rows);
+  } catch (error) {
+    console.error("Thumbs batch error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
