@@ -1355,6 +1355,105 @@ const crmReadyPromise = (async () => {
       `);
     } catch (e) { console.warn("FK migration warn:", e.message); }
 
+    // One-time backfill: enrich existing DNA-lead deal_items with real inventory
+    // (image, price, specs). Safe to re-run — only touches rows whose snapshot
+    // is missing imageUrl. Caps at 200 rows per boot to avoid long startup blocks.
+    try {
+      const todo = await pool.query(`
+        SELECT i.id, i.deal_id, i.sku
+          FROM crm_deal_items i
+          JOIN crm_deals d ON d.id = i.deal_id
+         WHERE d.shared = TRUE
+           AND i.sku IS NOT NULL
+           AND COALESCE(i.snapshot->>'imageUrl', '') = ''
+         LIMIT 200
+      `);
+      for (const row of todo.rows) {
+        try {
+          const stoneRes = await pool.query(
+            `SELECT sku, category, shape, weight, color, clarity, lab, origin,
+                    measurements, image, additional_pictures,
+                    certificate_number, certificate_image, comment,
+                    price_per_carat, total_price
+               FROM soap_stones WHERE sku = $1 LIMIT 1`,
+            [row.sku]
+          );
+          let snap = null;
+          let bruto = 0;
+          let category = null;
+          if (stoneRes.rows.length) {
+            const s = stoneRes.rows[0];
+            let img = s.image;
+            if (!img && s.additional_pictures) {
+              img = String(s.additional_pictures).split(';')[0]?.trim() || null;
+            }
+            bruto = Number(s.total_price) || 0;
+            category = s.category;
+            snap = {
+              sku: s.sku, category: s.category, shape: s.shape,
+              weightCt: s.weight ? Number(s.weight) : null,
+              color: s.color, clarity: s.clarity, lab: s.lab, origin: s.origin,
+              measurements: s.measurements,
+              certificateNumber: s.certificate_number,
+              certificateUrl: s.certificate_image,
+              treatment: s.comment, imageUrl: img,
+              pricePerCarat: Number(s.price_per_carat) || null,
+              priceTotal: bruto || null,
+            };
+          } else {
+            const jewRes = await pool.query(
+              `SELECT model_number, jewelry_type, style, collection, metal_type,
+                      total_carat, jewelry_weight, stone_type,
+                      all_pictures_link, video_link, price
+                 FROM jewelry_products WHERE model_number = $1 LIMIT 1`,
+              [row.sku]
+            );
+            if (jewRes.rows.length) {
+              const j = jewRes.rows[0];
+              const img = j.all_pictures_link
+                ? String(j.all_pictures_link).split(';').map((x) => x.trim()).filter(Boolean)[0] || null
+                : null;
+              bruto = Number(j.price) || 0;
+              category = 'Jewelry';
+              snap = {
+                sku: j.model_number, category: 'Jewelry',
+                jewelryType: j.jewelry_type, style: j.style,
+                collection: j.collection, metalType: j.metal_type,
+                totalCarat: j.total_carat ? Number(j.total_carat) : null,
+                weightG: j.jewelry_weight ? Number(j.jewelry_weight) : null,
+                stoneType: j.stone_type, imageUrl: img,
+                video: j.video_link,
+                priceTotal: bruto || null,
+              };
+            }
+          }
+          if (snap) {
+            const neto = bruto ? Math.round(bruto / 2) : null;
+            await pool.query(
+              `UPDATE crm_deal_items
+                  SET snapshot = $2::jsonb,
+                      category = COALESCE(category, $3),
+                      custom_price = COALESCE(custom_price, $4)
+                WHERE id = $1`,
+              [row.id, JSON.stringify(snap), category, neto]
+            );
+            if (neto != null) {
+              await pool.query(
+                `UPDATE crm_deals SET value = $2, updated_at = NOW()
+                  WHERE id = $1 AND COALESCE(value, 0) = 0`,
+                [row.deal_id, neto]
+              );
+            }
+          }
+        } catch (rowErr) {
+          console.warn(`DNA backfill row ${row.id} (${row.sku}) failed:`, rowErr.message);
+        }
+      }
+      if (todo.rows.length) console.log(`DNA backfill: processed ${todo.rows.length} item(s)`);
+    } catch (e) {
+      console.warn("DNA backfill warn:", e.message);
+    }
+
     crmReady = true;
     console.log("CRM tables ready");
   } catch (err) {
@@ -1832,7 +1931,92 @@ app.post("/api/crm/dna-lead", async (req, res) => {
       )).rows[0];
     }
 
-    // ---- Create the deal in 'lead' stage with snapshot of the stone ----
+    // ---- Look the SKU up in real inventory so the deal item carries
+    //      a real image, real bruto price, and trustworthy specs.
+    //      We try stones first, then jewelry.
+    let realCategory = snapshot?.category || null;
+    let realSnapshot = { ...(snapshot || {}) };
+    let brutoPrice = 0;
+
+    if (cleanSku) {
+      try {
+        const stoneRes = await pool.query(
+          `SELECT sku, category, shape, weight, color, clarity, lab, origin,
+                  measurements, image, additional_pictures, video,
+                  certificate_number, certificate_image, comment,
+                  price_per_carat, total_price
+             FROM soap_stones WHERE sku = $1 LIMIT 1`,
+          [cleanSku]
+        );
+
+        if (stoneRes.rows.length) {
+          const s = stoneRes.rows[0];
+          let img = s.image;
+          if (!img && s.additional_pictures) {
+            const first = String(s.additional_pictures).split(';')[0];
+            img = first ? first.trim() : null;
+          }
+          brutoPrice = Number(s.total_price) || 0;
+          realCategory = s.category || realCategory;
+          realSnapshot = {
+            sku: s.sku,
+            category: s.category,
+            shape: s.shape,
+            weightCt: s.weight ? Number(s.weight) : null,
+            color: s.color,
+            clarity: s.clarity,
+            lab: s.lab,
+            origin: s.origin,
+            measurements: s.measurements,
+            certificateNumber: s.certificate_number,
+            certificateUrl: s.certificate_image,
+            treatment: s.comment,
+            imageUrl: img,
+            video: s.video,
+            pricePerCarat: Number(s.price_per_carat) || null,
+            priceTotal: brutoPrice || null,
+          };
+        } else {
+          // Try jewelry
+          const jewRes = await pool.query(
+            `SELECT model_number, jewelry_type, style, collection, metal_type,
+                    total_carat, jewelry_weight, stone_type,
+                    all_pictures_link, video_link, price
+               FROM jewelry_products WHERE model_number = $1 LIMIT 1`,
+            [cleanSku]
+          );
+          if (jewRes.rows.length) {
+            const j = jewRes.rows[0];
+            const firstImg = j.all_pictures_link
+              ? String(j.all_pictures_link).split(';').map((x) => x.trim()).filter(Boolean)[0] || null
+              : null;
+            brutoPrice = Number(j.price) || 0;
+            realCategory = realCategory || 'Jewelry';
+            realSnapshot = {
+              sku: j.model_number,
+              category: 'Jewelry',
+              jewelryType: j.jewelry_type,
+              style: j.style,
+              collection: j.collection,
+              metalType: j.metal_type,
+              totalCarat: j.total_carat ? Number(j.total_carat) : null,
+              weightG: j.jewelry_weight ? Number(j.jewelry_weight) : null,
+              stoneType: j.stone_type,
+              imageUrl: firstImg,
+              video: j.video_link,
+              priceTotal: brutoPrice || null,
+            };
+          }
+        }
+      } catch (lookupErr) {
+        console.warn('DNA lead inventory lookup failed:', lookupErr.message);
+      }
+    }
+
+    // Net price (display default — same convention used everywhere else in the app)
+    const netoPrice = brutoPrice ? Math.round(brutoPrice / 2) : 0;
+
+    // ---- Create the deal in 'lead' stage ----
     const dealTitle = cleanSku
       ? `DNA inquiry · ${cleanSku}`
       : `DNA inquiry · ${fullName}`;
@@ -1846,18 +2030,18 @@ app.post("/api/crm/dna-lead", async (req, res) => {
         'dna_public',
         contact.id,
         dealTitle,
-        snapshot?.priceTotal ? Math.round(Number(snapshot.priceTotal) / 2) : 0, // neto guess
+        netoPrice,
         cleanMessage || null,
         cleanSku || null,
       ]
     )).rows[0];
 
-    // Attach the stone to the deal as a deal_item with snapshot
+    // Attach the stone to the deal as a deal_item with real snapshot + a default custom price (neto)
     if (cleanSku) {
       await pool.query(
-        `INSERT INTO crm_deal_items (deal_id, sku, category, snapshot)
-         VALUES ($1, $2, $3, $4::jsonb)`,
-        [deal.id, cleanSku, snapshot?.category || null, JSON.stringify(snapshot || {})]
+        `INSERT INTO crm_deal_items (deal_id, sku, category, snapshot, custom_price)
+         VALUES ($1, $2, $3, $4::jsonb, $5)`,
+        [deal.id, cleanSku, realCategory, JSON.stringify(realSnapshot), netoPrice || null]
       );
     }
 
