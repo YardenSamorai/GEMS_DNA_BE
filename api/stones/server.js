@@ -1318,6 +1318,23 @@ const crmReadyPromise = (async () => {
       "CREATE INDEX IF NOT EXISTS idx_crm_deals_shared ON crm_deals(shared) WHERE shared = TRUE",
       "CREATE INDEX IF NOT EXISTS idx_crm_contacts_email_lower ON crm_contacts(LOWER(email))",
       "CREATE INDEX IF NOT EXISTS idx_crm_contacts_phone_norm ON crm_contacts(regexp_replace(COALESCE(phone,''),'[^0-9]','','g'))",
+      // Performance indexes (huge speedup for the contacts list + drawer queries)
+      "CREATE INDEX IF NOT EXISTS idx_crm_contacts_user_id ON crm_contacts(user_id)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_contacts_updated_at ON crm_contacts(updated_at DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_contacts_folder_id ON crm_contacts(folder_id) WHERE folder_id IS NOT NULL",
+      "CREATE INDEX IF NOT EXISTS idx_crm_contacts_type ON crm_contacts(type)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_deals_contact_id ON crm_deals(contact_id)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_deals_contact_stage ON crm_deals(contact_id, stage)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_deals_user_id ON crm_deals(user_id)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_interactions_contact ON crm_interactions(contact_id, occurred_at DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_interactions_deal ON crm_interactions(deal_id) WHERE deal_id IS NOT NULL",
+      "CREATE INDEX IF NOT EXISTS idx_crm_tasks_contact ON crm_tasks(contact_id)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_tasks_deal ON crm_tasks(deal_id) WHERE deal_id IS NOT NULL",
+      "CREATE INDEX IF NOT EXISTS idx_crm_deal_items_deal ON crm_deal_items(deal_id)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_folders_parent ON crm_folders(parent_id)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_folders_user ON crm_folders(user_id)",
+      // Unread DNA leads badge query (polled every 30s by every signed-in user)
+      "CREATE INDEX IF NOT EXISTS idx_crm_contacts_dna_recent ON crm_contacts(created_at DESC) WHERE shared = TRUE AND source = 'dna_lead'",
     ];
     for (const sql of newCols) {
       try { await pool.query(sql); } catch (e) { console.warn("Migration warn:", e.message); }
@@ -1424,27 +1441,38 @@ app.get("/api/crm/contacts", async (req, res) => {
 
     let result;
     try {
-      // Exclude heavy card image columns from list responses (they are loaded on demand from the single-contact endpoint).
-      // Keep card_image_thumb for the table preview, plus boolean flags so the UI knows what's available.
+      // Lean payload: only fields the list/cards/filters need.
+      // Heavy fields (notes, address, preferences, linked_contact_ids, card images, dates other than updated_at)
+      // are fetched on demand from /api/crm/contacts/:id.
+      // Single LEFT JOIN with one aggregate query replaces 2 per-row correlated subqueries
+      // (was O(N×M); now ~O(N+M)).
       result = await pool.query(
         `SELECT
             c.id, c.user_id, c.name, c.type, c.title, c.company,
-            c.phone, c.phone_alt, c.email, c.website,
-            c.country, c.city, c.address,
-            c.source, c.status, c.notes, c.tags, c.preferences,
-            c.folder_id, c.linked_contact_ids, c.card_back_notes,
-            c.outlook_contact_id, c.outlook_synced_at,
+            c.phone, c.email, c.website,
+            c.country, c.city,
+            c.source, c.status, c.tags,
+            c.folder_id,
+            c.dna_sku, c.shared,
             c.card_image_thumb,
             (c.card_image_front IS NOT NULL) AS has_card_front,
             (c.card_image_back IS NOT NULL) AS has_card_back,
-            c.last_contact_at, c.created_at, c.updated_at,
+            c.last_contact_at, c.updated_at,
             f.name AS folder_name,
-            (SELECT COUNT(*)::int FROM crm_deals d WHERE d.contact_id = c.id) AS deals_count,
-            (SELECT COALESCE(SUM(value),0) FROM crm_deals d WHERE d.contact_id = c.id AND d.stage = 'won') AS total_won
+            COALESCE(da.deals_count, 0) AS deals_count,
+            COALESCE(da.total_won, 0) AS total_won
          FROM crm_contacts c
          LEFT JOIN crm_folders f ON f.id = c.folder_id
+         LEFT JOIN (
+           SELECT contact_id,
+                  COUNT(*)::int AS deals_count,
+                  COALESCE(SUM(CASE WHEN stage = 'won' THEN value ELSE 0 END), 0) AS total_won
+             FROM crm_deals
+            GROUP BY contact_id
+         ) da ON da.contact_id = c.id
          WHERE ${conditions.join(" AND ")}
-         ORDER BY c.updated_at DESC`,
+         ORDER BY c.updated_at DESC
+         LIMIT 2000`,
         values
       );
     } catch (joinErr) {
@@ -1477,11 +1505,19 @@ app.get("/api/crm/contacts", async (req, res) => {
       result = await pool.query(
         `SELECT c.*,
           NULL::text AS folder_name,
-          (SELECT COUNT(*)::int FROM crm_deals d WHERE d.contact_id = c.id) AS deals_count,
-          (SELECT COALESCE(SUM(value),0) FROM crm_deals d WHERE d.contact_id = c.id AND d.stage = 'won') AS total_won
+          COALESCE(da.deals_count, 0) AS deals_count,
+          COALESCE(da.total_won, 0) AS total_won
          FROM crm_contacts c
+         LEFT JOIN (
+           SELECT contact_id,
+                  COUNT(*)::int AS deals_count,
+                  COALESCE(SUM(CASE WHEN stage = 'won' THEN value ELSE 0 END), 0) AS total_won
+             FROM crm_deals
+            GROUP BY contact_id
+         ) da ON da.contact_id = c.id
          WHERE ${conditions.join(" AND ")}
-         ORDER BY c.updated_at DESC`,
+         ORDER BY c.updated_at DESC
+         LIMIT 2000`,
         values
       );
     }
