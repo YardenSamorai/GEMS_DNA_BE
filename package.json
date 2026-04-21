@@ -15,6 +15,7 @@
     "dotenv": "^16.4.7",
     "drizzle-orm": "^0.41.0",
     "express": "^4.21.2",
+    "libphonenumber-js": "^1.12.41",
     "node-cron": "^3.0.3",
     "node-fetch": "^2.7.0",
     "pg": "^8.14.1",

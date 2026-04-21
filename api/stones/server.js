@@ -1848,6 +1848,32 @@ app.get("/api/crm/contacts/thumbs", async (req, res) => {
 });
 
 /* =========================================================
+   Geo detection — country/city inference for CRM contacts
+   ========================================================= */
+const { detectGeo } = require("./geo");
+
+// POST /api/crm/geo/detect
+// Body: { phone?, city?, address?, country?, email? }
+// Returns: { country, countryCode, flag, city, lat, lng, confidence, source, alternates, signals }
+//
+// Used by:
+//   - ContactFormModal      (live suggestion as the user types)
+//   - ScanCardModal         (auto-fill suggestion after card OCR)
+//   - InterestedModal (DNA) (background detection on submit)
+//   - ImportContactsModal   (per-row preview during CSV/Excel import)
+app.post("/api/crm/geo/detect", async (req, res) => {
+  try {
+    const result = await detectGeo(req.body || {});
+    // Geo lookups are stable for hours; CDN-friendly cache
+    res.set("Cache-Control", "private, max-age=300");
+    res.json(result);
+  } catch (err) {
+    console.error("geo/detect failed:", err);
+    res.status(500).json({ error: "Geo detection failed" });
+  }
+});
+
+/* =========================================================
    DNA → CRM bridge — public endpoints (no Clerk auth required)
    ========================================================= */
 
@@ -1933,6 +1959,17 @@ app.post("/api/crm/dna-lead", async (req, res) => {
       if (r.rows.length) contact = r.rows[0];
     }
 
+    // Silent geo detection from phone / email — for DNA leads we don't ask
+    // the visitor for location, so this gives the CRM staff a populated
+    // country field for filtering/segmenting without any extra UX noise.
+    let detectedCountry = null;
+    try {
+      const geo = await detectGeo({ phone: cleanPhone, email: cleanEmail });
+      if (geo?.country && (geo.confidence === "high" || geo.confidence === "medium")) {
+        detectedCountry = geo.country;
+      }
+    } catch (_) { /* non-blocking */ }
+
     let isNew = false;
     if (contact) {
       // Update missing fields only — never overwrite human-edited data
@@ -1944,17 +1981,18 @@ app.post("/api/crm/dna-lead", async (req, res) => {
             company = COALESCE(NULLIF(company,''), $5),
             title = COALESCE(NULLIF(title,''), $6),
             dna_sku = COALESCE(dna_sku, $7),
+            country = COALESCE(NULLIF(country,''), $8),
             last_contact_at = NOW(),
             updated_at = NOW()
           WHERE id = $1 RETURNING *`,
-        [contact.id, fullName, cleanEmail || null, cleanPhone || null, cleanCompany || null, cleanTitle || null, cleanSku || null]
+        [contact.id, fullName, cleanEmail || null, cleanPhone || null, cleanCompany || null, cleanTitle || null, cleanSku || null, detectedCountry]
       )).rows[0];
     } else {
       isNew = true;
       contact = (await pool.query(
         `INSERT INTO crm_contacts
-           (user_id, shared, name, type, email, phone, company, title, source, dna_sku, tags, last_contact_at)
-         VALUES ($1, TRUE, $2, 'lead', $3, $4, $5, $6, 'dna_lead', $7, $8::jsonb, NOW())
+           (user_id, shared, name, type, email, phone, company, title, source, dna_sku, country, tags, last_contact_at)
+         VALUES ($1, TRUE, $2, 'lead', $3, $4, $5, $6, 'dna_lead', $7, $8, $9::jsonb, NOW())
          RETURNING *`,
         [
           'dna_public',                      // sentinel user_id; the row is shared anyway
@@ -1964,6 +2002,7 @@ app.post("/api/crm/dna-lead", async (req, res) => {
           cleanCompany || null,
           cleanTitle || null,
           cleanSku || null,
+          detectedCountry,
           JSON.stringify(['DNA Lead']),
         ]
       )).rows[0];
