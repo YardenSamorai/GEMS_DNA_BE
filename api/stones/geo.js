@@ -16,6 +16,32 @@
 
 const { parsePhoneNumberFromString } = require("libphonenumber-js");
 
+/**
+ * Tries to parse a phone number that may or may not start with a country
+ * code, optionally biasing the parser with a known default country.
+ *
+ *   - If the number already starts with `+`, libphonenumber identifies the
+ *     country directly and `defaultCountry` is ignored.
+ *   - If it doesn't (e.g. "(212) 555-1234"), `defaultCountry` is used to
+ *     interpret the number as a local one in that country.
+ *   - Returns { country, e164, international } on success, null on failure.
+ */
+function tryParsePhone(phone, defaultCountry) {
+  if (!phone) return null;
+  try {
+    const raw = String(phone).trim();
+    const parsed = parsePhoneNumberFromString(raw, defaultCountry || undefined);
+    if (parsed && parsed.isValid()) {
+      return {
+        country: parsed.country || null,
+        e164: parsed.number,                    // +12125551234
+        international: parsed.formatInternational(), // +1 212 555 1234
+      };
+    }
+  } catch (_) { /* invalid */ }
+  return null;
+}
+
 /* ---------- Country code → English name --------------------------------- */
 // We deliberately keep this list small/explicit (the ones our customers
 // actually use). Anything not on it falls back to the ISO code.
@@ -73,13 +99,13 @@ const countryFromEmail = (email) => {
 };
 
 /* ---------- Phone → country -------------------------------------------- */
-const countryFromPhone = (phone) => {
-  if (!phone) return null;
-  try {
-    const parsed = parsePhoneNumberFromString(String(phone).trim());
-    if (parsed && parsed.country) return parsed.country;
-  } catch (_) { /* invalid number — silently ignore */ }
-  return null;
+// `defaultCountry` lets us interpret bare local-format numbers like
+// "(212) 555-1234" or "020 7946 0123" by saying "if no + prefix, assume US"
+// or "...assume GB". Optional — caller can pass null for the original
+// strict behaviour.
+const countryFromPhone = (phone, defaultCountry = null) => {
+  const parsed = tryParsePhone(phone, defaultCountry);
+  return parsed?.country || null;
 };
 
 /* ---------- City normalisation ----------------------------------------- */
@@ -202,8 +228,12 @@ async function mapboxLookup(query, opts = {}) {
  * secondary "alternates" entry so the UI can offer both.
  */
 async function detectGeo({ phone, city, address, country, email } = {}) {
+  // ---- Pass 1: try to detect country from STRONG location signals only.
+  //              We deliberately do NOT pass a default country to the phone
+  //              parser yet, because if the phone really has a "+" prefix
+  //              we want to discover the country from it independently.
   const signals = {
-    phone: countryFromPhone(phone),
+    phone: countryFromPhone(phone, null),  // strict: only +-prefixed numbers count
     email: countryFromEmail(email),
     mapbox: null,
   };
@@ -216,7 +246,11 @@ async function detectGeo({ phone, city, address, country, email } = {}) {
     });
   }
 
-  // Resolve the winner
+  // Resolve the country winner using the strongest available signal.
+  // Order of trust:
+  //   1. Mapbox geocoding of the address (highest precision)
+  //   2. Strict phone country (only valid if number had + prefix)
+  //   3. Email TLD (weakest, but still useful)
   let bestCC = null;
   let bestCountry = null;
   let confidence = "low";
@@ -239,6 +273,29 @@ async function detectGeo({ phone, city, address, country, email } = {}) {
     source = "email";
   }
 
+  // ---- Pass 2: if we have a country guess BUT the phone has no country
+  //              code (e.g. "(212) 555-1234" on a card with a NYC address),
+  //              re-parse the phone with that country as a hint and produce
+  //              the international form. This is the magic that lets a US
+  //              local number on a US business card become "+1 212 555 1234"
+  //              automatically.
+  let formattedPhone = null;
+  if (phone && bestCC) {
+    const reparsed = tryParsePhone(phone, bestCC);
+    if (reparsed?.international) {
+      const original = String(phone).trim();
+      // Only suggest the formatted version if it actually adds info
+      // (i.e. the user didn't already type a +country-coded number).
+      if (!original.startsWith("+") || original.replace(/[^\d+]/g, "") !== reparsed.e164) {
+        formattedPhone = {
+          e164: reparsed.e164,                 // +12125551234
+          international: reparsed.international, // +1 212 555 1234
+          inferredCountry: reparsed.country,
+        };
+      }
+    }
+  }
+
   const alternates = [];
   if (signals.phone && signals.phone !== bestCC) {
     alternates.push({ countryCode: signals.phone, country: countryName(signals.phone), source: "phone" });
@@ -259,6 +316,7 @@ async function detectGeo({ phone, city, address, country, email } = {}) {
     source,
     alternates,
     signals,
+    formattedPhone,  // null if no improvement was possible
   };
 }
 

@@ -1962,11 +1962,17 @@ app.post("/api/crm/dna-lead", async (req, res) => {
     // Silent geo detection from phone / email — for DNA leads we don't ask
     // the visitor for location, so this gives the CRM staff a populated
     // country field for filtering/segmenting without any extra UX noise.
+    // We also reformat the phone with its country code if the visitor
+    // typed a bare local number and we managed to infer the country.
     let detectedCountry = null;
+    let normalisedPhone = cleanPhone;
     try {
       const geo = await detectGeo({ phone: cleanPhone, email: cleanEmail });
       if (geo?.country && (geo.confidence === "high" || geo.confidence === "medium")) {
         detectedCountry = geo.country;
+      }
+      if (geo?.formattedPhone?.international) {
+        normalisedPhone = geo.formattedPhone.international;
       }
     } catch (_) { /* non-blocking */ }
 
@@ -1985,7 +1991,7 @@ app.post("/api/crm/dna-lead", async (req, res) => {
             last_contact_at = NOW(),
             updated_at = NOW()
           WHERE id = $1 RETURNING *`,
-        [contact.id, fullName, cleanEmail || null, cleanPhone || null, cleanCompany || null, cleanTitle || null, cleanSku || null, detectedCountry]
+        [contact.id, fullName, cleanEmail || null, normalisedPhone || null, cleanCompany || null, cleanTitle || null, cleanSku || null, detectedCountry]
       )).rows[0];
     } else {
       isNew = true;
@@ -1998,7 +2004,7 @@ app.post("/api/crm/dna-lead", async (req, res) => {
           'dna_public',                      // sentinel user_id; the row is shared anyway
           fullName,
           cleanEmail || null,
-          cleanPhone || null,
+          normalisedPhone || null,
           cleanCompany || null,
           cleanTitle || null,
           cleanSku || null,
