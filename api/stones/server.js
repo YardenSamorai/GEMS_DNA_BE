@@ -266,6 +266,189 @@ app.get("/api/stones/:stone_id", async (req, res) => {
 });
 
 /* =========================================================
+   /api/stones/:sku/usage – cross-system view of one stone:
+     - jewelry pieces it lives in (workshop)
+     - DNA inquiries that referenced it (CRM interactions)
+     - sales/quote deals that included it (CRM deal items)
+     - current_status:  available | reserved | set | sold
+   This is what powers the "Used in / Inquired by" panel on the
+   stone detail and inventory drawer so the same SKU is no longer
+   blind to what's happening with it across the rest of the app.
+   ========================================================= */
+app.get("/api/stones/:sku/usage", async (req, res) => {
+  try {
+    const { sku } = req.params;
+    if (!sku) return res.status(400).json({ error: "sku required" });
+
+    const jewelry = await pool.query(
+      `SELECT jis.id              AS link_id,
+              jis.role,
+              jis.quantity,
+              jis.consume_from_inventory,
+              jis.inventory_status,
+              jis.snapshot,
+              jis.created_at,
+              ji.id              AS jewelry_item_id,
+              ji.sku             AS jewelry_sku,
+              ji.name            AS jewelry_name,
+              ji.status          AS jewelry_status,
+              ji.cover_image_url,
+              ji.contact_id,
+              ji.deal_id,
+              ji.sold_deal_id,
+              ji.sold_at,
+              c.first_name, c.last_name, c.business_name, c.contact_type
+         FROM jewelry_item_stones jis
+         JOIN jewelry_items ji ON ji.id = jis.item_id
+         LEFT JOIN crm_contacts c ON c.id = ji.contact_id
+        WHERE jis.stone_sku = $1
+        ORDER BY jis.created_at DESC`,
+      [sku]
+    );
+
+    const dnaInquiries = await pool.query(
+      `SELECT i.id, i.type, i.subject, i.content, i.metadata, i.occurred_at,
+              i.contact_id, i.deal_id,
+              c.first_name, c.last_name, c.business_name, c.contact_type, c.shared
+         FROM crm_interactions i
+         LEFT JOIN crm_contacts c ON c.id = i.contact_id
+        WHERE (i.metadata->>'sku' = $1 OR i.metadata->>'dna_sku' = $1)
+        ORDER BY i.occurred_at DESC NULLS LAST, i.id DESC
+        LIMIT 50`,
+      [sku]
+    ).catch(() => ({ rows: [] }));
+
+    const deals = await pool.query(
+      `SELECT DISTINCT d.id, d.title, d.stage, d.value, d.currency, d.contact_id,
+              d.dna_sku, d.created_at, d.shared,
+              c.first_name, c.last_name, c.business_name, c.contact_type
+         FROM crm_deal_items di
+         JOIN crm_deals d ON d.id = di.deal_id
+         LEFT JOIN crm_contacts c ON c.id = d.contact_id
+        WHERE di.sku = $1 OR di.snapshot->>'sku' = $1
+        ORDER BY d.created_at DESC
+        LIMIT 50`,
+      [sku]
+    ).catch(() => ({ rows: [] }));
+
+    // Compute current_status from jewelry usage rows.
+    let currentStatus = "available";
+    const active = jewelry.rows.find(
+      (r) =>
+        r.consume_from_inventory &&
+        r.inventory_status &&
+        !["sold", "returned"].includes(r.inventory_status)
+    );
+    if (active) {
+      currentStatus = active.inventory_status; // 'reserved' or 'set'
+    } else {
+      const lastSold = jewelry.rows.find((r) => r.consume_from_inventory && r.inventory_status === "sold");
+      if (lastSold) currentStatus = "sold";
+    }
+
+    const fmtName = (r) =>
+      r.contact_type === "business"
+        ? r.business_name || [r.first_name, r.last_name].filter(Boolean).join(" ").trim()
+        : [r.first_name, r.last_name].filter(Boolean).join(" ").trim() || r.business_name || null;
+
+    res.json({
+      sku,
+      current_status: currentStatus,
+      jewelry_items: jewelry.rows.map((r) => ({
+        link_id: r.link_id,
+        jewelry_item_id: r.jewelry_item_id,
+        jewelry_sku: r.jewelry_sku,
+        jewelry_name: r.jewelry_name,
+        jewelry_status: r.jewelry_status,
+        cover_image_url: r.cover_image_url,
+        role: r.role,
+        quantity: r.quantity,
+        consume_from_inventory: r.consume_from_inventory,
+        inventory_status: r.inventory_status,
+        snapshot: r.snapshot,
+        contact_id: r.contact_id,
+        contact_name: fmtName(r),
+        deal_id: r.deal_id,
+        sold_deal_id: r.sold_deal_id,
+        sold_at: r.sold_at,
+        created_at: r.created_at,
+      })),
+      dna_inquiries: dnaInquiries.rows.map((r) => ({
+        id: r.id,
+        type: r.type,
+        subject: r.subject,
+        content: r.content,
+        metadata: r.metadata,
+        occurred_at: r.occurred_at,
+        contact_id: r.contact_id,
+        contact_name: fmtName(r),
+        contact_shared: r.shared,
+        deal_id: r.deal_id,
+      })),
+      deals: deals.rows.map((r) => ({
+        id: r.id,
+        title: r.title,
+        stage: r.stage,
+        value: r.value != null ? Number(r.value) : null,
+        currency: r.currency,
+        contact_id: r.contact_id,
+        contact_name: fmtName(r),
+        dna_sku: r.dna_sku,
+        contact_shared: r.shared,
+        created_at: r.created_at,
+      })),
+    });
+  } catch (e) {
+    console.error("Stone usage error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =========================================================
+   /api/stones/inventory-status – bulk status map
+   Returns one row per SKU that currently has a non-final
+   jewelry usage. The inventory list calls this once and
+   merges client-side; SKUs not in the map are 'available'.
+   ========================================================= */
+app.get("/api/stones/inventory-status", async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT jis.stone_sku,
+              jis.inventory_status,
+              ji.id   AS jewelry_item_id,
+              ji.sku  AS jewelry_sku,
+              ji.name AS jewelry_name,
+              ji.status AS jewelry_status
+         FROM jewelry_item_stones jis
+         JOIN jewelry_items ji ON ji.id = jis.item_id
+        WHERE jis.stone_sku IS NOT NULL
+          AND jis.consume_from_inventory = TRUE
+          AND jis.inventory_status IS NOT NULL`
+    );
+    const map = {};
+    for (const row of r.rows) {
+      const sku = row.stone_sku;
+      const cur = map[sku];
+      // Active (reserved/set) wins over sold; among active, set wins over reserved.
+      const rank = (s) => (s === "set" ? 3 : s === "reserved" ? 2 : s === "sold" ? 1 : 0);
+      if (!cur || rank(row.inventory_status) > rank(cur.status)) {
+        map[sku] = {
+          status: row.inventory_status,
+          jewelry_item_id: row.jewelry_item_id,
+          jewelry_sku: row.jewelry_sku,
+          jewelry_name: row.jewelry_name,
+          jewelry_status: row.jewelry_status,
+        };
+      }
+    }
+    res.json({ statuses: map });
+  } catch (e) {
+    console.error("Inventory-status error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =========================================================
    /api/jewelry – all jewelry items (inventory list)
    ========================================================= */
 app.get("/api/jewelry", async (req, res) => {
@@ -1296,6 +1479,44 @@ const crmReadyPromise = (async () => {
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_email_templates_user ON crm_email_templates(user_id)`);
 
+    // Invoices (per-customer billing)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_invoices (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        contact_id INTEGER REFERENCES crm_contacts(id) ON DELETE CASCADE,
+        deal_id INTEGER REFERENCES crm_deals(id) ON DELETE SET NULL,
+        invoice_number TEXT NOT NULL,
+        status TEXT DEFAULT 'draft',
+        subtotal NUMERIC(14,2) DEFAULT 0,
+        tax NUMERIC(14,2) DEFAULT 0,
+        total NUMERIC(14,2) DEFAULT 0,
+        currency TEXT DEFAULT 'USD',
+        issued_at DATE,
+        due_at DATE,
+        paid_at TIMESTAMP,
+        notes TEXT,
+        metadata JSONB DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Occasions (birthdays, anniversaries, weddings — recurring or one-off)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_occasions (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        contact_id INTEGER REFERENCES crm_contacts(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        label TEXT,
+        occurs_on DATE NOT NULL,
+        recurring_yearly BOOLEAN DEFAULT TRUE,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
     // Add new columns to crm_contacts (idempotent)
     const newCols = [
       "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS title TEXT",
@@ -1333,6 +1554,13 @@ const crmReadyPromise = (async () => {
       "CREATE INDEX IF NOT EXISTS idx_crm_deal_items_deal ON crm_deal_items(deal_id)",
       "CREATE INDEX IF NOT EXISTS idx_crm_folders_parent ON crm_folders(parent_id)",
       "CREATE INDEX IF NOT EXISTS idx_crm_folders_user ON crm_folders(user_id)",
+      // Invoices + occasions
+      "CREATE INDEX IF NOT EXISTS idx_crm_invoices_contact ON crm_invoices(contact_id)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_invoices_user ON crm_invoices(user_id)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_invoices_status ON crm_invoices(status)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_invoices_deal ON crm_invoices(deal_id) WHERE deal_id IS NOT NULL",
+      "CREATE INDEX IF NOT EXISTS idx_crm_occasions_contact ON crm_occasions(contact_id)",
+      "CREATE INDEX IF NOT EXISTS idx_crm_occasions_user_date ON crm_occasions(user_id, occurs_on)",
       // Unread DNA leads badge query (polled every 30s by every signed-in user)
       "CREATE INDEX IF NOT EXISTS idx_crm_contacts_dna_recent ON crm_contacts(created_at DESC) WHERE shared = TRUE AND source = 'dna_lead'",
     ];
@@ -2389,7 +2617,20 @@ app.get("/api/crm/deals/:id", async (req, res) => {
     if (deal.rows.length === 0) return res.status(404).json({ error: "Deal not found" });
     const items = await pool.query("SELECT * FROM crm_deal_items WHERE deal_id = $1 ORDER BY created_at ASC", [id]);
     const interactions = await pool.query("SELECT * FROM crm_interactions WHERE deal_id = $1 ORDER BY occurred_at DESC", [id]);
-    res.json({ ...deal.rows[0], items: items.rows, interactions: interactions.rows });
+    // Linked jewelry items: anything pointing at this deal via deal_id or sold_deal_id
+    const jewelry = await pool.query(
+      `SELECT id, sku, name, type, status, category, sale_price, total_cost, cover_image_url, created_at
+         FROM jewelry_items
+        WHERE deal_id = $1 OR sold_deal_id = $1
+        ORDER BY created_at DESC`,
+      [id]
+    ).catch(() => ({ rows: [] }));
+    res.json({
+      ...deal.rows[0],
+      items: items.rows,
+      interactions: interactions.rows,
+      jewelry_items: jewelry.rows,
+    });
   } catch (error) {
     console.error("Error fetching deal:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -2619,6 +2860,376 @@ app.delete("/api/crm/tasks/:id", async (req, res) => {
   }
 });
 
+/* ---------- Interactions (GET + PUT) ----------
+ * POST + DELETE already exist above. The Sales/Customer profile page
+ * needs a way to fetch interactions (calls, notes, emails) for a contact
+ * and to update them (e.g. mark a call as completed).
+ */
+app.get("/api/crm/interactions", async (req, res) => {
+  try {
+    const { userId, contactId, type, dealId, limit } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const conditions = ["user_id = $1"];
+    const values = [userId];
+    let idx = 2;
+    if (contactId) { conditions.push(`contact_id = $${idx++}`); values.push(contactId); }
+    if (dealId)    { conditions.push(`deal_id = $${idx++}`);    values.push(dealId); }
+    if (type)      { conditions.push(`type = $${idx++}`);       values.push(type); }
+    const lim = Math.min(Number(limit) || 200, 500);
+    const result = await pool.query(
+      `SELECT * FROM crm_interactions
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY occurred_at DESC NULLS LAST, created_at DESC
+       LIMIT ${lim}`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching interactions:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.put("/api/crm/interactions/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const allowed = ["type", "direction", "subject", "content", "metadata", "occurred_at"];
+    const fields = [];
+    const values = [];
+    let idx = 1;
+    for (const key of allowed) {
+      const camel = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+      if (req.body[camel] !== undefined) {
+        fields.push(`${key} = $${idx++}`);
+        values.push(key === "metadata" ? JSON.stringify(req.body[camel] || {}) : req.body[camel]);
+      }
+    }
+    if (fields.length === 0) return res.status(400).json({ error: "No fields to update" });
+    values.push(id);
+    const result = await pool.query(
+      `UPDATE crm_interactions SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Error updating interaction:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* ---------- Invoices ---------- */
+
+// Auto-generate INV-YYYY-NNNN per user
+async function generateInvoiceNumber(userId) {
+  const year = new Date().getFullYear();
+  const prefix = `INV-${year}-`;
+  const result = await pool.query(
+    `SELECT invoice_number FROM crm_invoices
+     WHERE user_id = $1 AND invoice_number LIKE $2
+     ORDER BY id DESC LIMIT 1`,
+    [userId, `${prefix}%`]
+  );
+  let next = 1;
+  if (result.rows[0]) {
+    const last = result.rows[0].invoice_number || "";
+    const m = last.match(/-(\d+)$/);
+    if (m) next = Number(m[1]) + 1;
+  }
+  return `${prefix}${String(next).padStart(4, "0")}`;
+}
+
+app.get("/api/crm/invoices", async (req, res) => {
+  try {
+    const { userId, contactId, status, dealId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const conditions = ["i.user_id = $1"];
+    const values = [userId];
+    let idx = 2;
+    if (contactId) { conditions.push(`i.contact_id = $${idx++}`); values.push(contactId); }
+    if (status)    { conditions.push(`i.status = $${idx++}`);     values.push(status); }
+    if (dealId)    { conditions.push(`i.deal_id = $${idx++}`);    values.push(dealId); }
+    const result = await pool.query(
+      `SELECT i.*, c.name AS contact_name, d.title AS deal_title
+       FROM crm_invoices i
+       LEFT JOIN crm_contacts c ON c.id = i.contact_id
+       LEFT JOIN crm_deals d ON d.id = i.deal_id
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY i.created_at DESC
+       LIMIT 500`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching invoices:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/crm/invoices/:id", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT i.*, c.name AS contact_name, d.title AS deal_title
+       FROM crm_invoices i
+       LEFT JOIN crm_contacts c ON c.id = i.contact_id
+       LEFT JOIN crm_deals d ON d.id = i.deal_id
+       WHERE i.id = $1`,
+      [req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Invoice not found" });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Error fetching invoice:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/crm/invoices", async (req, res) => {
+  try {
+    const {
+      userId, contactId, dealId, invoiceNumber, status,
+      subtotal, tax, total, currency, issuedAt, dueAt, paidAt, notes, metadata
+    } = req.body;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const number = invoiceNumber || (await generateInvoiceNumber(userId));
+    const computedTotal = total != null ? total : (Number(subtotal || 0) + Number(tax || 0));
+
+    const result = await pool.query(
+      `INSERT INTO crm_invoices
+        (user_id, contact_id, deal_id, invoice_number, status,
+         subtotal, tax, total, currency, issued_at, due_at, paid_at, notes, metadata)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       RETURNING *`,
+      [
+        userId, contactId || null, dealId || null, number, status || "draft",
+        subtotal || 0, tax || 0, computedTotal, currency || "USD",
+        issuedAt || null, dueAt || null, paidAt || null, notes || null,
+        JSON.stringify(metadata || {}),
+      ]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("Error creating invoice:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.put("/api/crm/invoices/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const allowed = ["status", "subtotal", "tax", "total", "currency", "issued_at", "due_at", "paid_at", "notes", "metadata", "deal_id"];
+    const fields = [];
+    const values = [];
+    let idx = 1;
+    for (const key of allowed) {
+      const camel = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+      if (req.body[camel] !== undefined) {
+        fields.push(`${key} = $${idx++}`);
+        values.push(key === "metadata" ? JSON.stringify(req.body[camel] || {}) : req.body[camel]);
+      }
+    }
+    // Auto-stamp paid_at when status flips to "paid" and caller didn't set one
+    if (req.body.status === "paid" && req.body.paidAt === undefined) {
+      fields.push(`paid_at = NOW()`);
+    }
+    fields.push(`updated_at = NOW()`);
+    if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
+    values.push(id);
+    const result = await pool.query(
+      `UPDATE crm_invoices SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Error updating invoice:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/api/crm/invoices/:id", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM crm_invoices WHERE id = $1", [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error deleting invoice:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* ---------- Occasions (birthdays, anniversaries, etc.) ---------- */
+
+app.get("/api/crm/occasions", async (req, res) => {
+  try {
+    const { userId, contactId, upcomingDays } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const conditions = ["o.user_id = $1"];
+    const values = [userId];
+    let idx = 2;
+    if (contactId) { conditions.push(`o.contact_id = $${idx++}`); values.push(contactId); }
+    // "upcomingDays=30" returns only occasions whose next instance is in the next N days
+    let extra = "";
+    if (upcomingDays) {
+      const days = Math.max(1, Math.min(365, Number(upcomingDays)));
+      extra = `
+        AND (
+          (o.recurring_yearly = TRUE AND
+            (DATE(make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int, EXTRACT(MONTH FROM o.occurs_on)::int, EXTRACT(DAY FROM o.occurs_on)::int))
+              BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '${days} days'
+             OR
+             DATE(make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1, EXTRACT(MONTH FROM o.occurs_on)::int, EXTRACT(DAY FROM o.occurs_on)::int))
+              BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '${days} days'))
+          OR (o.recurring_yearly = FALSE AND o.occurs_on BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '${days} days')
+        )
+      `;
+    }
+    const result = await pool.query(
+      `SELECT o.*, c.name AS contact_name
+       FROM crm_occasions o
+       LEFT JOIN crm_contacts c ON c.id = o.contact_id
+       WHERE ${conditions.join(" AND ")} ${extra}
+       ORDER BY o.occurs_on ASC
+       LIMIT 500`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Error fetching occasions:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/crm/occasions", async (req, res) => {
+  try {
+    const { userId, contactId, kind, label, occursOn, recurringYearly, notes } = req.body;
+    if (!userId || !kind || !occursOn) {
+      return res.status(400).json({ error: "userId, kind, and occursOn are required" });
+    }
+    const result = await pool.query(
+      `INSERT INTO crm_occasions (user_id, contact_id, kind, label, occurs_on, recurring_yearly, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [userId, contactId || null, kind, label || null, occursOn, recurringYearly !== false, notes || null]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("Error creating occasion:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.put("/api/crm/occasions/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const allowed = ["kind", "label", "occurs_on", "recurring_yearly", "notes"];
+    const fields = [];
+    const values = [];
+    let idx = 1;
+    for (const key of allowed) {
+      const camel = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+      if (req.body[camel] !== undefined) {
+        fields.push(`${key} = $${idx++}`);
+        values.push(req.body[camel]);
+      }
+    }
+    if (fields.length === 0) return res.status(400).json({ error: "No fields to update" });
+    values.push(id);
+    const result = await pool.query(
+      `UPDATE crm_occasions SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Error updating occasion:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/api/crm/occasions/:id", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM crm_occasions WHERE id = $1", [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error deleting occasion:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* ---------- Phase C: Auto-generate tasks from upcoming occasions ----------
+ * Idempotent. For every occasion happening within `days` (default 30) we
+ * INSERT a task with metadata.{source:'occasion', occasion_id, occurs_on}
+ * unless a task with that same (occasion_id, occurs_on) already exists.
+ *
+ * The FE calls this on dashboard / tasks page load so the workflow stays
+ * "occasions are real to-dos", not just a passive list. Recurring occasions
+ * are projected to the next year automatically.
+ */
+app.post("/api/crm/occasions/ensure-tasks", async (req, res) => {
+  try {
+    const userId = req.body?.userId || req.query?.userId;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const days = Math.max(1, Math.min(365, Number(req.body?.days || req.query?.days || 30)));
+    const leadDays = Math.max(0, Math.min(60, Number(req.body?.leadDays || req.query?.leadDays || 7)));
+
+    // Project occasions (respect recurring_yearly), filter to the requested
+    // window, then insert tasks where one doesn't already exist.
+    const inserted = await pool.query(
+      `WITH proj AS (
+         SELECT
+           o.id, o.user_id, o.contact_id, o.kind, o.label, o.notes,
+           CASE
+             WHEN o.recurring_yearly THEN
+               CASE
+                 WHEN make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int,
+                                EXTRACT(MONTH FROM o.occurs_on)::int,
+                                EXTRACT(DAY FROM o.occurs_on)::int) >= CURRENT_DATE
+                   THEN make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int,
+                                  EXTRACT(MONTH FROM o.occurs_on)::int,
+                                  EXTRACT(DAY FROM o.occurs_on)::int)
+                 ELSE make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1,
+                                EXTRACT(MONTH FROM o.occurs_on)::int,
+                                EXTRACT(DAY FROM o.occurs_on)::int)
+               END
+             ELSE o.occurs_on
+           END AS next_occurrence
+         FROM crm_occasions o
+         WHERE o.user_id = $1
+       )
+       INSERT INTO crm_tasks (user_id, contact_id, title, description, due_date, priority, status, metadata)
+       SELECT
+         p.user_id,
+         p.contact_id,
+         CONCAT('Reach out: ', COALESCE(p.label, INITCAP(p.kind))),
+         CONCAT('Upcoming ', p.kind, ' on ', to_char(p.next_occurrence, 'YYYY-MM-DD'),
+                CASE WHEN p.notes IS NOT NULL AND p.notes <> '' THEN E'\n\n' || p.notes ELSE '' END),
+         (p.next_occurrence - ($3 || ' days')::interval)::timestamp,
+         'high',
+         'pending',
+         jsonb_build_object(
+           'source', 'occasion',
+           'occasion_id', p.id,
+           'occurs_on', to_char(p.next_occurrence, 'YYYY-MM-DD'),
+           'kind', p.kind
+         )
+       FROM proj p
+       WHERE p.next_occurrence BETWEEN CURRENT_DATE AND CURRENT_DATE + ($2 || ' days')::interval
+         AND NOT EXISTS (
+           SELECT 1 FROM crm_tasks t
+           WHERE t.user_id = p.user_id
+             AND COALESCE(t.contact_id, -1) = COALESCE(p.contact_id, -1)
+             AND t.metadata->>'source' = 'occasion'
+             AND t.metadata->>'occasion_id' = p.id::text
+             AND t.metadata->>'occurs_on' = to_char(p.next_occurrence, 'YYYY-MM-DD')
+         )
+       RETURNING id`,
+      [userId, String(days), String(leadDays)]
+    );
+
+    res.json({ created: inserted.rowCount, taskIds: inserted.rows.map((r) => r.id) });
+  } catch (e) {
+    console.error("ensure-tasks error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 /* ---------- WhatsApp Log ---------- */
 
 app.post("/api/crm/whatsapp-log", async (req, res) => {
@@ -2742,6 +3353,354 @@ app.get("/api/crm/stats", async (req, res) => {
   } catch (error) {
     console.error("Error fetching CRM stats:", error);
     res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   /api/dashboard/exec-summary – Phase B
+   One round-trip that aggregates KPIs across CRM + Workshop +
+   Stone Inventory + DNA so the home dashboard can show "Today
+   across the company" without firing 6 different requests.
+   Every block is wrapped in its own try so a single failing
+   query (e.g. a missing optional table) never breaks the rest.
+   ========================================================= */
+app.get("/api/dashboard/exec-summary", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const safe = async (q, fallback) => {
+      try {
+        const r = await q();
+        return r;
+      } catch (e) {
+        console.warn("exec-summary block warn:", e.message);
+        return fallback;
+      }
+    };
+
+    const [
+      dealsRow,
+      jewelryRow,
+      contactsRow,
+      stonesRow,
+      stonesActive,
+      dnaRow,
+      occasionsRow,
+      tasksRow,
+    ] = await Promise.all([
+      safe(
+        () =>
+          pool.query(
+            `SELECT
+               COUNT(*) FILTER (WHERE stage NOT IN ('won','lost'))::int             AS open_count,
+               COALESCE(SUM(value) FILTER (WHERE stage NOT IN ('won','lost')),0)    AS open_value,
+               COUNT(*) FILTER (WHERE stage = 'won' AND date_trunc('month', COALESCE(actual_close, updated_at)) = date_trunc('month', NOW()))::int AS won_month_count,
+               COALESCE(SUM(value) FILTER (WHERE stage = 'won' AND date_trunc('month', COALESCE(actual_close, updated_at)) = date_trunc('month', NOW())),0) AS won_month_value
+             FROM crm_deals WHERE user_id = $1`,
+            [userId]
+          ),
+        { rows: [{ open_count: 0, open_value: 0, won_month_count: 0, won_month_value: 0 }] }
+      ),
+      safe(
+        () =>
+          pool.query(
+            `SELECT
+               COUNT(*) FILTER (WHERE status NOT IN ('sold','archived'))::int                   AS wip_count,
+               COUNT(*) FILTER (WHERE status = 'ready')::int                                    AS ready_count,
+               COUNT(*) FILTER (WHERE status = 'qc')::int                                       AS qc_count,
+               COUNT(*) FILTER (WHERE status = 'sold' AND date_trunc('month', sold_at) = date_trunc('month', NOW()))::int AS sold_month_count,
+               COALESCE(SUM(sale_price) FILTER (WHERE status = 'sold' AND date_trunc('month', sold_at) = date_trunc('month', NOW())),0) AS sold_month_value,
+               COALESCE(SUM(total_cost) FILTER (WHERE status NOT IN ('sold','archived')),0)    AS wip_cost
+             FROM jewelry_items WHERE user_id = $1`,
+            [userId]
+          ),
+        { rows: [{ wip_count: 0, ready_count: 0, qc_count: 0, sold_month_count: 0, sold_month_value: 0, wip_cost: 0 }] }
+      ),
+      safe(
+        () =>
+          pool.query(
+            `SELECT
+               COUNT(*)::int                                                       AS total,
+               COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int AS new_week
+             FROM crm_contacts WHERE user_id = $1`,
+            [userId]
+          ),
+        { rows: [{ total: 0, new_week: 0 }] }
+      ),
+      safe(
+        () =>
+          pool.query(
+            `SELECT
+               COUNT(*)::int                                                  AS total,
+               COALESCE(SUM(NULLIF(total_price,'')::numeric),0)               AS total_value
+             FROM soap_stones WHERE sku IS NOT NULL`
+          ),
+        { rows: [{ total: 0, total_value: 0 }] }
+      ),
+      // How much of the live stone inventory is currently held by jewelry jobs
+      safe(
+        () =>
+          pool.query(
+            `SELECT
+               COUNT(DISTINCT stone_sku)::int AS active_skus
+             FROM jewelry_item_stones
+             WHERE consume_from_inventory = TRUE
+               AND inventory_status IN ('reserved','set')`
+          ),
+        { rows: [{ active_skus: 0 }] }
+      ),
+      safe(
+        () =>
+          pool.query(
+            `SELECT
+               COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int  AS new_7d,
+               COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days')::int AS new_30d,
+               COUNT(*)::int                                                          AS total_shared
+             FROM crm_contacts
+             WHERE shared = TRUE AND source = 'dna_lead'`
+          ),
+        { rows: [{ new_7d: 0, new_30d: 0, total_shared: 0 }] }
+      ),
+      // Upcoming occasions: respect recurring_yearly by projecting this year's date.
+      safe(
+        () =>
+          pool.query(
+            `WITH proj AS (
+               SELECT id, contact_id, kind, label, occurs_on, recurring_yearly,
+                 CASE
+                   WHEN recurring_yearly THEN
+                     CASE
+                       WHEN make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int,
+                                      EXTRACT(MONTH FROM occurs_on)::int,
+                                      EXTRACT(DAY FROM occurs_on)::int) >= CURRENT_DATE
+                         THEN make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int,
+                                        EXTRACT(MONTH FROM occurs_on)::int,
+                                        EXTRACT(DAY FROM occurs_on)::int)
+                       ELSE make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1,
+                                      EXTRACT(MONTH FROM occurs_on)::int,
+                                      EXTRACT(DAY FROM occurs_on)::int)
+                     END
+                   ELSE occurs_on
+                 END AS next_occurrence
+               FROM crm_occasions
+               WHERE user_id = $1
+             )
+             SELECT
+               COUNT(*) FILTER (WHERE next_occurrence BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days')::int AS upcoming_30d,
+               COUNT(*) FILTER (WHERE next_occurrence BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days')::int  AS upcoming_7d
+             FROM proj`,
+            [userId]
+          ),
+        { rows: [{ upcoming_30d: 0, upcoming_7d: 0 }] }
+      ),
+      safe(
+        () =>
+          pool.query(
+            `SELECT
+               COUNT(*) FILTER (WHERE status = 'pending')::int                                   AS pending,
+               COUNT(*) FILTER (WHERE status = 'pending' AND due_date < NOW())::int              AS overdue,
+               COUNT(*) FILTER (WHERE status = 'pending' AND due_date::date = CURRENT_DATE)::int AS today
+             FROM crm_tasks WHERE user_id = $1`,
+            [userId]
+          ),
+        { rows: [{ pending: 0, overdue: 0, today: 0 }] }
+      ),
+    ]);
+
+    res.json({
+      deals: dealsRow.rows[0],
+      jewelry: jewelryRow.rows[0],
+      contacts: contactsRow.rows[0],
+      stones: { ...stonesRow.rows[0], active_skus: stonesActive.rows[0]?.active_skus || 0 },
+      dna: dnaRow.rows[0],
+      occasions: occasionsRow.rows[0],
+      tasks: tasksRow.rows[0],
+      generated_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("exec-summary fatal:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =========================================================
+   /api/dashboard/reports – Phase D
+   Powers the Reports page. Returns revenue trend, production
+   throughput, top customers, profit margins, and pipeline
+   distribution in one shot. Each block is independently safe.
+   ========================================================= */
+app.get("/api/dashboard/reports", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const months = Math.max(3, Math.min(24, Number(req.query.months || 12)));
+
+    const safe = async (q, fallback) => {
+      try { return await q(); } catch (e) {
+        console.warn("reports block warn:", e.message);
+        return fallback;
+      }
+    };
+
+    const [
+      revenueByMonth,
+      pipelineByStage,
+      jewelryByStatus,
+      topCustomers,
+      recentSales,
+      throughput,
+      stoneActivity,
+    ] = await Promise.all([
+      // Revenue by month (paid invoices)
+      safe(
+        () => pool.query(
+          `SELECT to_char(date_trunc('month', issued_at), 'YYYY-MM') AS month,
+                  COALESCE(SUM(total),0)::numeric AS revenue,
+                  COUNT(*)::int AS invoices
+             FROM crm_invoices
+            WHERE user_id = $1
+              AND status = 'paid'
+              AND issued_at >= date_trunc('month', NOW() - ($2 || ' months')::interval)
+            GROUP BY 1
+            ORDER BY 1`,
+          [userId, String(months)]
+        ),
+        { rows: [] }
+      ),
+      // Pipeline value distributed across stages
+      safe(
+        () => pool.query(
+          `SELECT stage,
+                  COUNT(*)::int AS count,
+                  COALESCE(SUM(value),0)::numeric AS value
+             FROM crm_deals
+            WHERE user_id = $1
+            GROUP BY stage
+            ORDER BY value DESC`,
+          [userId]
+        ),
+        { rows: [] }
+      ),
+      // Workshop pipeline: how many pieces sit at each production stage
+      safe(
+        () => pool.query(
+          `SELECT status,
+                  COUNT(*)::int AS count,
+                  COALESCE(SUM(total_cost),0)::numeric AS cost,
+                  COALESCE(SUM(sale_price),0)::numeric AS sale_value
+             FROM jewelry_items
+            WHERE user_id = $1
+              AND status NOT IN ('archived')
+            GROUP BY status
+            ORDER BY count DESC`,
+          [userId]
+        ),
+        { rows: [] }
+      ),
+      // Top customers — combine "sold" jewelry value + "won" deals
+      safe(
+        () => pool.query(
+          `WITH won_deals AS (
+             SELECT contact_id, SUM(value) AS deal_value, COUNT(*)::int AS deal_count
+               FROM crm_deals
+              WHERE user_id = $1 AND stage = 'won'
+              GROUP BY contact_id
+           ),
+           sold_pieces AS (
+             SELECT contact_id AS cid, SUM(sale_price) AS jew_value, COUNT(*)::int AS jew_count
+               FROM jewelry_items
+              WHERE user_id = $1 AND status = 'sold' AND contact_id IS NOT NULL
+              GROUP BY contact_id
+             UNION ALL
+             SELECT sold_to AS cid, SUM(sale_price) AS jew_value, COUNT(*)::int AS jew_count
+               FROM jewelry_items
+              WHERE user_id = $1 AND status = 'sold' AND sold_to IS NOT NULL AND sold_to <> contact_id
+              GROUP BY sold_to
+           )
+           SELECT c.id, c.first_name, c.last_name, c.business_name, c.contact_type,
+                  COALESCE(MAX(wd.deal_value),0)::numeric  AS total_deal_value,
+                  COALESCE(MAX(wd.deal_count),0)::int      AS deals_won,
+                  COALESCE(SUM(sp.jew_value),0)::numeric   AS total_jewelry_value,
+                  COALESCE(SUM(sp.jew_count),0)::int       AS jewelry_sold,
+                  (COALESCE(MAX(wd.deal_value),0) + COALESCE(SUM(sp.jew_value),0))::numeric AS total_value
+             FROM crm_contacts c
+             LEFT JOIN won_deals  wd ON wd.contact_id = c.id
+             LEFT JOIN sold_pieces sp ON sp.cid       = c.id
+            WHERE c.user_id = $1
+            GROUP BY c.id
+           HAVING (COALESCE(MAX(wd.deal_value),0) + COALESCE(SUM(sp.jew_value),0)) > 0
+            ORDER BY total_value DESC
+            LIMIT 10`,
+          [userId]
+        ),
+        { rows: [] }
+      ),
+      // Recent sold pieces with profit margin
+      safe(
+        () => pool.query(
+          `SELECT id, sku, name, category, contact_id, sold_at,
+                  COALESCE(sale_price,0)::numeric AS sale_price,
+                  COALESCE(total_cost,0)::numeric AS total_cost,
+                  (COALESCE(sale_price,0) - COALESCE(total_cost,0))::numeric AS profit,
+                  CASE WHEN COALESCE(sale_price,0) > 0
+                       THEN ROUND(((COALESCE(sale_price,0) - COALESCE(total_cost,0)) / sale_price * 100)::numeric, 1)
+                       ELSE NULL END AS margin_pct
+             FROM jewelry_items
+            WHERE user_id = $1
+              AND status = 'sold'
+              AND sold_at IS NOT NULL
+            ORDER BY sold_at DESC
+            LIMIT 25`,
+          [userId]
+        ),
+        { rows: [] }
+      ),
+      // Throughput: avg days from created -> ready, ready -> sold, created -> sold
+      safe(
+        () => pool.query(
+          `SELECT
+             AVG(EXTRACT(EPOCH FROM (sold_at - created_at))/86400)::numeric AS avg_days_to_sell,
+             COUNT(*) FILTER (WHERE status = 'sold' AND sold_at >= NOW() - INTERVAL '90 days')::int AS sold_90d,
+             COALESCE(SUM(sale_price) FILTER (WHERE status = 'sold' AND sold_at >= NOW() - INTERVAL '90 days'),0)::numeric AS sold_90d_value,
+             COALESCE(SUM(total_cost) FILTER (WHERE status = 'sold' AND sold_at >= NOW() - INTERVAL '90 days'),0)::numeric AS sold_90d_cost
+           FROM jewelry_items
+           WHERE user_id = $1`,
+          [userId]
+        ),
+        { rows: [{ avg_days_to_sell: null, sold_90d: 0, sold_90d_value: 0, sold_90d_cost: 0 }] }
+      ),
+      // Stone consumption summary
+      safe(
+        () => pool.query(
+          `SELECT
+             COUNT(*) FILTER (WHERE consume_from_inventory = TRUE)::int                                AS consumed_total,
+             COUNT(*) FILTER (WHERE consume_from_inventory = TRUE AND inventory_status = 'reserved')::int AS reserved,
+             COUNT(*) FILTER (WHERE consume_from_inventory = TRUE AND inventory_status = 'set')::int      AS in_setting,
+             COUNT(*) FILTER (WHERE consume_from_inventory = TRUE AND inventory_status = 'sold')::int     AS sold
+           FROM jewelry_item_stones jis
+           JOIN jewelry_items ji ON ji.id = jis.item_id
+           WHERE ji.user_id = $1`,
+          [userId]
+        ),
+        { rows: [{ consumed_total: 0, reserved: 0, in_setting: 0, sold: 0 }] }
+      ),
+    ]);
+
+    res.json({
+      months,
+      revenueByMonth: revenueByMonth.rows,
+      pipelineByStage: pipelineByStage.rows,
+      jewelryByStatus: jewelryByStatus.rows,
+      topCustomers: topCustomers.rows,
+      recentSales: recentSales.rows,
+      throughput: throughput.rows[0],
+      stoneActivity: stoneActivity.rows[0],
+      generated_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("reports fatal:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -3972,6 +4931,908 @@ app.post("/api/crm/outlook/import-emails", async (req, res) => {
     res.json({ imported, scanned, lookbackDays });
   } catch (e) {
     console.error("Outlook import-emails error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =========================================================
+   JEWELRY PRODUCTION SYSTEM
+   ========================================================= */
+const multer = require('multer');
+let blobPut = null;
+try {
+  blobPut = require('@vercel/blob').put;
+} catch (e) {
+  console.warn('@vercel/blob not installed yet - blob uploads disabled until deps installed');
+}
+
+const blobUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 },
+});
+
+const JEWELRY_STATUSES = [
+  'draft', 'design', 'cad', 'wax', 'casting', 'setting',
+  'polishing', 'qc', 'ready', 'sold', 'archived',
+];
+
+const JEWELRY_TYPES = ['custom', 'stock'];
+
+const isValidStatus = (s) => JEWELRY_STATUSES.includes(s);
+const isValidType = (t) => JEWELRY_TYPES.includes(t);
+
+let jewelryReady = false;
+const jewelryReadyPromise = (async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS jewelry_items (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        location TEXT,
+        sku TEXT UNIQUE,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'custom',
+        status TEXT NOT NULL DEFAULT 'draft',
+        contact_id INTEGER REFERENCES crm_contacts(id) ON DELETE SET NULL,
+        deal_id INTEGER REFERENCES crm_deals(id) ON DELETE SET NULL,
+        category TEXT,
+        metal_summary TEXT,
+        weight_grams NUMERIC(10,3),
+        size TEXT,
+        description TEXT,
+        internal_notes TEXT,
+        total_cost NUMERIC(14,2) DEFAULT 0,
+        markup_percent NUMERIC(6,2) DEFAULT 0,
+        sale_price NUMERIC(14,2),
+        sold_at TIMESTAMP,
+        sold_to INTEGER REFERENCES crm_contacts(id) ON DELETE SET NULL,
+        sold_deal_id INTEGER REFERENCES crm_deals(id) ON DELETE SET NULL,
+        cover_image_url TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS jewelry_item_stones (
+        id SERIAL PRIMARY KEY,
+        item_id INTEGER NOT NULL REFERENCES jewelry_items(id) ON DELETE CASCADE,
+        stone_sku TEXT,
+        role TEXT,
+        quantity INTEGER DEFAULT 1,
+        snapshot JSONB,
+        notes TEXT
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS jewelry_item_metals (
+        id SERIAL PRIMARY KEY,
+        item_id INTEGER NOT NULL REFERENCES jewelry_items(id) ON DELETE CASCADE,
+        metal_type TEXT,
+        purity TEXT,
+        color TEXT,
+        weight_grams NUMERIC(10,3) NOT NULL,
+        price_per_gram NUMERIC(10,2),
+        total_cost NUMERIC(14,2)
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS jewelry_item_costs (
+        id SERIAL PRIMARY KEY,
+        item_id INTEGER NOT NULL REFERENCES jewelry_items(id) ON DELETE CASCADE,
+        label TEXT NOT NULL,
+        category TEXT,
+        amount NUMERIC(14,2) NOT NULL,
+        notes TEXT
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS jewelry_item_files (
+        id SERIAL PRIMARY KEY,
+        item_id INTEGER NOT NULL REFERENCES jewelry_items(id) ON DELETE CASCADE,
+        url TEXT NOT NULL,
+        kind TEXT,
+        stage TEXT,
+        filename TEXT,
+        mime_type TEXT,
+        size_bytes INTEGER,
+        uploaded_by TEXT,
+        uploaded_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS jewelry_item_history (
+        id SERIAL PRIMARY KEY,
+        item_id INTEGER NOT NULL REFERENCES jewelry_items(id) ON DELETE CASCADE,
+        from_status TEXT,
+        to_status TEXT NOT NULL,
+        changed_by TEXT,
+        changed_at TIMESTAMP DEFAULT NOW(),
+        notes TEXT
+      )
+    `);
+
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_items_user_id ON jewelry_items(user_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_items_status ON jewelry_items(status)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_items_type ON jewelry_items(type)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_items_contact_id ON jewelry_items(contact_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_items_deal_id ON jewelry_items(deal_id) WHERE deal_id IS NOT NULL`);
+
+    // Phase A: hybrid stone consumption.
+    //   - consume_from_inventory = caller opted to actually take this stone out of stock
+    //   - inventory_status = 'reserved' (consumed, item still in early stages)
+    //                      | 'set'      (item is at 'setting' or later but not sold)
+    //                      | 'sold'     (item sold; stone physically gone)
+    //                      | NULL       (snapshot-only row, doesn't affect inventory)
+    // No FK to soap_stones because that table is SOAP-synced and rows can come and go.
+    const stoneConsumeMigrations = [
+      "ALTER TABLE jewelry_item_stones ADD COLUMN IF NOT EXISTS consume_from_inventory BOOLEAN DEFAULT FALSE",
+      "ALTER TABLE jewelry_item_stones ADD COLUMN IF NOT EXISTS inventory_status TEXT",
+      "CREATE INDEX IF NOT EXISTS idx_jewelry_item_stones_sku ON jewelry_item_stones(stone_sku) WHERE stone_sku IS NOT NULL",
+      "CREATE INDEX IF NOT EXISTS idx_jewelry_item_stones_active ON jewelry_item_stones(stone_sku) WHERE consume_from_inventory = TRUE AND (inventory_status IS NULL OR inventory_status <> 'sold')",
+    ];
+    for (const sql of stoneConsumeMigrations) {
+      try { await pool.query(sql); } catch (e) { console.warn('Stone-consume migration warn:', e.message); }
+    }
+
+    // Phase C: tasks need a metadata column so we can dedupe auto-generated
+    // rows (e.g. one occasion -> one task per year) and trace where a task
+    // came from in the UI.
+    const taskMetadataMigrations = [
+      "ALTER TABLE crm_tasks ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb",
+      "CREATE INDEX IF NOT EXISTS idx_crm_tasks_metadata_source ON crm_tasks((metadata->>'source')) WHERE metadata IS NOT NULL",
+    ];
+    for (const sql of taskMetadataMigrations) {
+      try { await pool.query(sql); } catch (e) { console.warn('Task-metadata migration warn:', e.message); }
+    }
+
+    // Phase E: when a workshop job is spun off from a catalog template
+    // (jewelry_products row), remember which template it came from so we
+    // can show "Made from MODEL-123" links and report on template usage.
+    const templateMigrations = [
+      "ALTER TABLE jewelry_items ADD COLUMN IF NOT EXISTS template_model_number TEXT",
+      "CREATE INDEX IF NOT EXISTS idx_jewelry_items_template ON jewelry_items(template_model_number) WHERE template_model_number IS NOT NULL",
+    ];
+    for (const sql of templateMigrations) {
+      try { await pool.query(sql); } catch (e) { console.warn('Template migration warn:', e.message); }
+    }
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_item_stones_item_id ON jewelry_item_stones(item_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_item_files_item_id ON jewelry_item_files(item_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_item_history_item_id ON jewelry_item_history(item_id)`);
+
+    jewelryReady = true;
+    console.log('Jewelry tables ready');
+  } catch (err) {
+    console.error('Jewelry table creation error:', err);
+  }
+})();
+
+const ensureJewelry = async (req, res, next) => {
+  if (!jewelryReady) {
+    try { await jewelryReadyPromise; } catch (_) {}
+  }
+  if (!jewelryReady) return res.status(503).json({ error: 'Jewelry tables not ready' });
+  next();
+};
+app.use('/api/jewelry-items', ensureJewelry);
+
+async function generateJewelrySku() {
+  const year = new Date().getFullYear();
+  const prefix = `JW-${year}-`;
+  const r = await pool.query(
+    `SELECT sku FROM jewelry_items WHERE sku LIKE $1 ORDER BY sku DESC LIMIT 1`,
+    [`${prefix}%`]
+  );
+  let nextNum = 1;
+  if (r.rows[0]?.sku) {
+    const m = r.rows[0].sku.match(/-(\d+)$/);
+    if (m) nextNum = parseInt(m[1], 10) + 1;
+  }
+  return `${prefix}${String(nextNum).padStart(4, '0')}`;
+}
+
+/* ---------- Jewelry Items: List ---------- */
+app.get('/api/jewelry-items', async (req, res) => {
+  try {
+    const { userId, status, type, contactId, search, includeArchived } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+    const where = ['user_id = $1'];
+    const params = [userId];
+    let p = 2;
+
+    if (status) { where.push(`status = $${p++}`); params.push(status); }
+    if (type) { where.push(`type = $${p++}`); params.push(type); }
+    if (contactId) { where.push(`contact_id = $${p++}`); params.push(contactId); }
+    if (search) {
+      where.push(`(name ILIKE $${p} OR sku ILIKE $${p} OR description ILIKE $${p})`);
+      params.push(`%${search}%`);
+      p++;
+    }
+    if (!includeArchived || includeArchived === 'false') {
+      where.push(`status <> 'archived'`);
+    }
+
+    const sql = `
+      SELECT ji.*,
+             c.name AS contact_name, c.company AS contact_company,
+             (SELECT COUNT(*) FROM jewelry_item_files f WHERE f.item_id = ji.id) AS files_count,
+             (SELECT COUNT(*) FROM jewelry_item_stones s WHERE s.item_id = ji.id) AS stones_count
+        FROM jewelry_items ji
+        LEFT JOIN crm_contacts c ON c.id = ji.contact_id
+       WHERE ${where.join(' AND ')}
+       ORDER BY ji.updated_at DESC, ji.id DESC
+       LIMIT 500
+    `;
+    const r = await pool.query(sql, params);
+    res.json({ items: r.rows });
+  } catch (e) {
+    console.error('GET jewelry-items error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Jewelry Items: Get one (with all relations) ---------- */
+app.get('/api/jewelry-items/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const item = await pool.query(
+      `SELECT ji.*,
+              c.name AS contact_name, c.company AS contact_company, c.email AS contact_email,
+              d.title AS deal_title, d.stage AS deal_stage, d.value AS deal_value
+         FROM jewelry_items ji
+         LEFT JOIN crm_contacts c ON c.id = ji.contact_id
+         LEFT JOIN crm_deals    d ON d.id = ji.deal_id
+        WHERE ji.id = $1`,
+      [id]
+    );
+    if (!item.rows[0]) return res.status(404).json({ error: 'Item not found' });
+
+    const [stones, metals, costs, files, history] = await Promise.all([
+      pool.query(`SELECT * FROM jewelry_item_stones WHERE item_id = $1 ORDER BY id`, [id]),
+      pool.query(`SELECT * FROM jewelry_item_metals WHERE item_id = $1 ORDER BY id`, [id]),
+      pool.query(`SELECT * FROM jewelry_item_costs WHERE item_id = $1 ORDER BY id`, [id]),
+      pool.query(`SELECT * FROM jewelry_item_files WHERE item_id = $1 ORDER BY uploaded_at DESC, id DESC`, [id]),
+      pool.query(`SELECT * FROM jewelry_item_history WHERE item_id = $1 ORDER BY changed_at DESC, id DESC LIMIT 100`, [id]),
+    ]);
+
+    res.json({
+      item: item.rows[0],
+      stones: stones.rows,
+      metals: metals.rows,
+      costs: costs.rows,
+      files: files.rows,
+      history: history.rows,
+    });
+  } catch (e) {
+    console.error('GET jewelry-item error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Jewelry Items: Create ---------- */
+app.post('/api/jewelry-items', async (req, res) => {
+  try {
+    const {
+      userId, location, name, type = 'custom', category,
+      contactId, dealId, description, internalNotes, size, weightGrams,
+      metalSummary, status = 'draft',
+    } = req.body || {};
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'name is required' });
+    if (!isValidType(type)) return res.status(400).json({ error: 'invalid type' });
+    if (!isValidStatus(status)) return res.status(400).json({ error: 'invalid status' });
+
+    const sku = await generateJewelrySku();
+
+    const r = await pool.query(
+      `INSERT INTO jewelry_items
+         (user_id, location, sku, name, type, status, contact_id, deal_id,
+          category, metal_summary, weight_grams, size, description, internal_notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       RETURNING *`,
+      [
+        userId, location || null, sku, name.trim(), type, status,
+        contactId || null, dealId || null,
+        category || null, metalSummary || null,
+        weightGrams || null, size || null, description || null, internalNotes || null,
+      ]
+    );
+
+    await pool.query(
+      `INSERT INTO jewelry_item_history (item_id, from_status, to_status, changed_by, notes)
+       VALUES ($1, NULL, $2, $3, $4)`,
+      [r.rows[0].id, status, userId, 'Item created']
+    );
+
+    res.json({ item: r.rows[0] });
+  } catch (e) {
+    console.error('POST jewelry-items error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Jewelry Items: Create from catalog template (Phase E) ----------
+ * Spins off a workshop job from a `jewelry_products` row. Copies the
+ * descriptive fields (title, category, metal, weight, size, description,
+ * cover image) so the bench worker has everything they need, but starts
+ * fresh on stones/costs/history. Tracked via `template_model_number` so we
+ * can later report on which catalog pieces are most often re-made.
+ */
+const looksLikeImageUrl = (u) => {
+  if (!u || typeof u !== 'string') return false;
+  const s = u.trim().toLowerCase();
+  if (!/^https?:\/\//.test(s)) return false;
+  return /\.(png|jpe?g|webp|gif|avif)(\?|#|$)/.test(s);
+};
+
+app.post('/api/jewelry-items/from-template', async (req, res) => {
+  try {
+    const {
+      userId, modelNumber, location,
+      contactId, dealId, name: nameOverride,
+    } = req.body || {};
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+    if (!modelNumber) return res.status(400).json({ error: 'modelNumber is required' });
+
+    const tplRes = await pool.query(
+      `SELECT * FROM jewelry_products WHERE model_number = $1 LIMIT 1`,
+      [modelNumber]
+    );
+    const tpl = tplRes.rows[0];
+    if (!tpl) return res.status(404).json({ error: 'Template not found' });
+
+    const sku = await generateJewelrySku();
+    const name = (nameOverride && String(nameOverride).trim()) ||
+                 tpl.title ||
+                 `${tpl.jewelry_type || 'Piece'} ${tpl.model_number}`;
+    const description = tpl.full_description || tpl.description || null;
+    const category = tpl.category || tpl.jewelry_type || null;
+    const metalSummary = [tpl.metal_type, tpl.style].filter(Boolean).join(' / ') || null;
+    const weightGrams = tpl.jewelry_weight || null;
+    const size = tpl.jewelry_size || null;
+    const coverImage = looksLikeImageUrl(tpl.all_pictures_link) ? tpl.all_pictures_link : null;
+
+    const r = await pool.query(
+      `INSERT INTO jewelry_items
+         (user_id, location, sku, name, type, status, contact_id, deal_id,
+          category, metal_summary, weight_grams, size, description,
+          cover_image_url, template_model_number)
+       VALUES ($1,$2,$3,$4,'custom','draft',$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       RETURNING *`,
+      [
+        userId, location || null, sku, name,
+        contactId || null, dealId || null,
+        category, metalSummary, weightGrams, size, description,
+        coverImage, tpl.model_number,
+      ]
+    );
+
+    await pool.query(
+      `INSERT INTO jewelry_item_history (item_id, from_status, to_status, changed_by, notes)
+       VALUES ($1, NULL, 'draft', $2, $3)`,
+      [r.rows[0].id, userId, `Created from catalog template ${tpl.model_number}`]
+    );
+
+    res.json({ item: r.rows[0], template: { model_number: tpl.model_number, title: tpl.title } });
+  } catch (e) {
+    console.error('POST jewelry-items/from-template error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Jewelry Items: Update ---------- */
+app.put('/api/jewelry-items/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const fields = [
+      'name', 'type', 'category', 'contact_id', 'deal_id',
+      'description', 'internal_notes', 'size', 'weight_grams', 'metal_summary',
+      'cover_image_url', 'markup_percent', 'sale_price', 'location',
+    ];
+    const map = {
+      name: 'name', type: 'type', category: 'category',
+      contactId: 'contact_id', dealId: 'deal_id',
+      description: 'description', internalNotes: 'internal_notes',
+      size: 'size', weightGrams: 'weight_grams', metalSummary: 'metal_summary',
+      coverImageUrl: 'cover_image_url', markupPercent: 'markup_percent',
+      salePrice: 'sale_price', location: 'location',
+    };
+    const sets = [];
+    const params = [];
+    let p = 1;
+    for (const [k, v] of Object.entries(req.body || {})) {
+      const col = map[k];
+      if (col && fields.includes(col)) {
+        if (col === 'type' && v && !isValidType(v)) {
+          return res.status(400).json({ error: 'invalid type' });
+        }
+        sets.push(`${col} = $${p++}`);
+        params.push(v === '' ? null : v);
+      }
+    }
+    if (!sets.length) return res.status(400).json({ error: 'no valid fields' });
+    sets.push(`updated_at = NOW()`);
+    params.push(id);
+    const sql = `UPDATE jewelry_items SET ${sets.join(', ')} WHERE id = $${p} RETURNING *`;
+    const r = await pool.query(sql, params);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Item not found' });
+    res.json({ item: r.rows[0] });
+  } catch (e) {
+    console.error('PUT jewelry-item error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Jewelry Items: Delete ---------- */
+app.delete('/api/jewelry-items/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const r = await pool.query(`DELETE FROM jewelry_items WHERE id = $1 RETURNING id`, [id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Item not found' });
+    res.json({ success: true, id: r.rows[0].id });
+  } catch (e) {
+    console.error('DELETE jewelry-item error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Jewelry Items: Change status ----------
+ * Side effect: when an item with a contact_id changes status, we also drop a
+ * `production_update` row into crm_interactions so the customer's profile
+ * Activity timeline stays in sync with what's happening in the workshop.
+ */
+app.post('/api/jewelry-items/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { newStatus, notes, userId } = req.body || {};
+    if (!isValidStatus(newStatus)) return res.status(400).json({ error: 'invalid status' });
+
+    const cur = await pool.query(
+      `SELECT status, contact_id, sku, name, user_id FROM jewelry_items WHERE id = $1`,
+      [id]
+    );
+    if (!cur.rows[0]) return res.status(404).json({ error: 'Item not found' });
+
+    const fromStatus = cur.rows[0].status;
+    const r = await pool.query(
+      `UPDATE jewelry_items SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+      [newStatus, id]
+    );
+    await pool.query(
+      `INSERT INTO jewelry_item_history (item_id, from_status, to_status, changed_by, notes)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [id, fromStatus, newStatus, userId || null, notes || null]
+    );
+
+    // Inventory bridge: any consumed stones on this piece track the production status.
+    //   reserved -> set : when piece moves into setting/polishing/qc/ready
+    //   set -> reserved : if piece moves backward (e.g. setting -> wax/casting)
+    //   anything -> sold : not handled here (the /sell endpoint owns that transition)
+    if (fromStatus !== newStatus && newStatus !== 'sold') {
+      try {
+        const setStages = ['setting','polishing','qc','ready'];
+        const target = setStages.includes(newStatus) ? 'set' : 'reserved';
+        await pool.query(
+          `UPDATE jewelry_item_stones
+              SET inventory_status = $1
+            WHERE item_id = $2
+              AND consume_from_inventory = TRUE
+              AND (inventory_status IS NULL OR inventory_status NOT IN ('sold','returned'))`,
+          [target, id]
+        );
+      } catch (stHookErr) {
+        console.warn('Stone-status hook warn:', stHookErr.message);
+      }
+    }
+
+    // CRM bridge: customer-facing status update in their activity timeline.
+    // Skip when status didn't actually change, when there's no linked contact,
+    // or when transitioning to 'sold' (the /sell endpoint already records that).
+    if (cur.rows[0].contact_id && fromStatus !== newStatus && newStatus !== 'sold') {
+      try {
+        const skuOrName = cur.rows[0].sku || cur.rows[0].name || `#${id}`;
+        await pool.query(
+          `INSERT INTO crm_interactions (user_id, contact_id, type, direction, subject, content, metadata)
+           VALUES ($1,$2,'production_update','outgoing',$3,$4,$5)`,
+          [
+            cur.rows[0].user_id,
+            cur.rows[0].contact_id,
+            `${skuOrName} moved to ${newStatus}`,
+            notes || null,
+            JSON.stringify({
+              jewelry_item_id: Number(id),
+              sku: cur.rows[0].sku,
+              name: cur.rows[0].name,
+              from_status: fromStatus,
+              to_status: newStatus,
+            }),
+          ]
+        );
+      } catch (hookErr) {
+        // Never let the CRM hook fail the status change itself.
+        console.warn('CRM production_update hook warn:', hookErr.message);
+      }
+    }
+
+    res.json({ item: r.rows[0] });
+  } catch (e) {
+    console.error('POST jewelry-item status error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Jewelry Items: Files (register a blob URL on the item) ---------- */
+app.post('/api/jewelry-items/:id/files', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { url, kind, stage, filename, mimeType, sizeBytes, uploadedBy, setAsCover } = req.body || {};
+    if (!url) return res.status(400).json({ error: 'url is required' });
+
+    const r = await pool.query(
+      `INSERT INTO jewelry_item_files (item_id, url, kind, stage, filename, mime_type, size_bytes, uploaded_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING *`,
+      [id, url, kind || null, stage || null, filename || null, mimeType || null, sizeBytes || null, uploadedBy || null]
+    );
+
+    if (setAsCover) {
+      await pool.query(`UPDATE jewelry_items SET cover_image_url = $1, updated_at = NOW() WHERE id = $2`, [url, id]);
+    }
+
+    res.json({ file: r.rows[0] });
+  } catch (e) {
+    console.error('POST jewelry-item file error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/jewelry-items/:id/files/:fileId', async (req, res) => {
+  try {
+    const { id, fileId } = req.params;
+    const r = await pool.query(
+      `DELETE FROM jewelry_item_files WHERE id = $1 AND item_id = $2 RETURNING id`,
+      [fileId, id]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'File not found' });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('DELETE jewelry-item file error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Jewelry Items: Stones (composition) ---------- */
+app.post('/api/jewelry-items/:id/stones', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { stoneSku, role, quantity, snapshot, notes, consumeFromInventory } = req.body || {};
+    const consume = !!consumeFromInventory && !!stoneSku;
+
+    // Hybrid model: when the user opts to consume the physical stone,
+    //   1) make sure no other piece is already holding it (active = reserved/set, not yet sold)
+    //   2) auto-snapshot real specs from soap_stones so the BOM stays trustworthy
+    let finalSnapshot = snapshot && typeof snapshot === 'object' ? { ...snapshot } : (snapshot ? snapshot : null);
+    if (consume) {
+      const conflict = await pool.query(
+        `SELECT jis.id, jis.item_id, ji.sku AS jewelry_sku, ji.name AS jewelry_name, jis.inventory_status
+           FROM jewelry_item_stones jis
+           JOIN jewelry_items ji ON ji.id = jis.item_id
+          WHERE jis.stone_sku = $1
+            AND jis.consume_from_inventory = TRUE
+            AND (jis.inventory_status IS NULL OR jis.inventory_status NOT IN ('sold','returned'))
+            AND jis.item_id <> $2
+          LIMIT 1`,
+        [stoneSku, id]
+      );
+      if (conflict.rows[0]) {
+        const c = conflict.rows[0];
+        return res.status(409).json({
+          error: `Stone ${stoneSku} is already reserved by ${c.jewelry_sku || ('job #' + c.item_id)}${c.jewelry_name ? ' (' + c.jewelry_name + ')' : ''}`,
+          conflict: c,
+        });
+      }
+      try {
+        const sr = await pool.query(
+          `SELECT sku, category, shape, weight, color, clarity, lab, origin,
+                  bruto_price, net_price, image, additional_pictures, certificate
+             FROM soap_stones WHERE sku = $1 LIMIT 1`,
+          [stoneSku]
+        );
+        if (sr.rows[0]) {
+          const s = sr.rows[0];
+          const auto = {
+            shape: s.shape || null,
+            weight: s.weight != null ? Number(s.weight) : null,
+            color: s.color || null,
+            clarity: s.clarity || null,
+            lab: s.lab || null,
+            origin: s.origin || null,
+            category: s.category || null,
+            certificate: s.certificate || null,
+            price: s.bruto_price != null ? Number(s.bruto_price) : (s.net_price != null ? Number(s.net_price) : null),
+            imageUrl: s.image || (s.additional_pictures ? String(s.additional_pictures).split(';')[0].trim() : null),
+            sourcedAt: new Date().toISOString(),
+          };
+          finalSnapshot = { ...(finalSnapshot || {}), ...Object.fromEntries(Object.entries(auto).filter(([, v]) => v != null && v !== '')) };
+        }
+      } catch (snapErr) {
+        console.warn('Stone snapshot lookup failed (continuing):', snapErr.message);
+      }
+    }
+
+    // Decide initial inventory_status from the parent item's current production status.
+    let inventoryStatus = null;
+    if (consume) {
+      const it = await pool.query(`SELECT status FROM jewelry_items WHERE id = $1 LIMIT 1`, [id]);
+      const itStatus = it.rows[0]?.status || null;
+      if (itStatus === 'sold') inventoryStatus = 'sold';
+      else if (['setting','polishing','qc','ready'].includes(itStatus)) inventoryStatus = 'set';
+      else inventoryStatus = 'reserved';
+    }
+
+    const r = await pool.query(
+      `INSERT INTO jewelry_item_stones (item_id, stone_sku, role, quantity, snapshot, notes, consume_from_inventory, inventory_status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [id, stoneSku || null, role || null, quantity || 1, finalSnapshot ? JSON.stringify(finalSnapshot) : null, notes || null, consume, inventoryStatus]
+    );
+    res.json({ stone: r.rows[0] });
+  } catch (e) {
+    console.error('POST jewelry stone error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/jewelry-items/:id/stones/:stoneId', async (req, res) => {
+  try {
+    const { id, stoneId } = req.params;
+    // Just removing the row releases the stone back to inventory (the active-row index
+    // no longer matches it). No extra cleanup needed because we don't mutate soap_stones.
+    const r = await pool.query(
+      `DELETE FROM jewelry_item_stones WHERE id = $1 AND item_id = $2 RETURNING id, stone_sku, consume_from_inventory`,
+      [stoneId, id]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true, released: r.rows[0].consume_from_inventory ? r.rows[0].stone_sku : null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Jewelry Items: Metals ---------- */
+app.post('/api/jewelry-items/:id/metals', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { metalType, purity, color, weightGrams, pricePerGram } = req.body || {};
+    if (!weightGrams) return res.status(400).json({ error: 'weightGrams is required' });
+    const totalCost = pricePerGram ? Number(pricePerGram) * Number(weightGrams) : null;
+    const r = await pool.query(
+      `INSERT INTO jewelry_item_metals (item_id, metal_type, purity, color, weight_grams, price_per_gram, total_cost)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [id, metalType || null, purity || null, color || null, weightGrams, pricePerGram || null, totalCost]
+    );
+    res.json({ metal: r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/jewelry-items/:id/metals/:metalId', async (req, res) => {
+  try {
+    const { id, metalId } = req.params;
+    const r = await pool.query(
+      `DELETE FROM jewelry_item_metals WHERE id = $1 AND item_id = $2 RETURNING id`,
+      [metalId, id]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Jewelry Items: Costs ---------- */
+app.post('/api/jewelry-items/:id/costs', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { label, category, amount, notes } = req.body || {};
+    if (!label || amount == null) {
+      return res.status(400).json({ error: 'label and amount are required' });
+    }
+    const r = await pool.query(
+      `INSERT INTO jewelry_item_costs (item_id, label, category, amount, notes)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [id, label, category || null, amount, notes || null]
+    );
+    res.json({ cost: r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/jewelry-items/:id/costs/:costId', async (req, res) => {
+  try {
+    const { id, costId } = req.params;
+    const r = await pool.query(
+      `DELETE FROM jewelry_item_costs WHERE id = $1 AND item_id = $2 RETURNING id`,
+      [costId, id]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Jewelry Items: Recompute total cost ---------- */
+app.post('/api/jewelry-items/:id/recalc', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const stones = await pool.query(`SELECT snapshot FROM jewelry_item_stones WHERE item_id = $1`, [id]);
+    const stonesTotal = stones.rows.reduce((sum, r) => {
+      const p = Number(r.snapshot?.price ?? r.snapshot?.priceTotal ?? 0);
+      return sum + (Number.isFinite(p) ? p : 0);
+    }, 0);
+    const metalsTotal = await pool.query(`SELECT COALESCE(SUM(total_cost), 0) AS s FROM jewelry_item_metals WHERE item_id = $1`, [id]);
+    const costsTotal = await pool.query(`SELECT COALESCE(SUM(amount), 0) AS s FROM jewelry_item_costs WHERE item_id = $1`, [id]);
+    const total = Number(stonesTotal) + Number(metalsTotal.rows[0].s) + Number(costsTotal.rows[0].s);
+    const cur = await pool.query(`SELECT markup_percent FROM jewelry_items WHERE id = $1`, [id]);
+    const markup = Number(cur.rows[0]?.markup_percent || 0);
+    const salePrice = total * (1 + markup / 100);
+    const r = await pool.query(
+      `UPDATE jewelry_items SET total_cost = $1, sale_price = $2, updated_at = NOW() WHERE id = $3 RETURNING *`,
+      [total, salePrice, id]
+    );
+    res.json({ item: r.rows[0], breakdown: { stones: stonesTotal, metals: Number(metalsTotal.rows[0].s), costs: Number(costsTotal.rows[0].s), total, salePrice } });
+  } catch (e) {
+    console.error('Recalc error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Jewelry Items: Sell ---------- */
+app.post('/api/jewelry-items/:id/sell', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { contactId, salePrice, currency = 'USD', notes, userId } = req.body || {};
+    if (!contactId) return res.status(400).json({ error: 'contactId is required' });
+
+    const itemRes = await pool.query(`SELECT * FROM jewelry_items WHERE id = $1`, [id]);
+    const item = itemRes.rows[0];
+    if (!item) return res.status(404).json({ error: 'Item not found' });
+
+    const finalPrice = salePrice != null ? Number(salePrice) : Number(item.sale_price || 0);
+    const ownerUserId = userId || item.user_id;
+
+    // If the item is already attached to a CRM deal, reuse it: mark won + update value.
+    // Otherwise spin up a brand new "won" deal so the sale always lives in the pipeline.
+    let deal;
+    if (item.deal_id) {
+      const upd = await pool.query(
+        `UPDATE crm_deals
+            SET stage = 'won',
+                value = $1,
+                currency = $2,
+                actual_close = CURRENT_DATE,
+                probability = 100,
+                notes = COALESCE(NULLIF($3, ''), notes),
+                updated_at = NOW()
+          WHERE id = $4
+          RETURNING *`,
+        [finalPrice, currency, notes || '', item.deal_id]
+      );
+      deal = upd.rows[0] || null;
+    }
+    if (!deal) {
+      const dealRes = await pool.query(
+        `INSERT INTO crm_deals (user_id, contact_id, title, stage, value, currency, probability, notes, dna_sku, actual_close)
+         VALUES ($1,$2,$3,'won',$4,$5,100,$6,$7,CURRENT_DATE)
+         RETURNING *`,
+        [ownerUserId, contactId, `Jewelry: ${item.name}`, finalPrice, currency, notes || null, item.sku]
+      );
+      deal = dealRes.rows[0];
+    }
+
+    // Auto-generate a paid invoice so the customer profile's "Invoices" KPI reflects reality.
+    let invoice = null;
+    try {
+      const invoiceNumber = await generateInvoiceNumber(ownerUserId);
+      const invRes = await pool.query(
+        `INSERT INTO crm_invoices
+           (user_id, contact_id, deal_id, invoice_number, status,
+            subtotal, tax, total, currency, issued_at, paid_at, notes, metadata)
+         VALUES ($1,$2,$3,$4,'paid',$5,0,$5,$6,CURRENT_DATE,NOW(),$7,$8)
+         RETURNING *`,
+        [
+          ownerUserId, contactId, deal.id, invoiceNumber,
+          finalPrice, currency,
+          notes || `Auto-generated for ${item.sku || item.name}`,
+          JSON.stringify({ jewelry_item_id: Number(id), sku: item.sku, source: 'jewelry_sale' }),
+        ]
+      );
+      invoice = invRes.rows[0];
+    } catch (invErr) {
+      console.warn('Auto-invoice on sale warn:', invErr.message);
+    }
+
+    const r = await pool.query(
+      `UPDATE jewelry_items
+          SET status = 'sold', sold_at = NOW(), sold_to = $1, sold_deal_id = $2,
+              deal_id = COALESCE(deal_id, $2), sale_price = $3, updated_at = NOW()
+        WHERE id = $4 RETURNING *`,
+      [contactId, deal.id, finalPrice, id]
+    );
+    await pool.query(
+      `INSERT INTO jewelry_item_history (item_id, from_status, to_status, changed_by, notes)
+       VALUES ($1,$2,'sold',$3,$4)`,
+      [id, item.status, userId || null, `Sold via deal #${deal.id}${invoice ? `, invoice ${invoice.invoice_number}` : ''}`]
+    );
+
+    // Inventory bridge: any consumed stones on this piece are now physically gone.
+    let releasedSkus = [];
+    try {
+      const sold = await pool.query(
+        `UPDATE jewelry_item_stones
+            SET inventory_status = 'sold'
+          WHERE item_id = $1
+            AND consume_from_inventory = TRUE
+            AND (inventory_status IS NULL OR inventory_status NOT IN ('sold','returned'))
+          RETURNING stone_sku`,
+        [id]
+      );
+      releasedSkus = sold.rows.map(row => row.stone_sku).filter(Boolean);
+    } catch (stSellErr) {
+      console.warn('Stone-sell hook warn:', stSellErr.message);
+    }
+
+    res.json({ item: r.rows[0], deal, invoice, soldStones: releasedSkus });
+  } catch (e) {
+    console.error('Sell error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Vercel Blob: Upload ---------- */
+app.post('/api/blob/upload', blobUpload.single('file'), async (req, res) => {
+  try {
+    if (!blobPut) {
+      return res.status(503).json({
+        error: '@vercel/blob not installed. Run npm install on the backend.',
+      });
+    }
+    if (!process.env.BLOB_READ_WRITE_TOKEN) {
+      return res.status(503).json({
+        error: 'BLOB_READ_WRITE_TOKEN env var is not set on the backend.',
+      });
+    }
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const { originalname, mimetype, buffer, size } = req.file;
+    const folder = (req.query.folder || req.body?.folder || 'jewelry').replace(/[^a-zA-Z0-9_-]/g, '');
+
+    const ext = path.extname(originalname || '');
+    const baseName = path.basename(originalname || 'file', ext).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
+    const pathname = `${folder}/${Date.now()}_${baseName}${ext}`;
+
+    const blob = await blobPut(pathname, buffer, {
+      access: 'public',
+      contentType: mimetype,
+      addRandomSuffix: true,
+    });
+
+    res.json({
+      url: blob.url,
+      pathname: blob.pathname,
+      contentType: mimetype,
+      size,
+      filename: originalname,
+    });
+  } catch (e) {
+    console.error('Blob upload error:', e);
     res.status(500).json({ error: e.message });
   }
 });
