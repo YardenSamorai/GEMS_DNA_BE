@@ -311,7 +311,7 @@ app.get("/api/stones/:sku/usage", async (req, res) => {
               ji.deal_id,
               ji.sold_deal_id,
               ji.sold_at,
-              c.first_name, c.last_name, c.business_name, c.contact_type
+              c.name AS contact_name, c.company AS contact_company, c.type AS contact_type
          FROM jewelry_item_stones jis
          JOIN jewelry_items ji ON ji.id = jis.item_id
          LEFT JOIN crm_contacts c ON c.id = ji.contact_id
@@ -323,7 +323,7 @@ app.get("/api/stones/:sku/usage", async (req, res) => {
     const dnaInquiries = await pool.query(
       `SELECT i.id, i.type, i.subject, i.content, i.metadata, i.occurred_at,
               i.contact_id, i.deal_id,
-              c.first_name, c.last_name, c.business_name, c.contact_type, c.shared
+              c.name AS contact_name, c.company AS contact_company, c.type AS contact_type, c.shared
          FROM crm_interactions i
          LEFT JOIN crm_contacts c ON c.id = i.contact_id
         WHERE (i.metadata->>'sku' = $1 OR i.metadata->>'dna_sku' = $1)
@@ -335,7 +335,7 @@ app.get("/api/stones/:sku/usage", async (req, res) => {
     const deals = await pool.query(
       `SELECT DISTINCT d.id, d.title, d.stage, d.value, d.currency, d.contact_id,
               d.dna_sku, d.created_at, d.shared,
-              c.first_name, c.last_name, c.business_name, c.contact_type
+              c.name AS contact_name, c.company AS contact_company, c.type AS contact_type
          FROM crm_deal_items di
          JOIN crm_deals d ON d.id = di.deal_id
          LEFT JOIN crm_contacts c ON c.id = d.contact_id
@@ -360,10 +360,15 @@ app.get("/api/stones/:sku/usage", async (req, res) => {
       if (lastSold) currentStatus = "sold";
     }
 
-    const fmtName = (r) =>
-      r.contact_type === "business"
-        ? r.business_name || [r.first_name, r.last_name].filter(Boolean).join(" ").trim()
-        : [r.first_name, r.last_name].filter(Boolean).join(" ").trim() || r.business_name || null;
+    // Schema reminder: crm_contacts only has a single `name` column (no
+    // first/last split) plus `company` and `type` ('business' | 'lead' | ...).
+    // Show company name first for business contacts, fall back to person name.
+    const fmtName = (r) => {
+      const name = (r.contact_name || '').trim();
+      const company = (r.contact_company || '').trim();
+      if (r.contact_type === 'business') return company || name || null;
+      return name || company || null;
+    };
 
     res.json({
       sku,
