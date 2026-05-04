@@ -5141,20 +5141,23 @@ app.get('/api/jewelry-items', async (req, res) => {
     const { userId, status, type, contactId, search, includeArchived } = req.query;
     if (!userId) return res.status(400).json({ error: 'userId is required' });
 
-    const where = ['user_id = $1'];
+    // All filter columns must be prefixed with `ji.` because the JOIN with
+    // crm_contacts brings in columns like user_id/name that would otherwise
+    // be ambiguous to the planner.
+    const where = ['ji.user_id = $1'];
     const params = [userId];
     let p = 2;
 
-    if (status) { where.push(`status = $${p++}`); params.push(status); }
-    if (type) { where.push(`type = $${p++}`); params.push(type); }
-    if (contactId) { where.push(`contact_id = $${p++}`); params.push(contactId); }
+    if (status) { where.push(`ji.status = $${p++}`); params.push(status); }
+    if (type) { where.push(`ji.type = $${p++}`); params.push(type); }
+    if (contactId) { where.push(`ji.contact_id = $${p++}`); params.push(contactId); }
     if (search) {
-      where.push(`(name ILIKE $${p} OR sku ILIKE $${p} OR description ILIKE $${p})`);
+      where.push(`(ji.name ILIKE $${p} OR ji.sku ILIKE $${p} OR ji.description ILIKE $${p})`);
       params.push(`%${search}%`);
       p++;
     }
     if (!includeArchived || includeArchived === 'false') {
-      where.push(`status <> 'archived'`);
+      where.push(`ji.status <> 'archived'`);
     }
 
     const sql = `
