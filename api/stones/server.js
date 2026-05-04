@@ -280,6 +280,20 @@ app.get("/api/stones/:sku/usage", async (req, res) => {
     const { sku } = req.params;
     if (!sku) return res.status(400).json({ error: "sku required" });
 
+    // Detect whether the created_at column is present (older databases predate
+    // it). Falling back to ORDER BY jis.id keeps the endpoint working on the
+    // brief window before the migration above runs.
+    const stoneTsCheck = await pool.query(
+      `SELECT 1
+         FROM information_schema.columns
+        WHERE table_name = 'jewelry_item_stones'
+          AND column_name = 'created_at'
+        LIMIT 1`
+    ).catch(() => ({ rowCount: 0 }));
+    const hasStoneCreatedAt = stoneTsCheck.rowCount > 0;
+    const createdAtSelect = hasStoneCreatedAt ? 'jis.created_at' : 'NULL::timestamp AS created_at';
+    const createdAtOrder  = hasStoneCreatedAt ? 'jis.created_at DESC NULLS LAST, jis.id DESC' : 'jis.id DESC';
+
     const jewelry = await pool.query(
       `SELECT jis.id              AS link_id,
               jis.role,
@@ -287,7 +301,7 @@ app.get("/api/stones/:sku/usage", async (req, res) => {
               jis.consume_from_inventory,
               jis.inventory_status,
               jis.snapshot,
-              jis.created_at,
+              ${createdAtSelect},
               ji.id              AS jewelry_item_id,
               ji.sku             AS jewelry_sku,
               ji.name            AS jewelry_name,
@@ -302,7 +316,7 @@ app.get("/api/stones/:sku/usage", async (req, res) => {
          JOIN jewelry_items ji ON ji.id = jis.item_id
          LEFT JOIN crm_contacts c ON c.id = ji.contact_id
         WHERE jis.stone_sku = $1
-        ORDER BY jis.created_at DESC`,
+        ORDER BY ${createdAtOrder}`,
       [sku]
     );
 
@@ -3525,6 +3539,438 @@ app.get("/api/dashboard/exec-summary", async (req, res) => {
 });
 
 /* =========================================================
+   /api/dashboard/overview – Sprint 1.F (Overview tab)
+
+   Powers the redesigned Overview tab on the unified Dashboard.
+   Returns three blocks in one round-trip:
+
+     1. kpis     – 8 KPI cards across CRM/Jewelry/Stones/Tasks/Occasions
+     2. queue    – up to ~25 items the user should act on TODAY
+                   (tasks due/overdue, occasions today, ready jewelry,
+                    stale deals, recently received stones)
+     3. activity – up to ~15 most recent significant events.
+                   This is a *proxy* feed unioned from updated_at on
+                   crm_deals / jewelry_items / crm_contacts (DNA leads).
+                   Sprint 2 (Phase 1) will replace this with real
+                   activity_log entries — the FE shape stays identical.
+
+   Every block is wrapped in its own try so a single failing query never
+   blanks the whole dashboard.
+   ========================================================= */
+app.get("/api/dashboard/overview", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const safe = async (q, fallback) => {
+      try { return await q(); } catch (e) {
+        console.warn("overview block warn:", e.message);
+        return fallback;
+      }
+    };
+
+    /* ── KPIs ────────────────────────────────────────────── */
+    const [
+      dealsRow,
+      jewelryRow,
+      stonesRow,
+      dnaRow,
+      occasionsRow,
+      tasksRow,
+    ] = await Promise.all([
+      // Pipeline + sold-MTD via CRM deals
+      safe(
+        () => pool.query(
+          `SELECT
+             COUNT(*) FILTER (WHERE stage NOT IN ('won','lost'))::int            AS open_count,
+             COALESCE(SUM(value) FILTER (WHERE stage NOT IN ('won','lost')),0)   AS open_value,
+             COUNT(*) FILTER (WHERE stage = 'won' AND date_trunc('month', COALESCE(actual_close, updated_at)) = date_trunc('month', NOW()))::int AS won_month_count,
+             COALESCE(SUM(value) FILTER (WHERE stage = 'won' AND date_trunc('month', COALESCE(actual_close, updated_at)) = date_trunc('month', NOW())),0) AS won_month_value
+           FROM crm_deals WHERE user_id = $1`,
+          [userId]
+        ),
+        { rows: [{ open_count: 0, open_value: 0, won_month_count: 0, won_month_value: 0 }] }
+      ),
+      // WIP cost + ready count + sold-MTD via jewelry
+      safe(
+        () => pool.query(
+          `SELECT
+             COUNT(*) FILTER (WHERE status NOT IN ('sold','archived'))::int                AS wip_count,
+             COALESCE(SUM(total_cost) FILTER (WHERE status NOT IN ('sold','archived')),0)  AS wip_value,
+             COUNT(*) FILTER (WHERE status = 'ready')::int                                 AS ready_count,
+             COUNT(*) FILTER (WHERE status = 'sold' AND date_trunc('month', sold_at) = date_trunc('month', NOW()))::int AS sold_mtd_count,
+             COALESCE(SUM(sale_price) FILTER (WHERE status = 'sold' AND date_trunc('month', sold_at) = date_trunc('month', NOW())),0) AS sold_mtd_value
+           FROM jewelry_items WHERE user_id = $1`,
+          [userId]
+        ),
+        { rows: [{ wip_count: 0, wip_value: 0, ready_count: 0, sold_mtd_count: 0, sold_mtd_value: 0 }] }
+      ),
+      // Stones inventory $ — total available value (soap_stones is the live mirror)
+      safe(
+        () => pool.query(
+          `SELECT
+             COUNT(*)::int                                       AS total,
+             COALESCE(SUM(NULLIF(total_price,'')::numeric),0)    AS total_value
+           FROM soap_stones WHERE sku IS NOT NULL`
+        ),
+        { rows: [{ total: 0, total_value: 0 }] }
+      ),
+      // New DNA leads (last 7 days, last 30 days)
+      safe(
+        () => pool.query(
+          `SELECT
+             COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int   AS new_7d,
+             COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days')::int  AS new_30d
+           FROM crm_contacts
+           WHERE shared = TRUE AND source = 'dna_lead'`
+        ),
+        { rows: [{ new_7d: 0, new_30d: 0 }] }
+      ),
+      // Occasions today + this-week — recurring_yearly aware
+      safe(
+        () => pool.query(
+          `WITH proj AS (
+             SELECT id,
+               CASE
+                 WHEN recurring_yearly THEN
+                   CASE
+                     WHEN make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int,
+                                    EXTRACT(MONTH FROM occurs_on)::int,
+                                    EXTRACT(DAY FROM occurs_on)::int) >= CURRENT_DATE
+                       THEN make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int,
+                                      EXTRACT(MONTH FROM occurs_on)::int,
+                                      EXTRACT(DAY FROM occurs_on)::int)
+                     ELSE make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int + 1,
+                                    EXTRACT(MONTH FROM occurs_on)::int,
+                                    EXTRACT(DAY FROM occurs_on)::int)
+                   END
+                 ELSE occurs_on
+               END AS next_occurrence
+             FROM crm_occasions WHERE user_id = $1
+           )
+           SELECT
+             COUNT(*) FILTER (WHERE next_occurrence = CURRENT_DATE)::int                                    AS today,
+             COUNT(*) FILTER (WHERE next_occurrence BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days')::int  AS this_week
+           FROM proj`,
+          [userId]
+        ),
+        { rows: [{ today: 0, this_week: 0 }] }
+      ),
+      // Tasks due today + overdue
+      safe(
+        () => pool.query(
+          `SELECT
+             COUNT(*) FILTER (WHERE status = 'pending' AND due_date::date = CURRENT_DATE)::int  AS today,
+             COUNT(*) FILTER (WHERE status = 'pending' AND due_date < NOW())::int               AS overdue
+           FROM crm_tasks WHERE user_id = $1`,
+          [userId]
+        ),
+        { rows: [{ today: 0, overdue: 0 }] }
+      ),
+    ]);
+
+    /* ── Queue: things demanding attention TODAY ──────────── */
+    const [
+      tasksToday,
+      occasionsToday,
+      readyJewelry,
+      staleDeals,
+      newLeadsToday,
+    ] = await Promise.all([
+      // Pending tasks: overdue first, then today's
+      safe(
+        () => pool.query(
+          `SELECT t.id, t.title, t.due_date, t.priority, t.contact_id, c.name AS contact_name
+           FROM crm_tasks t
+           LEFT JOIN crm_contacts c ON c.id = t.contact_id
+           WHERE t.user_id = $1
+             AND t.status = 'pending'
+             AND (t.due_date < NOW() OR t.due_date::date = CURRENT_DATE)
+           ORDER BY t.due_date ASC NULLS LAST
+           LIMIT 8`,
+          [userId]
+        ),
+        { rows: [] }
+      ),
+      // Occasions occurring today (recurring-aware)
+      safe(
+        () => pool.query(
+          `WITH proj AS (
+             SELECT o.id, o.contact_id, o.kind, o.label, o.occurs_on,
+               CASE
+                 WHEN o.recurring_yearly THEN
+                   make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int,
+                             EXTRACT(MONTH FROM o.occurs_on)::int,
+                             EXTRACT(DAY FROM o.occurs_on)::int)
+                 ELSE o.occurs_on
+               END AS next_occurrence
+             FROM crm_occasions o WHERE o.user_id = $1
+           )
+           SELECT p.id, p.contact_id, p.kind, p.label, p.next_occurrence,
+                  c.name AS contact_name
+           FROM proj p
+           LEFT JOIN crm_contacts c ON c.id = p.contact_id
+           WHERE p.next_occurrence = CURRENT_DATE
+           ORDER BY c.name
+           LIMIT 8`,
+          [userId]
+        ),
+        { rows: [] }
+      ),
+      // Jewelry items in 'ready' status — need handoff
+      safe(
+        () => pool.query(
+          `SELECT j.id, j.sku, j.name, j.cover_image_url, j.updated_at,
+                  c.id AS contact_id, c.name AS contact_name
+           FROM jewelry_items j
+           LEFT JOIN crm_contacts c ON c.id = j.contact_id
+           WHERE j.user_id = $1 AND j.status = 'ready'
+           ORDER BY j.updated_at DESC
+           LIMIT 6`,
+          [userId]
+        ),
+        { rows: [] }
+      ),
+      // Open deals untouched for 7+ days
+      safe(
+        () => pool.query(
+          `SELECT d.id, d.title, d.stage, d.value, d.updated_at,
+                  c.id AS contact_id, c.name AS contact_name
+           FROM crm_deals d
+           LEFT JOIN crm_contacts c ON c.id = d.contact_id
+           WHERE d.user_id = $1
+             AND d.stage NOT IN ('won','lost')
+             AND d.updated_at < NOW() - INTERVAL '7 days'
+           ORDER BY d.updated_at ASC
+           LIMIT 5`,
+          [userId]
+        ),
+        { rows: [] }
+      ),
+      // New DNA leads from the last 24 hours that I haven't contacted
+      safe(
+        () => pool.query(
+          `SELECT id, name, email, phone, dna_sku, created_at
+           FROM crm_contacts
+           WHERE shared = TRUE AND source = 'dna_lead'
+             AND created_at >= NOW() - INTERVAL '24 hours'
+             AND last_contact_at IS NULL
+           ORDER BY created_at DESC
+           LIMIT 5`
+        ),
+        { rows: [] }
+      ),
+    ]);
+
+    const queue = [];
+    for (const t of tasksToday.rows) {
+      const overdue = t.due_date && new Date(t.due_date) < new Date();
+      queue.push({
+        type: "task",
+        id: `task-${t.id}`,
+        title: t.title,
+        sub: t.contact_name ? `for ${t.contact_name}` : "",
+        severity: overdue ? "overdue" : "today",
+        priority: t.priority,
+        link: t.contact_id ? `/crm/customers/${t.contact_id}` : "/crm/tasks",
+      });
+    }
+    for (const o of occasionsToday.rows) {
+      queue.push({
+        type: "occasion",
+        id: `occ-${o.id}`,
+        title: `${o.contact_name || "Contact"} — ${o.label || o.kind}`,
+        sub: "today",
+        severity: "today",
+        link: o.contact_id ? `/crm/customers/${o.contact_id}` : "/crm/contacts",
+      });
+    }
+    for (const j of readyJewelry.rows) {
+      queue.push({
+        type: "ready_item",
+        id: `ready-${j.id}`,
+        title: `${j.sku || j.name} is ready`,
+        sub: j.contact_name ? `for ${j.contact_name}` : "no customer linked",
+        severity: "info",
+        link: `/jewelry/items/${j.id}`,
+        image: j.cover_image_url || null,
+      });
+    }
+    for (const d of staleDeals.rows) {
+      const days = Math.floor((Date.now() - new Date(d.updated_at).getTime()) / 86400000);
+      queue.push({
+        type: "stale_deal",
+        id: `deal-${d.id}`,
+        title: d.title,
+        sub: `${d.contact_name || "no contact"} · stage ${d.stage} · ${days}d idle`,
+        severity: days > 21 ? "warn" : "info",
+        link: d.contact_id ? `/crm/customers/${d.contact_id}` : "/crm/deals",
+      });
+    }
+    for (const l of newLeadsToday.rows) {
+      queue.push({
+        type: "new_lead",
+        id: `lead-${l.id}`,
+        title: `New DNA lead: ${l.name}`,
+        sub: l.dna_sku ? `interested in ${l.dna_sku}` : (l.email || l.phone || ""),
+        severity: "info",
+        link: `/crm/customers/${l.id}`,
+      });
+    }
+
+    /* ── Activity feed (proxy until Sprint 2 ships activity_log) ── */
+    const [
+      recentDealMoves,
+      recentJewelryMoves,
+      recentNewLeads,
+      recentSold,
+    ] = await Promise.all([
+      // Deals updated in the last 14 days
+      safe(
+        () => pool.query(
+          `SELECT d.id, d.title, d.stage, d.updated_at, d.contact_id, c.name AS contact_name
+           FROM crm_deals d
+           LEFT JOIN crm_contacts c ON c.id = d.contact_id
+           WHERE d.user_id = $1 AND d.updated_at >= NOW() - INTERVAL '14 days'
+           ORDER BY d.updated_at DESC
+           LIMIT 8`,
+          [userId]
+        ),
+        { rows: [] }
+      ),
+      // Jewelry updated in the last 14 days
+      safe(
+        () => pool.query(
+          `SELECT j.id, j.sku, j.name, j.status, j.updated_at,
+                  c.name AS contact_name
+           FROM jewelry_items j
+           LEFT JOIN crm_contacts c ON c.id = j.contact_id
+           WHERE j.user_id = $1 AND j.updated_at >= NOW() - INTERVAL '14 days'
+           ORDER BY j.updated_at DESC
+           LIMIT 8`,
+          [userId]
+        ),
+        { rows: [] }
+      ),
+      // New DNA leads in the last 14 days
+      safe(
+        () => pool.query(
+          `SELECT id, name, email, dna_sku, created_at
+           FROM crm_contacts
+           WHERE shared = TRUE AND source = 'dna_lead'
+             AND created_at >= NOW() - INTERVAL '14 days'
+           ORDER BY created_at DESC
+           LIMIT 6`
+        ),
+        { rows: [] }
+      ),
+      // Recently sold items
+      safe(
+        () => pool.query(
+          `SELECT j.id, j.sku, j.name, j.sale_price, j.sold_at,
+                  c.name AS contact_name
+           FROM jewelry_items j
+           LEFT JOIN crm_contacts c ON c.id = j.sold_to
+           WHERE j.user_id = $1 AND j.sold_at >= NOW() - INTERVAL '14 days'
+           ORDER BY j.sold_at DESC
+           LIMIT 5`,
+          [userId]
+        ),
+        { rows: [] }
+      ),
+    ]);
+
+    const activity = [];
+    for (const d of recentDealMoves.rows) {
+      activity.push({
+        type: "deal_update",
+        id: `act-deal-${d.id}-${new Date(d.updated_at).getTime()}`,
+        label: `Deal "${d.title}" — ${d.stage}`,
+        sub: d.contact_name || "",
+        ts: d.updated_at,
+        link: d.contact_id ? `/crm/customers/${d.contact_id}` : "/crm/deals",
+      });
+    }
+    for (const j of recentJewelryMoves.rows) {
+      activity.push({
+        type: "jewelry_update",
+        id: `act-jw-${j.id}-${new Date(j.updated_at).getTime()}`,
+        label: `${j.sku || j.name} → ${j.status}`,
+        sub: j.contact_name ? `for ${j.contact_name}` : "",
+        ts: j.updated_at,
+        link: `/jewelry/items/${j.id}`,
+      });
+    }
+    for (const l of recentNewLeads.rows) {
+      activity.push({
+        type: "new_lead",
+        id: `act-lead-${l.id}`,
+        label: `New DNA lead: ${l.name}`,
+        sub: l.dna_sku ? `via ${l.dna_sku}` : (l.email || ""),
+        ts: l.created_at,
+        link: `/crm/customers/${l.id}`,
+      });
+    }
+    for (const s of recentSold.rows) {
+      activity.push({
+        type: "jewelry_sold",
+        id: `act-sold-${s.id}`,
+        label: `${s.sku || s.name} sold`,
+        sub: `${s.contact_name || "Customer"} · $${Math.round(Number(s.sale_price || 0)).toLocaleString("en-US")}`,
+        ts: s.sold_at,
+        link: `/jewelry/items/${s.id}`,
+      });
+    }
+    // Sort all activity by timestamp DESC and cap at 15
+    activity.sort((a, b) => new Date(b.ts) - new Date(a.ts));
+    const activityCapped = activity.slice(0, 15);
+
+    /* ── Response ────────────────────────────────────────── */
+    res.json({
+      kpis: {
+        pipeline: {
+          value: Number(dealsRow.rows[0].open_value || 0),
+          count: Number(dealsRow.rows[0].open_count || 0),
+        },
+        wip: {
+          value: Number(jewelryRow.rows[0].wip_value || 0),
+          count: Number(jewelryRow.rows[0].wip_count || 0),
+        },
+        inventory: {
+          value: Number(stonesRow.rows[0].total_value || 0),
+          count: Number(stonesRow.rows[0].total || 0),
+        },
+        sold_mtd: {
+          value: Number(jewelryRow.rows[0].sold_mtd_value || 0),
+          count: Number(jewelryRow.rows[0].sold_mtd_count || 0),
+        },
+        tasks_today: {
+          count: Number(tasksRow.rows[0].today || 0),
+          overdue: Number(tasksRow.rows[0].overdue || 0),
+        },
+        items_ready: {
+          count: Number(jewelryRow.rows[0].ready_count || 0),
+        },
+        new_leads: {
+          new_7d: Number(dnaRow.rows[0].new_7d || 0),
+          new_30d: Number(dnaRow.rows[0].new_30d || 0),
+        },
+        occasions: {
+          today: Number(occasionsRow.rows[0].today || 0),
+          this_week: Number(occasionsRow.rows[0].this_week || 0),
+        },
+      },
+      queue,
+      activity: activityCapped,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("overview fatal:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =========================================================
    /api/dashboard/reports – Phase D
    Powers the Reports page. Returns revenue trend, production
    throughput, top customers, profit margins, and pipeline
@@ -5001,7 +5447,9 @@ const jewelryReadyPromise = (async () => {
         role TEXT,
         quantity INTEGER DEFAULT 1,
         snapshot JSONB,
-        notes TEXT
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
       )
     `);
 
@@ -5072,6 +5520,11 @@ const jewelryReadyPromise = (async () => {
     const stoneConsumeMigrations = [
       "ALTER TABLE jewelry_item_stones ADD COLUMN IF NOT EXISTS consume_from_inventory BOOLEAN DEFAULT FALSE",
       "ALTER TABLE jewelry_item_stones ADD COLUMN IF NOT EXISTS inventory_status TEXT",
+      // Timestamps – needed by the StoneUsagePanel (DNA page) which orders by created_at.
+      // Backfill old rows so ORDER BY behaves consistently.
+      "ALTER TABLE jewelry_item_stones ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
+      "ALTER TABLE jewelry_item_stones ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
+      "UPDATE jewelry_item_stones SET created_at = NOW() WHERE created_at IS NULL",
       "CREATE INDEX IF NOT EXISTS idx_jewelry_item_stones_sku ON jewelry_item_stones(stone_sku) WHERE stone_sku IS NOT NULL",
       "CREATE INDEX IF NOT EXISTS idx_jewelry_item_stones_active ON jewelry_item_stones(stone_sku) WHERE consume_from_inventory = TRUE AND (inventory_status IS NULL OR inventory_status <> 'sold')",
     ];
