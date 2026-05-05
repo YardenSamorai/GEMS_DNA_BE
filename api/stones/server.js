@@ -3,6 +3,7 @@ const cors = require("cors");
 const { Pool } = require("pg");
 const dotenv = require("dotenv");
 const path = require("path");
+const crypto = require("crypto");
 const CryptoJS = require("crypto-js");
 
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -5970,6 +5971,48 @@ const jewelryReadyPromise = (async () => {
     for (const sql of ijewelMigrations) {
       try { await pool.query(sql); } catch (e) { console.warn('iJewel migration warn:', e.message); }
     }
+
+    // Phase G (Customer Preview): public share links so the workshop can
+    // send a clean URL to the customer for approval, plus a log of every
+    // approval / change-request / view that came back through it.
+    //
+    //   jewelry_shares          - one row per generated link (token, expiry,
+    //                             revocation, who created it)
+    //   jewelry_share_responses - append-only log of customer interactions
+    //                             (action: viewed | approved | changes_requested
+    //                              | comment); also feeds activity_log
+    //
+    // Tokens are URL-safe random base64 (24 bytes ≈ 32 chars) — opaque enough
+    // that nobody can guess another item's preview without the link.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS jewelry_shares (
+        id SERIAL PRIMARY KEY,
+        item_id INTEGER NOT NULL REFERENCES jewelry_items(id) ON DELETE CASCADE,
+        token TEXT UNIQUE NOT NULL,
+        created_by TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        expires_at TIMESTAMP,
+        revoked_at TIMESTAMP,
+        last_viewed_at TIMESTAMP,
+        view_count INTEGER DEFAULT 0,
+        notes TEXT
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS jewelry_share_responses (
+        id SERIAL PRIMARY KEY,
+        share_id INTEGER NOT NULL REFERENCES jewelry_shares(id) ON DELETE CASCADE,
+        action TEXT NOT NULL,
+        customer_name TEXT,
+        comment TEXT,
+        ip TEXT,
+        user_agent TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_shares_item_id ON jewelry_shares(item_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_shares_token ON jewelry_shares(token)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_share_responses_share_id ON jewelry_share_responses(share_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_item_stones_item_id ON jewelry_item_stones(item_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_item_files_item_id ON jewelry_item_files(item_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_item_history_item_id ON jewelry_item_history(item_id)`);
@@ -6987,6 +7030,490 @@ app.post('/api/jewelry-items/:id/sell', async (req, res) => {
     });
   } catch (e) {
     console.error('Sell error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =====================================================================
+   Customer Preview: Share links + AI mockup generation
+
+   Replaces the old "3D Preview" tab with something the customer actually
+   touches. Two parts:
+
+   1) Share links — each row in jewelry_shares is a long, unguessable
+      token granting public read access to a curated subset of the item
+      (cover + photos + AI mockups + pricing + designer notes). The link
+      is revocable and optionally expires. Customer responses (view,
+      approve, request-changes, comment) are append-only in
+      jewelry_share_responses AND mirrored to activity_log so the
+      workshop sees them in the main feed without polling.
+
+   2) AI mockup — POST a prompt and we call OpenAI Images (gpt-image-1),
+      upload the result to Vercel Blob, and register it as a
+      jewelry_item_files row with kind='ai_mockup'. From then on it's
+      indistinguishable from any uploaded image — the share page picks it
+      up automatically, the workshop can promote it to cover, etc.
+   ===================================================================== */
+
+const VALID_SHARE_RESPONSE_ACTIONS = new Set([
+  'viewed',
+  'approved',
+  'changes_requested',
+  'comment',
+]);
+
+function makeShareToken() {
+  // 24 random bytes → 32 url-safe base64 chars. Plenty of entropy.
+  return crypto.randomBytes(24).toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function isShareUsable(share) {
+  if (!share) return false;
+  if (share.revoked_at) return false;
+  if (share.expires_at && new Date(share.expires_at).getTime() < Date.now()) return false;
+  return true;
+}
+
+function getRequestIp(req) {
+  const fwd = req.headers['x-forwarded-for'];
+  if (typeof fwd === 'string') return fwd.split(',')[0].trim();
+  return req.socket?.remoteAddress || null;
+}
+
+/* ---------- Share links: list / create / revoke (private) ---------- */
+app.get('/api/jewelry-items/:id/shares', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const r = await pool.query(
+      `SELECT s.*,
+              (SELECT COUNT(*) FROM jewelry_share_responses
+                 WHERE share_id = s.id AND action = 'approved') AS approve_count,
+              (SELECT COUNT(*) FROM jewelry_share_responses
+                 WHERE share_id = s.id AND action = 'changes_requested') AS change_request_count,
+              (SELECT COUNT(*) FROM jewelry_share_responses
+                 WHERE share_id = s.id AND action = 'comment') AS comment_count
+         FROM jewelry_shares s
+        WHERE s.item_id = $1
+        ORDER BY s.created_at DESC`,
+      [id]
+    );
+    res.json({ shares: r.rows });
+  } catch (e) {
+    console.error('GET shares error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/jewelry-items/:id/shares', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId, expiresAt, notes } = req.body || {};
+
+    const itemRes = await pool.query(
+      `SELECT user_id, name, sku, contact_id FROM jewelry_items WHERE id = $1`,
+      [id]
+    );
+    const item = itemRes.rows[0];
+    if (!item) return res.status(404).json({ error: 'Item not found' });
+
+    const token = makeShareToken();
+    const r = await pool.query(
+      `INSERT INTO jewelry_shares (item_id, token, created_by, expires_at, notes)
+       VALUES ($1,$2,$3,$4,$5)
+       RETURNING *`,
+      [id, token, userId || null, expiresAt || null, notes || null]
+    );
+
+    res.json({ share: r.rows[0] });
+
+    const { actorId, actorName } = getActor(req);
+    logActivity({
+      userId:     item.user_id,
+      actorId, actorName,
+      entityType: 'jewelry_item',
+      entityId:   id,
+      action:     'share_created',
+      summary:    `Customer preview link created for ${item.name || item.sku}`,
+      related:    item.contact_id ? [{ type: 'contact', id: item.contact_id }] : null,
+    });
+  } catch (e) {
+    console.error('POST share error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/jewelry-items/:id/shares/:shareId', async (req, res) => {
+  try {
+    const { id, shareId } = req.params;
+    const r = await pool.query(
+      `UPDATE jewelry_shares
+          SET revoked_at = NOW()
+        WHERE id = $1 AND item_id = $2 AND revoked_at IS NULL
+        RETURNING *`,
+      [shareId, id]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'Share not found or already revoked' });
+    res.json({ share: r.rows[0] });
+
+    const itemRes = await pool.query(
+      `SELECT user_id, name, sku, contact_id FROM jewelry_items WHERE id = $1`,
+      [id]
+    );
+    const item = itemRes.rows[0];
+    if (item) {
+      const { actorId, actorName } = getActor(req);
+      logActivity({
+        userId:     item.user_id,
+        actorId, actorName,
+        entityType: 'jewelry_item',
+        entityId:   id,
+        action:     'share_revoked',
+        summary:    `Customer preview link revoked for ${item.name || item.sku}`,
+        related:    item.contact_id ? [{ type: 'contact', id: item.contact_id }] : null,
+      });
+    }
+  } catch (e) {
+    console.error('DELETE share error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Public share endpoints (no auth) ---------- */
+//
+// `GET /api/share/:token` is the only window the customer ever sees into
+// our DB, so we hand-pick exactly which jewelry_items columns ship out:
+// no internal_notes, no markup_percent, no total_cost, no contact PII.
+// Stones are summarised (count + carat total), files are filtered to
+// images only. Anything we don't explicitly include here stays private.
+app.get('/api/share/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const sr = await pool.query(`SELECT * FROM jewelry_shares WHERE token = $1`, [token]);
+    const share = sr.rows[0];
+    if (!share || !isShareUsable(share)) {
+      return res.status(404).json({ error: 'This preview link is no longer available.' });
+    }
+
+    const itemRes = await pool.query(
+      `SELECT id, sku, name, category, type, status,
+              metal_summary, weight_grams, size, description,
+              cover_image_url, sale_price, created_at, updated_at
+         FROM jewelry_items
+        WHERE id = $1`,
+      [share.item_id]
+    );
+    const item = itemRes.rows[0];
+    if (!item) {
+      return res.status(404).json({ error: 'Item not found.' });
+    }
+
+    // Image-only files (sketches, AI mockups, progress photos, finals).
+    const filesRes = await pool.query(
+      `SELECT id, url, kind, stage, filename, mime_type, uploaded_at
+         FROM jewelry_item_files
+        WHERE item_id = $1
+          AND (mime_type LIKE 'image/%' OR kind IN ('sketch','progress','final','ai_mockup'))
+        ORDER BY uploaded_at ASC`,
+      [share.item_id]
+    );
+
+    // Stones: count + total carats only — never expose SKU/cost/cert#.
+    const stonesRes = await pool.query(
+      `SELECT COUNT(*)::int AS count,
+              COALESCE(SUM((snapshot->>'weight')::numeric), 0)::numeric AS total_weight
+         FROM jewelry_item_stones
+        WHERE item_id = $1`,
+      [share.item_id]
+    );
+
+    // Bump view counter (best-effort; never block the response on it)
+    pool.query(
+      `UPDATE jewelry_shares
+          SET view_count = view_count + 1, last_viewed_at = NOW()
+        WHERE id = $1`,
+      [share.id]
+    ).catch(() => { /* non-fatal */ });
+
+    // Light "viewed" log — capped to once per IP per hour so refresh spam
+    // doesn't drown the activity feed.
+    try {
+      const ip = getRequestIp(req);
+      const ua = req.headers['user-agent'] || null;
+      const recent = await pool.query(
+        `SELECT 1 FROM jewelry_share_responses
+          WHERE share_id = $1 AND action = 'viewed' AND ip = $2
+            AND created_at > NOW() - INTERVAL '1 hour' LIMIT 1`,
+        [share.id, ip]
+      );
+      if (!recent.rows.length) {
+        await pool.query(
+          `INSERT INTO jewelry_share_responses (share_id, action, ip, user_agent)
+           VALUES ($1,'viewed',$2,$3)`,
+          [share.id, ip, ua]
+        );
+      }
+    } catch (_) { /* non-fatal */ }
+
+    res.json({
+      share: {
+        id: share.id,
+        createdAt: share.created_at,
+        expiresAt: share.expires_at,
+        notes: share.notes,
+      },
+      item: {
+        id: item.id,
+        sku: item.sku,
+        name: item.name,
+        category: item.category,
+        type: item.type,
+        status: item.status,
+        metalSummary: item.metal_summary,
+        weightGrams: item.weight_grams,
+        size: item.size,
+        description: item.description,
+        coverImageUrl: item.cover_image_url,
+        salePrice: item.sale_price,
+      },
+      images: filesRes.rows.map(r => ({
+        id: r.id,
+        url: r.url,
+        kind: r.kind,
+        stage: r.stage,
+        filename: r.filename,
+        uploadedAt: r.uploaded_at,
+      })),
+      stoneSummary: {
+        count: stonesRes.rows[0]?.count || 0,
+        totalCarats: Number(stonesRes.rows[0]?.total_weight || 0),
+      },
+    });
+  } catch (e) {
+    console.error('GET share error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/share/:token/respond', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { action, customerName, comment } = req.body || {};
+    if (!VALID_SHARE_RESPONSE_ACTIONS.has(action)) {
+      return res.status(400).json({ error: 'Invalid action' });
+    }
+    const sr = await pool.query(`SELECT * FROM jewelry_shares WHERE token = $1`, [token]);
+    const share = sr.rows[0];
+    if (!share || !isShareUsable(share)) {
+      return res.status(404).json({ error: 'This preview link is no longer available.' });
+    }
+
+    const ip = getRequestIp(req);
+    const ua = req.headers['user-agent'] || null;
+    const insRes = await pool.query(
+      `INSERT INTO jewelry_share_responses
+         (share_id, action, customer_name, comment, ip, user_agent)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING *`,
+      [share.id, action, customerName || null, comment || null, ip, ua]
+    );
+    res.json({ response: insRes.rows[0] });
+
+    // Mirror customer activity into the workshop's activity_log so it
+    // shows up alongside everything else without a separate inbox.
+    try {
+      const itemRes = await pool.query(
+        `SELECT user_id, name, sku, contact_id FROM jewelry_items WHERE id = $1`,
+        [share.item_id]
+      );
+      const item = itemRes.rows[0];
+      if (item) {
+        const who = customerName ? `Customer (${customerName})` : 'Customer';
+        const verbMap = {
+          approved: 'approved the design',
+          changes_requested: 'requested changes',
+          comment: 'left a comment',
+          viewed: 'viewed the preview',
+        };
+        logActivity({
+          userId:     item.user_id,
+          actorId:    null,
+          actorName:  who,
+          entityType: 'jewelry_item',
+          entityId:   share.item_id,
+          action:     `share_${action}`,
+          summary:    `${who} ${verbMap[action] || action} on ${item.name || item.sku}`,
+          changes:    comment ? { comment: { from: null, to: comment } } : null,
+          related:    item.contact_id ? [{ type: 'contact', id: item.contact_id }] : null,
+        });
+      }
+    } catch (_) { /* non-fatal */ }
+  } catch (e) {
+    console.error('POST share respond error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Share responses: list (workshop side) ---------- */
+app.get('/api/jewelry-items/:id/share-responses', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const r = await pool.query(
+      `SELECT r.*, s.token
+         FROM jewelry_share_responses r
+         JOIN jewelry_shares s ON s.id = r.share_id
+        WHERE s.item_id = $1
+        ORDER BY r.created_at DESC
+        LIMIT 200`,
+      [id]
+    );
+    res.json({ responses: r.rows });
+  } catch (e) {
+    console.error('GET share-responses error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- AI Mockup: prompt → photoreal render → blob → file row ---------- */
+//
+// One round trip: caller sends a free-text prompt + (optional) item context
+// flag. We compose a strong prompt for jewelry photography, ask OpenAI's
+// gpt-image-1 model for a 1024x1024 b64 PNG, push it to Vercel Blob, and
+// register it on the item as kind='ai_mockup'. Optionally promote to cover.
+app.post('/api/jewelry-items/:id/ai-mockup', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      prompt,
+      userId,
+      useItemContext = true,
+      setAsCover = false,
+      size = '1024x1024',
+    } = req.body || {};
+
+    if (!prompt || !String(prompt).trim()) {
+      return res.status(400).json({ error: 'prompt is required' });
+    }
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(503).json({ error: 'OPENAI_API_KEY is not configured on the server.' });
+    }
+    if (!blobPut || !process.env.BLOB_READ_WRITE_TOKEN) {
+      return res.status(503).json({ error: 'Vercel Blob is not configured (BLOB_READ_WRITE_TOKEN missing).' });
+    }
+
+    // Pull just enough item context to ground the model. We avoid sending
+    // pricing / customer info — the prompt only needs material + stone hints.
+    let composedPrompt = String(prompt).trim();
+    if (useItemContext) {
+      const itemRes = await pool.query(
+        `SELECT name, category, metal_summary, size, description
+           FROM jewelry_items WHERE id = $1`,
+        [id]
+      );
+      const item = itemRes.rows[0];
+      if (item) {
+        const ctxBits = [
+          item.category && `category: ${item.category}`,
+          item.metal_summary && `metal: ${item.metal_summary}`,
+          item.size && `size: ${item.size}`,
+          item.name && `piece name: ${item.name}`,
+        ].filter(Boolean);
+        if (ctxBits.length) {
+          composedPrompt = `${composedPrompt}\n\nItem context — ${ctxBits.join('; ')}.`;
+        }
+      }
+    }
+
+    // Boilerplate that turns "Pear emerald two side diamonds" into a
+    // proper studio jewelry shot every time, regardless of how terse the
+    // user is. Negative prompts go in the same string for image models.
+    const photoStyle =
+      'Professional fine-jewelry product photography. Soft studio lighting, ' +
+      'gradient white-to-grey seamless background, macro lens, shallow depth ' +
+      'of field, hero hero-angle, crisp metal reflections, sparkle on stones, ' +
+      'no human hands, no text, no watermark.';
+
+    const finalPrompt = `${photoStyle}\n\nDesign brief: ${composedPrompt}`;
+
+    const aiRes = await fetch('https://api.openai.com/v1/images/generations', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-image-1',
+        prompt: finalPrompt,
+        size,
+        quality: 'high',
+        n: 1,
+      }),
+    });
+
+    if (!aiRes.ok) {
+      const errText = await aiRes.text();
+      console.error('OpenAI image generation failed:', aiRes.status, errText);
+      return res.status(502).json({ error: `Image generation failed (${aiRes.status})`, detail: errText.slice(0, 500) });
+    }
+
+    const aiJson = await aiRes.json();
+    const b64 = aiJson?.data?.[0]?.b64_json;
+    const revisedPrompt = aiJson?.data?.[0]?.revised_prompt || null;
+    if (!b64) {
+      return res.status(502).json({ error: 'Image generation returned no data.' });
+    }
+
+    const buffer = Buffer.from(b64, 'base64');
+    const pathname = `jewelry/ai-mockup/${id}/${Date.now()}.png`;
+    const blob = await blobPut(pathname, buffer, {
+      access: 'public',
+      contentType: 'image/png',
+      addRandomSuffix: true,
+    });
+
+    const fileRes = await pool.query(
+      `INSERT INTO jewelry_item_files
+         (item_id, url, kind, filename, mime_type, size_bytes, uploaded_by)
+       VALUES ($1, $2, 'ai_mockup', $3, 'image/png', $4, $5)
+       RETURNING *`,
+      [id, blob.url, `ai-mockup-${Date.now()}.png`, buffer.length, userId || null]
+    );
+
+    if (setAsCover) {
+      await pool.query(
+        `UPDATE jewelry_items SET cover_image_url = $1, updated_at = NOW() WHERE id = $2`,
+        [blob.url, id]
+      );
+    }
+
+    res.json({
+      file: fileRes.rows[0],
+      revisedPrompt,
+      promptSent: finalPrompt,
+    });
+
+    // Activity log so the workshop sees mockups being generated.
+    try {
+      const itemRes = await pool.query(
+        `SELECT user_id, name, sku, contact_id FROM jewelry_items WHERE id = $1`,
+        [id]
+      );
+      const item = itemRes.rows[0];
+      if (item) {
+        const { actorId, actorName } = getActor(req);
+        logActivity({
+          userId:     item.user_id,
+          actorId, actorName,
+          entityType: 'jewelry_item',
+          entityId:   id,
+          action:     'ai_mockup_generated',
+          summary:    `Generated AI mockup for ${item.name || item.sku}`,
+          related:    item.contact_id ? [{ type: 'contact', id: item.contact_id }] : null,
+        });
+      }
+    } catch (_) { /* non-fatal */ }
+  } catch (e) {
+    console.error('AI mockup error:', e);
     res.status(500).json({ error: e.message });
   }
 });
