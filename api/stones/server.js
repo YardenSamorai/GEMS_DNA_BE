@@ -6143,6 +6143,19 @@ const looksLikeImageUrl = (u) => {
   return /\.(png|jpe?g|webp|gif|avif)(\?|#|$)/.test(s);
 };
 
+// Templates store `all_pictures_link` as a `;`-separated list of URLs (CSV
+// import preserves the column verbatim). Walk it and return the first entry
+// that actually looks like an image so we can use it as the workshop job's
+// cover. Returns null when nothing in the list qualifies.
+const pickFirstImageUrl = (raw) => {
+  if (!raw || typeof raw !== 'string') return null;
+  const candidates = raw.split(/[;,]+/).map((s) => s.trim()).filter(Boolean);
+  for (const u of candidates) {
+    if (looksLikeImageUrl(u)) return u;
+  }
+  return null;
+};
+
 app.post('/api/jewelry-items/from-template', async (req, res) => {
   try {
     const {
@@ -6168,14 +6181,21 @@ app.post('/api/jewelry-items/from-template', async (req, res) => {
     const metalSummary = [tpl.metal_type, tpl.style].filter(Boolean).join(' / ') || null;
     const weightGrams = tpl.jewelry_weight || null;
     const size = tpl.jewelry_size || null;
-    const coverImage = looksLikeImageUrl(tpl.all_pictures_link) ? tpl.all_pictures_link : null;
+    // CSV-imported templates store images as `url1; url2; url3` rather than a
+    // single URL, so we have to walk the list. The earlier single-URL check
+    // never matched and we lost the cover.
+    const coverImage = pickFirstImageUrl(tpl.all_pictures_link);
 
+    // "Make from template" is an explicit commit to start production — the
+    // previous default of 'draft' hid the new job from the Production Kanban
+    // (which only shows items in active stages). Land directly on 'design',
+    // the first stage of the workflow.
     const r = await pool.query(
       `INSERT INTO jewelry_items
          (user_id, location, sku, name, type, status, contact_id, deal_id,
           category, metal_summary, weight_grams, size, description,
           cover_image_url, template_model_number)
-       VALUES ($1,$2,$3,$4,'custom','draft',$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       VALUES ($1,$2,$3,$4,'custom','design',$5,$6,$7,$8,$9,$10,$11,$12,$13)
        RETURNING *`,
       [
         userId, location || null, sku, name,
@@ -6187,7 +6207,7 @@ app.post('/api/jewelry-items/from-template', async (req, res) => {
 
     await pool.query(
       `INSERT INTO jewelry_item_history (item_id, from_status, to_status, changed_by, notes)
-       VALUES ($1, NULL, 'draft', $2, $3)`,
+       VALUES ($1, NULL, 'design', $2, $3)`,
       [r.rows[0].id, userId, `Created from catalog template ${tpl.model_number}`]
     );
 
