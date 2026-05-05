@@ -6059,9 +6059,42 @@ app.get('/api/jewelry-items/:id', async (req, res) => {
       pool.query(`SELECT * FROM jewelry_item_history WHERE item_id = $1 ORDER BY changed_at DESC, id DESC LIMIT 100`, [id]),
     ]);
 
+    // Lazy backfill: any inventory-consumed stone with an empty snapshot gets
+    // re-snapshotted on the spot. Catches rows added during the brief window
+    // before the new snapshot path was deployed (and any future regressions
+    // that leave snapshot empty). Bounded — only runs for stones that lack
+    // it, and the result is persisted so subsequent loads are pure reads.
+    const stoneRows = stones.rows;
+    const needsSnapshot = stoneRows.filter((r) => {
+      if (!r.consume_from_inventory || !r.stone_sku) return false;
+      const snap = r.snapshot;
+      if (snap == null) return true;
+      if (typeof snap === 'object' && Object.keys(snap).length === 0) return true;
+      return false;
+    });
+    if (needsSnapshot.length) {
+      await Promise.all(needsSnapshot.map(async (row) => {
+        try {
+          const built = await _buildStoneSnapshot(row.stone_sku, null);
+          if (built && Object.keys(built).length) {
+            const upd = await pool.query(
+              `UPDATE jewelry_item_stones
+                  SET snapshot = $1::jsonb, updated_at = NOW()
+                WHERE id = $2
+              RETURNING snapshot`,
+              [JSON.stringify(built), row.id]
+            );
+            row.snapshot = upd.rows[0]?.snapshot || built;
+          }
+        } catch (e) {
+          console.warn('Lazy snapshot backfill failed for stone', row.id, e.message);
+        }
+      }));
+    }
+
     res.json({
       item: item.rows[0],
-      stones: stones.rows,
+      stones: stoneRows,
       metals: metals.rows,
       costs: costs.rows,
       files: files.rows,
@@ -6496,6 +6529,10 @@ app.delete('/api/jewelry-items/:id/files/:fileId', async (req, res) => {
  */
 
 // Centralised auto-snapshot so single + batch paths stay in sync.
+// IMPORTANT: soap_stones is externally synced (SOAP) and column shape can
+// drift, so we use SELECT * + optional-chained column reads — a single
+// missing column would otherwise throw and we'd silently end up with an
+// empty snapshot (which is exactly what showed up in production).
 async function _buildStoneSnapshot(stoneSku, baseSnapshot) {
   let finalSnapshot = baseSnapshot && typeof baseSnapshot === 'object'
     ? { ...baseSnapshot }
@@ -6503,57 +6540,65 @@ async function _buildStoneSnapshot(stoneSku, baseSnapshot) {
   if (!stoneSku) return finalSnapshot;
   try {
     const sr = await pool.query(
-      `SELECT sku, category, shape, weight, color, clarity, lab, origin,
-              bruto_price, net_price, image, additional_pictures, certificate,
-              certificate_number, certificate_image, video,
-              measurements, ratio, comment, fluorescence, luster,
-              cut, polish, symmetry, table_percent, depth_percent,
-              fancy_intensity, fancy_color, fancy_overtone, pair_stone, branch
-         FROM soap_stones WHERE sku = $1 LIMIT 1`,
+      `SELECT * FROM soap_stones WHERE sku = $1 LIMIT 1`,
       [stoneSku]
     );
     const s = sr.rows[0];
-    if (!s) return finalSnapshot;
+    if (!s) {
+      console.warn(`Stone snapshot: SKU ${stoneSku} not found in soap_stones`);
+      return finalSnapshot;
+    }
+    // Helper to coerce numeric-ish columns that might come back as strings.
+    const num = (v) => (v != null && v !== '' && !isNaN(Number(v)) ? Number(v) : null);
+    const txt = (v) => (v != null && v !== '' ? v : null);
     const auto = {
-      shape:        s.shape || null,
-      weight:       s.weight != null ? Number(s.weight) : null,
-      color:        s.color || null,
-      clarity:      s.clarity || null,
-      lab:          s.lab || null,
-      origin:       s.origin || null,
-      category:     s.category || null,
+      shape:        txt(s.shape),
+      weight:       num(s.weight),
+      color:        txt(s.color),
+      clarity:      txt(s.clarity),
+      lab:          txt(s.lab),
+      origin:       txt(s.origin),
+      category:     txt(s.category),
       // Pre-existing field — keeps 'certificate' in case the column carries
       // a friendlier identifier; the explicit number/image are also captured.
-      certificate:  s.certificate || null,
-      certificateNumber: s.certificate_number || null,
-      certificateUrl:    s.certificate_image || null,
-      videoUrl:     s.video || null,
+      certificate:        txt(s.certificate),
+      certificateNumber:  txt(s.certificate_number),
+      certificateUrl:     txt(s.certificate_image) || txt(s.certificate_url),
+      videoUrl:           txt(s.video),
       // The spec block — what the user explicitly asked for.
-      measurements: s.measurements || null,
-      ratio:        s.ratio != null ? Number(s.ratio) : null,
-      cut:          s.cut || null,
-      polish:       s.polish || null,
-      symmetry:     s.symmetry || null,
-      tablePercent: s.table_percent != null ? Number(s.table_percent) : null,
-      depthPercent: s.depth_percent != null ? Number(s.depth_percent) : null,
-      fluorescence: s.fluorescence || null,
-      luster:       s.luster || null,
-      treatment:    s.comment || null,
-      fancyIntensity: s.fancy_intensity || null,
-      fancyColor:     s.fancy_color || null,
-      fancyOvertone:  s.fancy_overtone || null,
-      pairSku:        s.pair_stone || null,
-      sourcedFrom:    s.branch || null,
-      price:        s.bruto_price != null ? Number(s.bruto_price) : (s.net_price != null ? Number(s.net_price) : null),
-      imageUrl:     s.image || (s.additional_pictures ? String(s.additional_pictures).split(';')[0].trim() : null),
-      sourcedAt:    new Date().toISOString(),
+      measurements:   txt(s.measurements),
+      ratio:          num(s.ratio),
+      cut:            txt(s.cut),
+      polish:         txt(s.polish),
+      symmetry:       txt(s.symmetry),
+      tablePercent:   num(s.table_percent),
+      depthPercent:   num(s.depth_percent),
+      fluorescence:   txt(s.fluorescence),
+      luster:         txt(s.luster),
+      treatment:      txt(s.comment),
+      fancyIntensity: txt(s.fancy_intensity),
+      fancyColor:     txt(s.fancy_color),
+      fancyOvertone:  txt(s.fancy_overtone),
+      pairSku:        txt(s.pair_stone),
+      sourcedFrom:    txt(s.branch),
+      // Price priority: bruto > net > total_price > price_per_carat * weight.
+      price: num(s.bruto_price) ?? num(s.net_price) ?? num(s.total_price)
+              ?? (num(s.price_per_carat) != null && num(s.weight) != null
+                    ? num(s.price_per_carat) * num(s.weight)
+                    : null),
+      imageUrl: txt(s.image)
+              || (s.additional_pictures ? String(s.additional_pictures).split(';')[0].trim() || null : null),
+      sourcedAt: new Date().toISOString(),
     };
     finalSnapshot = {
       ...(finalSnapshot || {}),
       ...Object.fromEntries(Object.entries(auto).filter(([, v]) => v != null && v !== '')),
     };
   } catch (snapErr) {
-    console.warn('Stone snapshot lookup failed (continuing):', snapErr.message);
+    // Bubble enough info to the logs so this kind of issue isn't invisible
+    // again. Caller still proceeds with the original snapshot (or null) so
+    // the row gets inserted — better an empty snapshot than a 500.
+    console.error(`Stone snapshot lookup failed for ${stoneSku}:`, snapErr.message, snapErr.stack);
   }
   return finalSnapshot;
 }
