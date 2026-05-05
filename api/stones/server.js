@@ -6475,83 +6475,169 @@ app.delete('/api/jewelry-items/:id/files/:fileId', async (req, res) => {
   }
 });
 
-/* ---------- Jewelry Items: Stones (composition) ---------- */
+/* ---------- Jewelry Items: Stones (composition) ----------
+ *
+ * Accepts EITHER:
+ *   - { stoneSku, role, quantity, snapshot, notes, consumeFromInventory }
+ *     (single legacy payload — kept for backwards compatibility)
+ *   - { stones: [ { stoneSku, role, quantity, snapshot, notes, consumeFromInventory }, ... ] }
+ *     (batch payload — used by the queue UI in StonesPanel so the user can
+ *     add several stones in one click, including splitting a single SKU
+ *     across multiple roles like 12 sides + 8 accents from the same parcel)
+ *
+ * For each row we:
+ *   1) Conflict-check the SKU against rows on OTHER items (same-item rows
+ *      are allowed so split-by-role works).
+ *   2) Auto-snapshot a wide set of fields from soap_stones (measurements,
+ *      cut/polish/symmetry, table/depth %, fluorescence, certificate#,
+ *      video, fancy color, treatment, etc.) so the BOM keeps a faithful
+ *      record even after the inventory row changes.
+ *   3) Pick an initial inventory_status based on the parent item's stage.
+ */
+
+// Centralised auto-snapshot so single + batch paths stay in sync.
+async function _buildStoneSnapshot(stoneSku, baseSnapshot) {
+  let finalSnapshot = baseSnapshot && typeof baseSnapshot === 'object'
+    ? { ...baseSnapshot }
+    : (baseSnapshot ? baseSnapshot : null);
+  if (!stoneSku) return finalSnapshot;
+  try {
+    const sr = await pool.query(
+      `SELECT sku, category, shape, weight, color, clarity, lab, origin,
+              bruto_price, net_price, image, additional_pictures, certificate,
+              certificate_number, certificate_image, video,
+              measurements, ratio, comment, fluorescence, luster,
+              cut, polish, symmetry, table_percent, depth_percent,
+              fancy_intensity, fancy_color, fancy_overtone, pair_stone, branch
+         FROM soap_stones WHERE sku = $1 LIMIT 1`,
+      [stoneSku]
+    );
+    const s = sr.rows[0];
+    if (!s) return finalSnapshot;
+    const auto = {
+      shape:        s.shape || null,
+      weight:       s.weight != null ? Number(s.weight) : null,
+      color:        s.color || null,
+      clarity:      s.clarity || null,
+      lab:          s.lab || null,
+      origin:       s.origin || null,
+      category:     s.category || null,
+      // Pre-existing field — keeps 'certificate' in case the column carries
+      // a friendlier identifier; the explicit number/image are also captured.
+      certificate:  s.certificate || null,
+      certificateNumber: s.certificate_number || null,
+      certificateUrl:    s.certificate_image || null,
+      videoUrl:     s.video || null,
+      // The spec block — what the user explicitly asked for.
+      measurements: s.measurements || null,
+      ratio:        s.ratio != null ? Number(s.ratio) : null,
+      cut:          s.cut || null,
+      polish:       s.polish || null,
+      symmetry:     s.symmetry || null,
+      tablePercent: s.table_percent != null ? Number(s.table_percent) : null,
+      depthPercent: s.depth_percent != null ? Number(s.depth_percent) : null,
+      fluorescence: s.fluorescence || null,
+      luster:       s.luster || null,
+      treatment:    s.comment || null,
+      fancyIntensity: s.fancy_intensity || null,
+      fancyColor:     s.fancy_color || null,
+      fancyOvertone:  s.fancy_overtone || null,
+      pairSku:        s.pair_stone || null,
+      sourcedFrom:    s.branch || null,
+      price:        s.bruto_price != null ? Number(s.bruto_price) : (s.net_price != null ? Number(s.net_price) : null),
+      imageUrl:     s.image || (s.additional_pictures ? String(s.additional_pictures).split(';')[0].trim() : null),
+      sourcedAt:    new Date().toISOString(),
+    };
+    finalSnapshot = {
+      ...(finalSnapshot || {}),
+      ...Object.fromEntries(Object.entries(auto).filter(([, v]) => v != null && v !== '')),
+    };
+  } catch (snapErr) {
+    console.warn('Stone snapshot lookup failed (continuing):', snapErr.message);
+  }
+  return finalSnapshot;
+}
+
+// Reject if any OTHER jewelry item already reserves this SKU. Same-item rows
+// are explicitly allowed so the user can split one parcel across roles.
+async function _conflictForStoneOnItem(stoneSku, itemId) {
+  if (!stoneSku) return null;
+  const conflict = await pool.query(
+    `SELECT jis.id, jis.item_id, ji.sku AS jewelry_sku, ji.name AS jewelry_name, jis.inventory_status
+       FROM jewelry_item_stones jis
+       JOIN jewelry_items ji ON ji.id = jis.item_id
+      WHERE jis.stone_sku = $1
+        AND jis.consume_from_inventory = TRUE
+        AND (jis.inventory_status IS NULL OR jis.inventory_status NOT IN ('sold','returned'))
+        AND jis.item_id <> $2
+      LIMIT 1`,
+    [stoneSku, itemId]
+  );
+  return conflict.rows[0] || null;
+}
+
+function _initialInventoryStatusFromItemStatus(itemStatus) {
+  if (itemStatus === 'sold') return 'sold';
+  if (['setting','polishing','qc','ready'].includes(itemStatus)) return 'set';
+  return 'reserved';
+}
+
 app.post('/api/jewelry-items/:id/stones', async (req, res) => {
   try {
     const { id } = req.params;
-    const { stoneSku, role, quantity, snapshot, notes, consumeFromInventory } = req.body || {};
-    const consume = !!consumeFromInventory && !!stoneSku;
+    const body = req.body || {};
+    // Normalise to a list so single + batch payloads share one path.
+    const rows = Array.isArray(body.stones) && body.stones.length
+      ? body.stones
+      : [body];
 
-    // Hybrid model: when the user opts to consume the physical stone,
-    //   1) make sure no other piece is already holding it (active = reserved/set, not yet sold)
-    //   2) auto-snapshot real specs from soap_stones so the BOM stays trustworthy
-    let finalSnapshot = snapshot && typeof snapshot === 'object' ? { ...snapshot } : (snapshot ? snapshot : null);
-    if (consume) {
-      const conflict = await pool.query(
-        `SELECT jis.id, jis.item_id, ji.sku AS jewelry_sku, ji.name AS jewelry_name, jis.inventory_status
-           FROM jewelry_item_stones jis
-           JOIN jewelry_items ji ON ji.id = jis.item_id
-          WHERE jis.stone_sku = $1
-            AND jis.consume_from_inventory = TRUE
-            AND (jis.inventory_status IS NULL OR jis.inventory_status NOT IN ('sold','returned'))
-            AND jis.item_id <> $2
-          LIMIT 1`,
-        [stoneSku, id]
-      );
-      if (conflict.rows[0]) {
-        const c = conflict.rows[0];
+    // Pre-check every row's conflict so we either insert all or insert none —
+    // a partial batch on a multi-row pick is confusing for the user.
+    for (const row of rows) {
+      const wantsConsume = !!row.consumeFromInventory && !!row.stoneSku;
+      if (!wantsConsume) continue;
+      const c = await _conflictForStoneOnItem(row.stoneSku, id);
+      if (c) {
         return res.status(409).json({
-          error: `Stone ${stoneSku} is already reserved by ${c.jewelry_sku || ('job #' + c.item_id)}${c.jewelry_name ? ' (' + c.jewelry_name + ')' : ''}`,
+          error: `Stone ${row.stoneSku} is already reserved by ${c.jewelry_sku || ('job #' + c.item_id)}${c.jewelry_name ? ' (' + c.jewelry_name + ')' : ''}`,
           conflict: c,
         });
       }
-      try {
-        const sr = await pool.query(
-          `SELECT sku, category, shape, weight, color, clarity, lab, origin,
-                  bruto_price, net_price, image, additional_pictures, certificate
-             FROM soap_stones WHERE sku = $1 LIMIT 1`,
-          [stoneSku]
-        );
-        if (sr.rows[0]) {
-          const s = sr.rows[0];
-          const auto = {
-            shape: s.shape || null,
-            weight: s.weight != null ? Number(s.weight) : null,
-            color: s.color || null,
-            clarity: s.clarity || null,
-            lab: s.lab || null,
-            origin: s.origin || null,
-            category: s.category || null,
-            certificate: s.certificate || null,
-            price: s.bruto_price != null ? Number(s.bruto_price) : (s.net_price != null ? Number(s.net_price) : null),
-            imageUrl: s.image || (s.additional_pictures ? String(s.additional_pictures).split(';')[0].trim() : null),
-            sourcedAt: new Date().toISOString(),
-          };
-          finalSnapshot = { ...(finalSnapshot || {}), ...Object.fromEntries(Object.entries(auto).filter(([, v]) => v != null && v !== '')) };
-        }
-      } catch (snapErr) {
-        console.warn('Stone snapshot lookup failed (continuing):', snapErr.message);
-      }
     }
 
-    // Decide initial inventory_status from the parent item's current production status.
-    let inventoryStatus = null;
-    if (consume) {
-      const it = await pool.query(`SELECT status FROM jewelry_items WHERE id = $1 LIMIT 1`, [id]);
-      const itStatus = it.rows[0]?.status || null;
-      if (itStatus === 'sold') inventoryStatus = 'sold';
-      else if (['setting','polishing','qc','ready'].includes(itStatus)) inventoryStatus = 'set';
-      else inventoryStatus = 'reserved';
+    // Cache the parent item's stage once — every row gets the same initial
+    // inventory_status so we don't re-query inside the loop.
+    const itStatusRes = await pool.query(`SELECT status FROM jewelry_items WHERE id = $1 LIMIT 1`, [id]);
+    const itStatus = itStatusRes.rows[0]?.status || null;
+    const consumedInitialStatus = _initialInventoryStatusFromItemStatus(itStatus);
+
+    const inserted = [];
+    for (const row of rows) {
+      const consume = !!row.consumeFromInventory && !!row.stoneSku;
+      const finalSnapshot = consume
+        ? await _buildStoneSnapshot(row.stoneSku, row.snapshot)
+        : (row.snapshot && typeof row.snapshot === 'object' ? { ...row.snapshot } : (row.snapshot || null));
+      const r = await pool.query(
+        `INSERT INTO jewelry_item_stones (item_id, stone_sku, role, quantity, snapshot, notes, consume_from_inventory, inventory_status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [
+          id,
+          row.stoneSku || null,
+          row.role || null,
+          row.quantity || 1,
+          finalSnapshot ? JSON.stringify(finalSnapshot) : null,
+          row.notes || null,
+          consume,
+          consume ? consumedInitialStatus : null,
+        ]
+      );
+      inserted.push(r.rows[0]);
     }
 
-    const r = await pool.query(
-      `INSERT INTO jewelry_item_stones (item_id, stone_sku, role, quantity, snapshot, notes, consume_from_inventory, inventory_status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [id, stoneSku || null, role || null, quantity || 1, finalSnapshot ? JSON.stringify(finalSnapshot) : null, notes || null, consume, inventoryStatus]
-    );
-    res.json({ stone: r.rows[0] });
+    // Backwards-compatible response: return `stone` for single, plus `stones` for batch.
+    res.json({ stone: inserted[0], stones: inserted });
 
-    // Look up the parent item's name + owner so the activity row reads naturally.
+    // ---- Activity log (non-blocking) ----
     const itemRes = await pool.query(
       `SELECT user_id, name, sku FROM jewelry_items WHERE id = $1`,
       [id]
@@ -6560,17 +6646,33 @@ app.post('/api/jewelry-items/:id/stones', async (req, res) => {
     if (item) {
       const { actorId, actorName } = getActor(req);
       const itemLabel = item.name || item.sku || `#${id}`;
-      logActivity({
-        userId:     item.user_id,
-        actorId, actorName,
-        entityType: 'jewelry_item',
-        entityId:   id,
-        action:     consume ? 'stone_consumed' : 'stone_added',
-        summary:    stoneSku
-          ? `${consume ? 'Consumed' : 'Added'} stone ${stoneSku} on ${itemLabel}`
-          : `Added stone slot on ${itemLabel}`,
-        related:    stoneSku ? [{ type: 'stone', id: stoneSku }] : null,
-      });
+      if (inserted.length === 1) {
+        const only = inserted[0];
+        const consumed = !!only.consume_from_inventory;
+        logActivity({
+          userId:     item.user_id,
+          actorId, actorName,
+          entityType: 'jewelry_item',
+          entityId:   id,
+          action:     consumed ? 'stone_consumed' : 'stone_added',
+          summary:    only.stone_sku
+            ? `${consumed ? 'Consumed' : 'Added'} stone ${only.stone_sku} on ${itemLabel}`
+            : `Added stone slot on ${itemLabel}`,
+          related:    only.stone_sku ? [{ type: 'stone', id: only.stone_sku }] : null,
+        });
+      } else {
+        const distinctSkus = Array.from(new Set(inserted.map((s) => s.stone_sku).filter(Boolean)));
+        const anyConsumed = inserted.some((s) => s.consume_from_inventory);
+        logActivity({
+          userId:     item.user_id,
+          actorId, actorName,
+          entityType: 'jewelry_item',
+          entityId:   id,
+          action:     anyConsumed ? 'stone_consumed' : 'stone_added',
+          summary:    `${anyConsumed ? 'Consumed' : 'Added'} ${inserted.length} stones on ${itemLabel}`,
+          related:    distinctSkus.length ? distinctSkus.map((sku) => ({ type: 'stone', id: sku })) : null,
+        });
+      }
     }
   } catch (e) {
     console.error('POST jewelry stone error:', e);
