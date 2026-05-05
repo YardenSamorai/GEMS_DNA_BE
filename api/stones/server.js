@@ -5956,6 +5956,20 @@ const jewelryReadyPromise = (async () => {
     for (const sql of templateMigrations) {
       try { await pool.query(sql); } catch (e) { console.warn('Template migration warn:', e.message); }
     }
+
+    // Phase F (3D viewer): pair each jewelry_item with a model living in
+    // iJewel3D Drive. ijewel_file_id is the per-item GLB/configurator file
+    // id; ijewel_instance is the workspace name (e.g. "drive"). Most users
+    // will have a single workspace and rely on the FE-level default, so the
+    // per-item override is nullable. When both are present the 3D Preview
+    // tab swaps the procedural placeholder for the real iJewel viewer.
+    const ijewelMigrations = [
+      "ALTER TABLE jewelry_items ADD COLUMN IF NOT EXISTS ijewel_file_id TEXT",
+      "ALTER TABLE jewelry_items ADD COLUMN IF NOT EXISTS ijewel_instance TEXT",
+    ];
+    for (const sql of ijewelMigrations) {
+      try { await pool.query(sql); } catch (e) { console.warn('iJewel migration warn:', e.message); }
+    }
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_item_stones_item_id ON jewelry_item_stones(item_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_item_files_item_id ON jewelry_item_files(item_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_jewelry_item_history_item_id ON jewelry_item_history(item_id)`);
@@ -6274,6 +6288,7 @@ app.put('/api/jewelry-items/:id', async (req, res) => {
       'name', 'type', 'category', 'contact_id', 'deal_id',
       'description', 'internal_notes', 'size', 'weight_grams', 'metal_summary',
       'cover_image_url', 'markup_percent', 'sale_price', 'location',
+      'ijewel_file_id', 'ijewel_instance',
     ];
     const map = {
       name: 'name', type: 'type', category: 'category',
@@ -6282,6 +6297,7 @@ app.put('/api/jewelry-items/:id', async (req, res) => {
       size: 'size', weightGrams: 'weight_grams', metalSummary: 'metal_summary',
       coverImageUrl: 'cover_image_url', markupPercent: 'markup_percent',
       salePrice: 'sale_price', location: 'location',
+      ijewelFileId: 'ijewel_file_id', ijewelInstance: 'ijewel_instance',
     };
     const sets = [];
     const params = [];
