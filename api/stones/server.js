@@ -40,6 +40,90 @@ const decrypt = (cipher) => {
 };
 
 /* =========================================================
+   Activity log (Sprint 2 / Phase 1)
+   ---------------------------------------------------------
+   Single source-of-truth feed for "what just happened in the
+   workspace". Every meaningful mutation (create/update/delete,
+   status change, link, etc.) calls logActivity() so we can
+   build per-entity timelines, audit trails and a real activity
+   feed in the Overview tab.
+
+   Design notes:
+   - Fire-and-forget: failures NEVER bubble up to the parent
+     route. Activity logging is best-effort by definition.
+   - Actor info comes from x-actor-id / x-actor-name headers
+     (FE will start sending these in Phase 2). Until then we
+     fall back to actorId = userId, which is correct for the
+     current single-user-per-workspace assumption.
+   - `related` is a JSONB array of {type,id,name} pointers used
+     by the FE to render backlinks ("→ contact: Liora Kirsch").
+   ========================================================= */
+function getActor(req) {
+  return {
+    actorId:
+      req?.headers?.['x-actor-id'] ||
+      req?.body?.actorId ||
+      req?.body?.userId ||
+      null,
+    actorName:
+      req?.headers?.['x-actor-name'] ||
+      req?.body?.actorName ||
+      null,
+  };
+}
+
+async function logActivity({
+  userId,
+  actorId,
+  actorName,
+  entityType,
+  entityId,
+  action,
+  summary,
+  changes,
+  related,
+}) {
+  if (!userId || !entityType || !entityId || !action) return;
+  try {
+    await pool.query(
+      `INSERT INTO activity_log
+         (user_id, actor_id, actor_name, entity_type, entity_id,
+          action, summary, changes, related)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb)`,
+      [
+        userId,
+        actorId || userId,
+        actorName || null,
+        entityType,
+        String(entityId),
+        action,
+        summary || null,
+        JSON.stringify(changes || null),
+        JSON.stringify(related || null),
+      ]
+    );
+  } catch (e) {
+    // Don't fail the parent operation if logging hiccups
+    console.warn('activity_log insert failed (non-fatal):', e.message);
+  }
+}
+
+// Diff two row snapshots and return only the fields that actually changed.
+// Used by UPDATE endpoints to populate `changes` with a compact { field: {from,to} } map.
+function diffRows(before, after, keys) {
+  if (!before || !after) return null;
+  const out = {};
+  for (const k of keys) {
+    const a = before[k];
+    const b = after[k];
+    const aJson = a && typeof a === 'object' ? JSON.stringify(a) : a;
+    const bJson = b && typeof b === 'object' ? JSON.stringify(b) : b;
+    if (aJson !== bJson) out[k] = { from: a ?? null, to: b ?? null };
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/* =========================================================
    /api/stones – כל האבנים מטבלת stones (לא selector)
    ========================================================= */
 app.get("/api/stones", async (req, res) => {
@@ -1536,6 +1620,67 @@ const crmReadyPromise = (async () => {
       )
     `);
 
+    // Sprint 2 / Phase 1 — unified activity_log.
+    // entity_id is TEXT (not INTEGER) so the same table can hold rows for
+    // both serial-id entities (deals, tasks) and string-keyed ones (stone SKUs).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS activity_log (
+        id           BIGSERIAL PRIMARY KEY,
+        user_id      TEXT NOT NULL,
+        actor_id     TEXT,
+        actor_name   TEXT,
+        entity_type  TEXT NOT NULL,
+        entity_id    TEXT NOT NULL,
+        action       TEXT NOT NULL,
+        summary      TEXT,
+        changes      JSONB,
+        related      JSONB,
+        occurred_at  TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_user_time   ON activity_log(user_id, occurred_at DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_entity      ON activity_log(entity_type, entity_id, occurred_at DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_actor_time  ON activity_log(actor_id, occurred_at DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_action_time ON activity_log(action, occurred_at DESC)`);
+
+    // One-time backfill: when activity_log is empty, seed it with a
+    // 'created' row per existing entity using the row's own created_at /
+    // occurred_at. Without this, the Overview feed would look empty for
+    // existing workspaces on day-1 of the rollout.
+    try {
+      const { rows: [{ count }] } = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM activity_log`
+      );
+      if (count === 0) {
+        await pool.query(`
+          INSERT INTO activity_log
+            (user_id, actor_id, actor_name, entity_type, entity_id, action, summary, occurred_at)
+          SELECT user_id, user_id, NULL, 'contact', id::text, 'created',
+                 'Created contact ' || COALESCE(NULLIF(name,''), '#' || id), created_at
+            FROM crm_contacts WHERE created_at IS NOT NULL
+          UNION ALL
+          SELECT user_id, user_id, NULL, 'deal', id::text, 'created',
+                 'Created deal: ' || COALESCE(NULLIF(title,''), '#' || id), created_at
+            FROM crm_deals WHERE created_at IS NOT NULL
+          UNION ALL
+          SELECT user_id, user_id, NULL, 'jewelry_item', id::text, 'created',
+                 COALESCE('Added jewelry: ' || NULLIF(name,''), 'Added jewelry ' || sku), created_at
+            FROM jewelry_items WHERE created_at IS NOT NULL
+          UNION ALL
+          SELECT user_id, user_id, NULL, 'task', id::text, 'created',
+                 'Created task: ' || COALESCE(NULLIF(title,''), '#' || id), created_at
+            FROM crm_tasks WHERE created_at IS NOT NULL
+          UNION ALL
+          SELECT user_id, user_id, NULL, 'interaction', id::text, COALESCE(type,'logged'),
+                 COALESCE(NULLIF(subject,''), 'Logged interaction'), occurred_at
+            FROM crm_interactions WHERE occurred_at IS NOT NULL
+        `);
+        console.log('🧬 activity_log: backfilled from existing entities');
+      }
+    } catch (e) {
+      console.warn('activity_log backfill skipped:', e.message);
+    }
+
     // Add new columns to crm_contacts (idempotent)
     const newCols = [
       "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS title TEXT",
@@ -1948,6 +2093,19 @@ app.post("/api/crm/contacts", async (req, res) => {
       ]
     );
     res.status(201).json(result.rows[0]);
+
+    const { actorId, actorName } = getActor(req);
+    logActivity({
+      userId,
+      actorId, actorName,
+      entityType: 'contact',
+      entityId:   result.rows[0].id,
+      action:     'created',
+      summary:    `Created contact ${result.rows[0].name}`,
+      related: result.rows[0].folder_id
+        ? [{ type: 'folder', id: result.rows[0].folder_id }]
+        : null,
+    });
   } catch (error) {
     console.error("Error creating contact:", error);
     res.status(500).json({ error: error.message || "Internal server error" });
@@ -1982,6 +2140,10 @@ app.put("/api/crm/contacts/:id", async (req, res) => {
     fields.push(`updated_at = NOW()`);
     if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
 
+    // Snapshot the row before mutating so we can compute a `changes` diff.
+    const beforeRes = await pool.query("SELECT * FROM crm_contacts WHERE id = $1", [id]);
+    const before = beforeRes.rows[0] || null;
+
     values.push(id);
     const result = await pool.query(
       `UPDATE crm_contacts SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
@@ -1989,6 +2151,26 @@ app.put("/api/crm/contacts/:id", async (req, res) => {
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Contact not found" });
     res.json(result.rows[0]);
+
+    const after = result.rows[0];
+    const changes = diffRows(before, after, allowed);
+    if (changes && before) {
+      const { actorId, actorName } = getActor(req);
+      const changedKeys = Object.keys(changes);
+      const summary =
+        changedKeys.length === 1
+          ? `Updated ${changedKeys[0]} on ${after.name}`
+          : `Updated ${after.name} (${changedKeys.length} fields)`;
+      logActivity({
+        userId:     after.user_id,
+        actorId, actorName,
+        entityType: 'contact',
+        entityId:   after.id,
+        action:     'updated',
+        summary,
+        changes,
+      });
+    }
   } catch (error) {
     console.error("Error updating contact:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -1998,8 +2180,26 @@ app.put("/api/crm/contacts/:id", async (req, res) => {
 app.delete("/api/crm/contacts/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    // Capture name + owner before delete so the activity row is human-readable.
+    const beforeRes = await pool.query(
+      "SELECT user_id, name FROM crm_contacts WHERE id = $1",
+      [id]
+    );
     await pool.query("DELETE FROM crm_contacts WHERE id = $1", [id]);
     res.json({ success: true });
+
+    const before = beforeRes.rows[0];
+    if (before) {
+      const { actorId, actorName } = getActor(req);
+      logActivity({
+        userId:     before.user_id,
+        actorId, actorName,
+        entityType: 'contact',
+        entityId:   id,
+        action:     'deleted',
+        summary:    `Deleted contact ${before.name}`,
+      });
+    }
   } catch (error) {
     console.error("Error deleting contact:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -2018,6 +2218,19 @@ app.post("/api/crm/contacts/bulk-delete", async (req, res) => {
       [userId, ids.map(Number)]
     );
     res.json({ success: true, deleted: result.rowCount });
+
+    if (result.rowCount > 0) {
+      const { actorId, actorName } = getActor(req);
+      logActivity({
+        userId,
+        actorId, actorName,
+        entityType: 'contact',
+        entityId:   'bulk',
+        action:     'bulk_deleted',
+        summary:    `Bulk deleted ${result.rowCount} contact${result.rowCount === 1 ? '' : 's'}`,
+        related:    result.rows.map(r => ({ type: 'contact', id: r.id })),
+      });
+    }
   } catch (error) {
     console.error("Bulk delete error:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -2052,6 +2265,20 @@ app.post("/api/crm/contacts/bulk-tag", async (req, res) => {
 
     const result = await pool.query(sql, [JSON.stringify(safeTag), userId, ids.map(Number)]);
     res.json({ success: true, updated: result.rowCount });
+
+    if (result.rowCount > 0) {
+      const { actorId, actorName } = getActor(req);
+      logActivity({
+        userId,
+        actorId, actorName,
+        entityType: 'contact',
+        entityId:   'bulk',
+        action:     action === 'add' ? 'tagged' : 'untagged',
+        summary:    `${action === 'add' ? 'Tagged' : 'Removed tag'} "${safeTag}" ${action === 'add' ? 'on' : 'from'} ${result.rowCount} contact${result.rowCount === 1 ? '' : 's'}`,
+        changes:    { tag: safeTag, action },
+        related:    result.rows.map(r => ({ type: 'contact', id: r.id })),
+      });
+    }
   } catch (error) {
     console.error("Bulk tag error:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -2578,6 +2805,26 @@ app.post("/api/crm/interactions", async (req, res) => {
     );
     await pool.query("UPDATE crm_contacts SET last_contact_at = NOW(), updated_at = NOW() WHERE id = $1", [contactId]);
     res.status(201).json(result.rows[0]);
+
+    // Mirror into the unified activity log so the contact's timeline + the
+    // workspace feed see the same interaction without a UNION at read time.
+    const inter = result.rows[0];
+    const { actorId, actorName } = getActor(req);
+    const meta = inter.metadata || {};
+    const sku = meta.sku || meta.dna_sku;
+    logActivity({
+      userId,
+      actorId, actorName,
+      entityType: 'interaction',
+      entityId:   inter.id,
+      action:     inter.type || 'logged',
+      summary:    inter.subject || `Logged ${inter.type}`,
+      related: [
+        { type: 'contact', id: contactId },
+        dealId ? { type: 'deal', id: dealId } : null,
+        sku    ? { type: 'stone', id: sku }  : null,
+      ].filter(Boolean),
+    });
   } catch (error) {
     console.error("Error creating interaction:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -2586,8 +2833,30 @@ app.post("/api/crm/interactions", async (req, res) => {
 
 app.delete("/api/crm/interactions/:id", async (req, res) => {
   try {
-    await pool.query("DELETE FROM crm_interactions WHERE id = $1", [req.params.id]);
+    const { id } = req.params;
+    const beforeRes = await pool.query(
+      "SELECT user_id, contact_id, deal_id, subject, type FROM crm_interactions WHERE id = $1",
+      [id]
+    );
+    await pool.query("DELETE FROM crm_interactions WHERE id = $1", [id]);
     res.json({ success: true });
+
+    const before = beforeRes.rows[0];
+    if (before) {
+      const { actorId, actorName } = getActor(req);
+      logActivity({
+        userId:     before.user_id,
+        actorId, actorName,
+        entityType: 'interaction',
+        entityId:   id,
+        action:     'deleted',
+        summary:    `Deleted interaction: ${before.subject || before.type || '#' + id}`,
+        related: [
+          before.contact_id ? { type: 'contact', id: before.contact_id } : null,
+          before.deal_id    ? { type: 'deal',    id: before.deal_id    } : null,
+        ].filter(Boolean),
+      });
+    }
   } catch (error) {
     console.error("Error deleting interaction:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -2678,6 +2947,20 @@ app.post("/api/crm/deals", async (req, res) => {
       }
     }
     res.status(201).json(deal);
+
+    const { actorId, actorName } = getActor(req);
+    logActivity({
+      userId,
+      actorId, actorName,
+      entityType: 'deal',
+      entityId:   deal.id,
+      action:     'created',
+      summary:    `Created deal "${deal.title}"${deal.value ? ` (${deal.currency || 'USD'} ${deal.value})` : ''}`,
+      related: [
+        contactId ? { type: 'contact', id: contactId } : null,
+        ...(Array.isArray(items) ? items.filter(i => i.sku).map(i => ({ type: 'stone', id: i.sku })) : []),
+      ].filter(Boolean),
+    });
   } catch (error) {
     console.error("Error creating deal:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -2706,6 +2989,10 @@ app.put("/api/crm/deals/:id", async (req, res) => {
     fields.push(`updated_at = NOW()`);
     if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
 
+    // Snapshot before so we can detect stage transitions and field diffs.
+    const beforeRes = await pool.query("SELECT * FROM crm_deals WHERE id = $1", [id]);
+    const before = beforeRes.rows[0] || null;
+
     values.push(id);
     const result = await pool.query(
       `UPDATE crm_deals SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
@@ -2713,6 +3000,32 @@ app.put("/api/crm/deals/:id", async (req, res) => {
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Deal not found" });
     res.json(result.rows[0]);
+
+    const after = result.rows[0];
+    const changes = diffRows(before, after, allowed);
+    if (changes && before) {
+      const { actorId, actorName } = getActor(req);
+      const stageChanged = changes.stage;
+      // Stage transitions are first-class business events — give them their
+      // own action so the FE can render them with a different icon/colour.
+      const isStageChange = !!stageChanged && Object.keys(changes).length === 1;
+      const action = isStageChange ? 'stage_changed' : 'updated';
+      const summary = stageChanged
+        ? `Moved deal "${after.title}" → ${stageChanged.to}`
+        : (Object.keys(changes).length === 1
+            ? `Updated ${Object.keys(changes)[0]} on "${after.title}"`
+            : `Updated "${after.title}" (${Object.keys(changes).length} fields)`);
+      logActivity({
+        userId:     after.user_id,
+        actorId, actorName,
+        entityType: 'deal',
+        entityId:   after.id,
+        action,
+        summary,
+        changes,
+        related:    after.contact_id ? [{ type: 'contact', id: after.contact_id }] : null,
+      });
+    }
   } catch (error) {
     console.error("Error updating deal:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -2721,8 +3034,27 @@ app.put("/api/crm/deals/:id", async (req, res) => {
 
 app.delete("/api/crm/deals/:id", async (req, res) => {
   try {
-    await pool.query("DELETE FROM crm_deals WHERE id = $1", [req.params.id]);
+    const { id } = req.params;
+    const beforeRes = await pool.query(
+      "SELECT user_id, title, contact_id FROM crm_deals WHERE id = $1",
+      [id]
+    );
+    await pool.query("DELETE FROM crm_deals WHERE id = $1", [id]);
     res.json({ success: true });
+
+    const before = beforeRes.rows[0];
+    if (before) {
+      const { actorId, actorName } = getActor(req);
+      logActivity({
+        userId:     before.user_id,
+        actorId, actorName,
+        entityType: 'deal',
+        entityId:   id,
+        action:     'deleted',
+        summary:    `Deleted deal "${before.title}"`,
+        related:    before.contact_id ? [{ type: 'contact', id: before.contact_id }] : null,
+      });
+    }
   } catch (error) {
     console.error("Error deleting deal:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -2748,6 +3080,23 @@ app.post("/api/crm/deals/:id/items", async (req, res) => {
     }
     await pool.query("UPDATE crm_deals SET updated_at = NOW() WHERE id = $1", [id]);
     res.status(201).json(inserted);
+
+    if (inserted.length > 0) {
+      const dealRes = await pool.query("SELECT user_id, title FROM crm_deals WHERE id = $1", [id]);
+      const deal = dealRes.rows[0];
+      if (deal) {
+        const { actorId, actorName } = getActor(req);
+        logActivity({
+          userId:     deal.user_id,
+          actorId, actorName,
+          entityType: 'deal',
+          entityId:   id,
+          action:     'items_added',
+          summary:    `Added ${inserted.length} item${inserted.length === 1 ? '' : 's'} to "${deal.title}"`,
+          related:    inserted.filter(it => it.sku).map(it => ({ type: 'stone', id: it.sku })),
+        });
+      }
+    }
   } catch (error) {
     console.error("Error adding deal items:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -2832,6 +3181,21 @@ app.post("/api/crm/tasks", async (req, res) => {
       [userId, contactId || null, dealId || null, title.trim(), description || null, dueDate || null, priority || 'normal', status || 'pending']
     );
     res.status(201).json(result.rows[0]);
+
+    const task = result.rows[0];
+    const { actorId, actorName } = getActor(req);
+    logActivity({
+      userId,
+      actorId, actorName,
+      entityType: 'task',
+      entityId:   task.id,
+      action:     'created',
+      summary:    `Created task: ${task.title}`,
+      related: [
+        contactId ? { type: 'contact', id: contactId } : null,
+        dealId    ? { type: 'deal',    id: dealId    } : null,
+      ].filter(Boolean),
+    });
   } catch (error) {
     console.error("Error creating task:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -2857,12 +3221,42 @@ app.put("/api/crm/tasks/:id", async (req, res) => {
     }
     fields.push(`updated_at = NOW()`);
     if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
+
+    const beforeRes = await pool.query("SELECT * FROM crm_tasks WHERE id = $1", [id]);
+    const before = beforeRes.rows[0] || null;
+
     values.push(id);
     const result = await pool.query(
       `UPDATE crm_tasks SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
       values
     );
     res.json(result.rows[0]);
+
+    const after = result.rows[0];
+    const changes = diffRows(before, after, allowed);
+    if (changes && before) {
+      const { actorId, actorName } = getActor(req);
+      const justCompleted = changes.status && changes.status.to === 'done';
+      const action = justCompleted ? 'completed' : 'updated';
+      const summary = justCompleted
+        ? `Completed task: ${after.title}`
+        : (Object.keys(changes).length === 1
+            ? `Updated ${Object.keys(changes)[0]} on task "${after.title}"`
+            : `Updated task "${after.title}" (${Object.keys(changes).length} fields)`);
+      logActivity({
+        userId:     after.user_id,
+        actorId, actorName,
+        entityType: 'task',
+        entityId:   after.id,
+        action,
+        summary,
+        changes,
+        related: [
+          after.contact_id ? { type: 'contact', id: after.contact_id } : null,
+          after.deal_id    ? { type: 'deal',    id: after.deal_id    } : null,
+        ].filter(Boolean),
+      });
+    }
   } catch (error) {
     console.error("Error updating task:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -2871,8 +3265,30 @@ app.put("/api/crm/tasks/:id", async (req, res) => {
 
 app.delete("/api/crm/tasks/:id", async (req, res) => {
   try {
-    await pool.query("DELETE FROM crm_tasks WHERE id = $1", [req.params.id]);
+    const { id } = req.params;
+    const beforeRes = await pool.query(
+      "SELECT user_id, title, contact_id, deal_id FROM crm_tasks WHERE id = $1",
+      [id]
+    );
+    await pool.query("DELETE FROM crm_tasks WHERE id = $1", [id]);
     res.json({ success: true });
+
+    const before = beforeRes.rows[0];
+    if (before) {
+      const { actorId, actorName } = getActor(req);
+      logActivity({
+        userId:     before.user_id,
+        actorId, actorName,
+        entityType: 'task',
+        entityId:   id,
+        action:     'deleted',
+        summary:    `Deleted task: ${before.title}`,
+        related: [
+          before.contact_id ? { type: 'contact', id: before.contact_id } : null,
+          before.deal_id    ? { type: 'deal',    id: before.deal_id    } : null,
+        ].filter(Boolean),
+      });
+    }
   } catch (error) {
     console.error("Error deleting task:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -3823,112 +4239,35 @@ app.get("/api/dashboard/overview", async (req, res) => {
       });
     }
 
-    /* ── Activity feed (proxy until Sprint 2 ships activity_log) ── */
-    const [
-      recentDealMoves,
-      recentJewelryMoves,
-      recentNewLeads,
-      recentSold,
-    ] = await Promise.all([
-      // Deals updated in the last 14 days
-      safe(
-        () => pool.query(
-          `SELECT d.id, d.title, d.stage, d.updated_at, d.contact_id, c.name AS contact_name
-           FROM crm_deals d
-           LEFT JOIN crm_contacts c ON c.id = d.contact_id
-           WHERE d.user_id = $1 AND d.updated_at >= NOW() - INTERVAL '14 days'
-           ORDER BY d.updated_at DESC
-           LIMIT 8`,
-          [userId]
-        ),
-        { rows: [] }
+    /* ── Activity feed (Sprint 2 / Phase 1: real activity_log) ── */
+    // Per-row link is computed FE-side from entity_type/entity_id/related so
+    // we keep the BE payload schema-flat. Filtered to last 14 days to match
+    // the prior proxy feed's window.
+    const activityRes = await safe(
+      () => pool.query(
+        `SELECT id, actor_id, actor_name, entity_type, entity_id,
+                action, summary, changes, related, occurred_at
+           FROM activity_log
+          WHERE user_id = $1
+            AND occurred_at >= NOW() - INTERVAL '14 days'
+          ORDER BY occurred_at DESC NULLS LAST, id DESC
+          LIMIT 20`,
+        [userId]
       ),
-      // Jewelry updated in the last 14 days
-      safe(
-        () => pool.query(
-          `SELECT j.id, j.sku, j.name, j.status, j.updated_at,
-                  c.name AS contact_name
-           FROM jewelry_items j
-           LEFT JOIN crm_contacts c ON c.id = j.contact_id
-           WHERE j.user_id = $1 AND j.updated_at >= NOW() - INTERVAL '14 days'
-           ORDER BY j.updated_at DESC
-           LIMIT 8`,
-          [userId]
-        ),
-        { rows: [] }
-      ),
-      // New DNA leads in the last 14 days
-      safe(
-        () => pool.query(
-          `SELECT id, name, email, dna_sku, created_at
-           FROM crm_contacts
-           WHERE shared = TRUE AND source = 'dna_lead'
-             AND created_at >= NOW() - INTERVAL '14 days'
-           ORDER BY created_at DESC
-           LIMIT 6`
-        ),
-        { rows: [] }
-      ),
-      // Recently sold items
-      safe(
-        () => pool.query(
-          `SELECT j.id, j.sku, j.name, j.sale_price, j.sold_at,
-                  c.name AS contact_name
-           FROM jewelry_items j
-           LEFT JOIN crm_contacts c ON c.id = j.sold_to
-           WHERE j.user_id = $1 AND j.sold_at >= NOW() - INTERVAL '14 days'
-           ORDER BY j.sold_at DESC
-           LIMIT 5`,
-          [userId]
-        ),
-        { rows: [] }
-      ),
-    ]);
-
-    const activity = [];
-    for (const d of recentDealMoves.rows) {
-      activity.push({
-        type: "deal_update",
-        id: `act-deal-${d.id}-${new Date(d.updated_at).getTime()}`,
-        label: `Deal "${d.title}" — ${d.stage}`,
-        sub: d.contact_name || "",
-        ts: d.updated_at,
-        link: d.contact_id ? `/crm/customers/${d.contact_id}` : "/crm/deals",
-      });
-    }
-    for (const j of recentJewelryMoves.rows) {
-      activity.push({
-        type: "jewelry_update",
-        id: `act-jw-${j.id}-${new Date(j.updated_at).getTime()}`,
-        label: `${j.sku || j.name} → ${j.status}`,
-        sub: j.contact_name ? `for ${j.contact_name}` : "",
-        ts: j.updated_at,
-        link: `/jewelry/items/${j.id}`,
-      });
-    }
-    for (const l of recentNewLeads.rows) {
-      activity.push({
-        type: "new_lead",
-        id: `act-lead-${l.id}`,
-        label: `New DNA lead: ${l.name}`,
-        sub: l.dna_sku ? `via ${l.dna_sku}` : (l.email || ""),
-        ts: l.created_at,
-        link: `/crm/customers/${l.id}`,
-      });
-    }
-    for (const s of recentSold.rows) {
-      activity.push({
-        type: "jewelry_sold",
-        id: `act-sold-${s.id}`,
-        label: `${s.sku || s.name} sold`,
-        sub: `${s.contact_name || "Customer"} · $${Math.round(Number(s.sale_price || 0)).toLocaleString("en-US")}`,
-        ts: s.sold_at,
-        link: `/jewelry/items/${s.id}`,
-      });
-    }
-    // Sort all activity by timestamp DESC and cap at 15
-    activity.sort((a, b) => new Date(b.ts) - new Date(a.ts));
-    const activityCapped = activity.slice(0, 15);
+      { rows: [] }
+    );
+    const activityCapped = activityRes.rows.map(r => ({
+      id:          `act-${r.id}`,
+      type:        `${r.entity_type}_${r.action}`,
+      entity_type: r.entity_type,
+      entity_id:   r.entity_id,
+      action:      r.action,
+      label:       r.summary || `${r.action} ${r.entity_type}`,
+      sub:         r.actor_name || '',
+      ts:          r.occurred_at,
+      changes:     r.changes,
+      related:     r.related,
+    }));
 
     /* ── Response ────────────────────────────────────────── */
     res.json({
@@ -3971,6 +4310,65 @@ app.get("/api/dashboard/overview", async (req, res) => {
     });
   } catch (e) {
     console.error("overview fatal:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =========================================================
+   /api/activity – Sprint 2 / Phase 1 read endpoint
+   Returns rows from activity_log, optionally filtered by entity,
+   actor, action type and time range. Used by:
+     - OverviewTab "What just happened" feed (no filters)
+     - Per-entity timelines (entityType + entityId)
+     - Per-user audit views (actorId)
+   ========================================================= */
+app.get("/api/activity", async (req, res) => {
+  try {
+    const {
+      userId,
+      entityType,
+      entityId,
+      actorId,
+      action,
+      since,
+      until,
+      limit = 50,
+      offset = 0,
+    } = req.query;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const conds = ['user_id = $1'];
+    const vals  = [userId];
+    let i = 2;
+    if (entityType) { conds.push(`entity_type = $${i++}`); vals.push(entityType); }
+    if (entityId)   { conds.push(`entity_id = $${i++}`);   vals.push(String(entityId)); }
+    if (actorId)    { conds.push(`actor_id = $${i++}`);    vals.push(actorId); }
+    if (action)     { conds.push(`action = $${i++}`);      vals.push(action); }
+    if (since)      { conds.push(`occurred_at >= $${i++}`); vals.push(new Date(since)); }
+    if (until)      { conds.push(`occurred_at <  $${i++}`); vals.push(new Date(until)); }
+
+    const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
+    const off = Math.max(parseInt(offset, 10) || 0, 0);
+    vals.push(lim, off);
+
+    const r = await pool.query(
+      `SELECT id, actor_id, actor_name, entity_type, entity_id,
+              action, summary, changes, related, occurred_at
+         FROM activity_log
+        WHERE ${conds.join(' AND ')}
+        ORDER BY occurred_at DESC NULLS LAST, id DESC
+        LIMIT $${i++} OFFSET $${i}`,
+      vals
+    );
+
+    res.json({
+      items: r.rows,
+      limit: lim,
+      offset: off,
+      has_more: r.rows.length === lim,
+    });
+  } catch (e) {
+    console.error('/api/activity error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -4069,7 +4467,7 @@ app.get("/api/dashboard/reports", async (req, res) => {
               WHERE user_id = $1 AND status = 'sold' AND sold_to IS NOT NULL AND sold_to <> contact_id
               GROUP BY sold_to
            )
-           SELECT c.id, c.first_name, c.last_name, c.business_name, c.contact_type,
+           SELECT c.id, c.name, c.company, c.type,
                   COALESCE(MAX(wd.deal_value),0)::numeric  AS total_deal_value,
                   COALESCE(MAX(wd.deal_count),0)::int      AS deals_won,
                   COALESCE(SUM(sp.jew_value),0)::numeric   AS total_jewelry_value,
@@ -5711,6 +6109,20 @@ app.post('/api/jewelry-items', async (req, res) => {
     );
 
     res.json({ item: r.rows[0] });
+
+    const { actorId, actorName } = getActor(req);
+    logActivity({
+      userId,
+      actorId, actorName,
+      entityType: 'jewelry_item',
+      entityId:   r.rows[0].id,
+      action:     'created',
+      summary:    `Added jewelry: ${r.rows[0].name} (${r.rows[0].sku})`,
+      related: [
+        contactId ? { type: 'contact', id: contactId } : null,
+        dealId    ? { type: 'deal',    id: dealId    } : null,
+      ].filter(Boolean),
+    });
   } catch (e) {
     console.error('POST jewelry-items error:', e);
     res.status(500).json({ error: e.message });
@@ -5780,6 +6192,21 @@ app.post('/api/jewelry-items/from-template', async (req, res) => {
     );
 
     res.json({ item: r.rows[0], template: { model_number: tpl.model_number, title: tpl.title } });
+
+    const { actorId, actorName } = getActor(req);
+    logActivity({
+      userId,
+      actorId, actorName,
+      entityType: 'jewelry_item',
+      entityId:   r.rows[0].id,
+      action:     'created',
+      summary:    `Made ${r.rows[0].name} from template ${tpl.model_number}`,
+      changes:    { template_model_number: { from: null, to: tpl.model_number } },
+      related: [
+        contactId ? { type: 'contact', id: contactId } : null,
+        dealId    ? { type: 'deal',    id: dealId    } : null,
+      ].filter(Boolean),
+    });
   } catch (e) {
     console.error('POST jewelry-items/from-template error:', e);
     res.status(500).json({ error: e.message });
@@ -5818,11 +6245,39 @@ app.put('/api/jewelry-items/:id', async (req, res) => {
     }
     if (!sets.length) return res.status(400).json({ error: 'no valid fields' });
     sets.push(`updated_at = NOW()`);
+
+    // Snapshot before so we can record what changed.
+    const beforeRes = await pool.query(`SELECT * FROM jewelry_items WHERE id = $1`, [id]);
+    const before = beforeRes.rows[0] || null;
+
     params.push(id);
     const sql = `UPDATE jewelry_items SET ${sets.join(', ')} WHERE id = $${p} RETURNING *`;
     const r = await pool.query(sql, params);
     if (!r.rows[0]) return res.status(404).json({ error: 'Item not found' });
     res.json({ item: r.rows[0] });
+
+    const after = r.rows[0];
+    const changes = diffRows(before, after, fields);
+    if (changes && before) {
+      const { actorId, actorName } = getActor(req);
+      const ck = Object.keys(changes);
+      const summary = ck.length === 1
+        ? `Updated ${ck[0]} on ${after.name || after.sku}`
+        : `Updated ${after.name || after.sku} (${ck.length} fields)`;
+      logActivity({
+        userId:     after.user_id,
+        actorId, actorName,
+        entityType: 'jewelry_item',
+        entityId:   after.id,
+        action:     'updated',
+        summary,
+        changes,
+        related: [
+          after.contact_id ? { type: 'contact', id: after.contact_id } : null,
+          after.deal_id    ? { type: 'deal',    id: after.deal_id    } : null,
+        ].filter(Boolean),
+      });
+    }
   } catch (e) {
     console.error('PUT jewelry-item error:', e);
     res.status(500).json({ error: e.message });
@@ -5833,9 +6288,27 @@ app.put('/api/jewelry-items/:id', async (req, res) => {
 app.delete('/api/jewelry-items/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const beforeRes = await pool.query(
+      `SELECT user_id, sku, name, contact_id FROM jewelry_items WHERE id = $1`,
+      [id]
+    );
     const r = await pool.query(`DELETE FROM jewelry_items WHERE id = $1 RETURNING id`, [id]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Item not found' });
     res.json({ success: true, id: r.rows[0].id });
+
+    const before = beforeRes.rows[0];
+    if (before) {
+      const { actorId, actorName } = getActor(req);
+      logActivity({
+        userId:     before.user_id,
+        actorId, actorName,
+        entityType: 'jewelry_item',
+        entityId:   id,
+        action:     'deleted',
+        summary:    `Deleted jewelry ${before.name || before.sku}`,
+        related:    before.contact_id ? [{ type: 'contact', id: before.contact_id }] : null,
+      });
+    }
   } catch (e) {
     console.error('DELETE jewelry-item error:', e);
     res.status(500).json({ error: e.message });
@@ -5921,6 +6394,21 @@ app.post('/api/jewelry-items/:id/status', async (req, res) => {
     }
 
     res.json({ item: r.rows[0] });
+
+    if (fromStatus !== newStatus) {
+      const { actorId, actorName } = getActor(req);
+      const skuOrName = cur.rows[0].name || cur.rows[0].sku || `#${id}`;
+      logActivity({
+        userId:     cur.rows[0].user_id,
+        actorId, actorName,
+        entityType: 'jewelry_item',
+        entityId:   id,
+        action:     newStatus === 'sold' ? 'sold' : 'status_changed',
+        summary:    `${skuOrName}: ${fromStatus || 'new'} → ${newStatus}`,
+        changes:    { status: { from: fromStatus, to: newStatus } },
+        related:    cur.rows[0].contact_id ? [{ type: 'contact', id: cur.rows[0].contact_id }] : null,
+      });
+    }
   } catch (e) {
     console.error('POST jewelry-item status error:', e);
     res.status(500).json({ error: e.message });
@@ -6042,6 +6530,28 @@ app.post('/api/jewelry-items/:id/stones', async (req, res) => {
       [id, stoneSku || null, role || null, quantity || 1, finalSnapshot ? JSON.stringify(finalSnapshot) : null, notes || null, consume, inventoryStatus]
     );
     res.json({ stone: r.rows[0] });
+
+    // Look up the parent item's name + owner so the activity row reads naturally.
+    const itemRes = await pool.query(
+      `SELECT user_id, name, sku FROM jewelry_items WHERE id = $1`,
+      [id]
+    );
+    const item = itemRes.rows[0];
+    if (item) {
+      const { actorId, actorName } = getActor(req);
+      const itemLabel = item.name || item.sku || `#${id}`;
+      logActivity({
+        userId:     item.user_id,
+        actorId, actorName,
+        entityType: 'jewelry_item',
+        entityId:   id,
+        action:     consume ? 'stone_consumed' : 'stone_added',
+        summary:    stoneSku
+          ? `${consume ? 'Consumed' : 'Added'} stone ${stoneSku} on ${itemLabel}`
+          : `Added stone slot on ${itemLabel}`,
+        related:    stoneSku ? [{ type: 'stone', id: stoneSku }] : null,
+      });
+    }
   } catch (e) {
     console.error('POST jewelry stone error:', e);
     res.status(500).json({ error: e.message });
@@ -6059,6 +6569,28 @@ app.delete('/api/jewelry-items/:id/stones/:stoneId', async (req, res) => {
     );
     if (!r.rows[0]) return res.status(404).json({ error: 'Not found' });
     res.json({ success: true, released: r.rows[0].consume_from_inventory ? r.rows[0].stone_sku : null });
+
+    const itemRes = await pool.query(
+      `SELECT user_id, name, sku FROM jewelry_items WHERE id = $1`,
+      [id]
+    );
+    const item = itemRes.rows[0];
+    if (item) {
+      const { actorId, actorName } = getActor(req);
+      const itemLabel = item.name || item.sku || `#${id}`;
+      const sku = r.rows[0].stone_sku;
+      logActivity({
+        userId:     item.user_id,
+        actorId, actorName,
+        entityType: 'jewelry_item',
+        entityId:   id,
+        action:     'stone_removed',
+        summary:    sku
+          ? `Removed stone ${sku} from ${itemLabel}${r.rows[0].consume_from_inventory ? ' (released to inventory)' : ''}`
+          : `Removed stone slot from ${itemLabel}`,
+        related:    sku ? [{ type: 'stone', id: sku }] : null,
+      });
+    }
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -6251,6 +6783,25 @@ app.post('/api/jewelry-items/:id/sell', async (req, res) => {
     }
 
     res.json({ item: r.rows[0], deal, invoice, soldStones: releasedSkus });
+
+    const { actorId, actorName } = getActor(req);
+    const itemLabel = item.name || item.sku || `#${id}`;
+    const moneyLabel = `${currency} ${finalPrice.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+    logActivity({
+      userId:     ownerUserId,
+      actorId, actorName,
+      entityType: 'jewelry_item',
+      entityId:   id,
+      action:     'sold',
+      summary:    `Sold ${itemLabel} for ${moneyLabel}`,
+      changes:    { status: { from: item.status, to: 'sold' }, sale_price: { from: item.sale_price ?? null, to: finalPrice } },
+      related: [
+        { type: 'contact', id: contactId },
+        { type: 'deal',    id: deal.id   },
+        invoice ? { type: 'invoice', id: invoice.id } : null,
+        ...releasedSkus.map(sku => ({ type: 'stone', id: sku })),
+      ].filter(Boolean),
+    });
   } catch (e) {
     console.error('Sell error:', e);
     res.status(500).json({ error: e.message });
