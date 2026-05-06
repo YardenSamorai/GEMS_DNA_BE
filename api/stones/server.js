@@ -181,6 +181,9 @@ app.get("/api/soap-stones", async (req, res) => {
         // ⭐ קטגוריה (Emerald / Diamond / Fancy / Gemstone וכו')
         category: row.category || "",
 
+        // ⭐ Type — סיווג גרעיני יותר (e.g. "Diamonds MEMO" sub-type)
+        type: row.type || "",
+
         // משקל
         weightCt: row.weight ? Number(row.weight) : null,
 
@@ -193,9 +196,14 @@ app.get("/api/soap-stones", async (req, res) => {
           row.price_per_carat !== null && row.price_per_carat !== undefined
             ? Number(row.price_per_carat)
             : null,
+        rapListPrice:
+          row.rap_list_price !== null && row.rap_list_price !== undefined
+            ? Number(row.rap_list_price)
+            : null,
 
         // טיפול / Oil / Enhancement (מגיע מה־comment)
         treatment: row.comment || "",
+        certComments: row.cert_comments || "",
 
         // מידות ויחס
         measurements: row.measurements || "",
@@ -208,8 +216,11 @@ app.get("/api/soap-stones", async (req, res) => {
 
         // תמונות / וידאו / תעודה
         imageUrl,
+        additionalPictures: row.additional_pictures || "",
         videoUrl: row.video || null,
+        additionalVideos: row.additional_videos || "",
         certificateUrl: row.certificate_image || row.certificate_url || null,
+        certificateImageJpg: row.certificate_image_jpg || null,
         certificateNumber: row.certificate_number || "",
 
         // מאפיינים נוספים
@@ -219,8 +230,14 @@ app.get("/api/soap-stones", async (req, res) => {
         clarity: row.clarity || "",
         luster: row.luster || "",
         fluorescence: row.fluorescence || "",
-        location: row.branch || null,  // branch מהDB מוצג כ-Location בUI (already mapped)
-        
+
+        // 📍 Location — חשיפה דו-שכבתית:
+        //  - `location` נשמר תואם-אחורה (= branch). שאר ה-UI מסתמך על זה.
+        //  - `branch` ו-`exactLocation` חדשים: סניף ומיקום פיזי מדויק בנפרד.
+        location: row.branch || null,
+        branch: row.branch || null,
+        exactLocation: row.location || null,
+
         // Diamond specific fields (camelCase for frontend)
         cut: row.cut || "",
         polish: row.polish || "",
@@ -239,10 +256,17 @@ app.get("/api/soap-stones", async (req, res) => {
         // Pair stone
         pairSku: row.pair_stone || null,
         
-        // Grouping
+        // Grouping & inventory layout
         groupingType: row.grouping_type || "",
         box: row.box || "",
         stones: row.stones != null ? Number(row.stones) : null,
+
+        // Marketing flags
+        homePage: row.home_page || "",
+        tradeShow: row.trade_show || "",
+
+        // Sync timestamp
+        updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
       };
     });
 
