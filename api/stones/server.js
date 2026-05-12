@@ -8151,7 +8151,7 @@ function buildInviteEmail({ rep, inviter, workspaceName, signInUrl }) {
           </p>
           <p style="margin:0 0 24px 0;font-size:15px;line-height:1.6;color:#44403c;">
             You'll see your own contacts, deals, jewelry items and the diamonds &amp; gemstones assigned to you
-            the moment you log in. Just sign in with this exact email to get linked to the team:
+            the moment you log in. Create your account using this exact email so we can link it to the team:
             <strong style="color:#1c1917;">${repEmail}</strong>
           </p>
         </td></tr>
@@ -8180,7 +8180,7 @@ function buildInviteEmail({ rep, inviter, workspaceName, signInUrl }) {
         </td></tr>
         <tr><td style="padding:18px 32px 28px 32px;background:#fafaf9;">
           <p style="margin:0;font-size:11px;line-height:1.5;color:#a8a29e;text-align:center;">
-            If you weren't expecting this invitation you can safely ignore this email — you won't be added until you sign in.
+            If you weren't expecting this invitation you can safely ignore this email — you won't be added until you create your account.
           </p>
         </td></tr>
       </table>
@@ -8195,7 +8195,7 @@ function buildInviteEmail({ rep, inviter, workspaceName, signInUrl }) {
     ``,
     `${inviter?.name || 'Your team admin'} just added you as a sales rep on GEMS DNA — the workshop platform for managing customers, deals, loose-stone inventory and jewelry production.`,
     ``,
-    `Accept your invitation by signing in with this exact email: ${rep?.email || ''}`,
+    `Create your account using this exact email so we can link it to the team: ${rep?.email || ''}`,
     `${ctaUrl}`,
     ``,
     `What you'll be able to do:`,
@@ -8204,7 +8204,7 @@ function buildInviteEmail({ rep, inviter, workspaceName, signInUrl }) {
     `  • Track jewelry items in production`,
     `  • See your own commission & quota progress`,
     ``,
-    `If you weren't expecting this invitation, you can safely ignore this email — you won't be added until you sign in.`,
+    `If you weren't expecting this invitation, you can safely ignore this email — you won't be added until you create your account.`,
     ``,
     `— GEMS DNA`,
   ].join('\n');
@@ -8247,7 +8247,10 @@ async function sendTeamInviteEmail({ rep, inviter, workspaceName }) {
   const fromEmail  = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
   const senderName = (workspaceName || 'GEMS DNA').replace(/[\r\n<>]/g, '');
   const fromHeader = `${senderName} <${fromEmail}>`;
-  const signInUrl  = `${FRONTEND_URL.replace(/\/$/, '')}/sign-in?email=${encodeURIComponent(rep.email)}`;
+  // Send invitees to /sign-up because they don't have an account yet. The
+  // sign-up page itself links to /sign-in for already-registered users, so
+  // both flows are reachable from a single CTA.
+  const signInUrl  = `${FRONTEND_URL.replace(/\/$/, '')}/sign-up?email=${encodeURIComponent(rep.email)}`;
 
   const { subject, html, text } = buildInviteEmail({ rep, inviter, workspaceName, signInUrl });
 
