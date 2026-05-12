@@ -125,6 +125,121 @@ function diffRows(before, after, keys) {
 }
 
 /* =========================================================
+   Team / Sales-Rep system (Sprint 3)
+   ---------------------------------------------------------
+   Design goal: a workshop with one owner ("admin") and up to ~10
+   reps. Every record (contact, deal, task, jewelry_item) gets an
+   `assigned_to` (Clerk user id of the rep) so reps see their own
+   pipeline by default while the admin sees the whole workspace.
+
+   - `team_members` is a thin lookup that maps Clerk users to a
+     workspace (`team_owner_id`) + role.
+   - All existing queries are scoped by `user_id = team_owner_id`,
+     so reps automatically read/write into the admin's workspace.
+   - resolveTeamContext(req) returns the current actor + the
+     workspace + the role; if the actor is not in any team row we
+     fall back to "you are your own one-person team" (backward
+     compatible with the pre-team era).
+   - Email-based linking lets the admin add a rep BEFORE the rep
+     signs up: when the rep first signs in, we backfill clerk_user_id
+     by email and they instantly join the team.
+   ========================================================= */
+async function resolveTeamContext(req) {
+  const actorId =
+    (req?.headers?.['x-actor-id'] && String(req.headers['x-actor-id']).trim()) ||
+    (req?.query?.userId && String(req.query.userId).trim()) ||
+    (req?.body?.userId && String(req.body.userId).trim()) ||
+    null;
+  const actorEmail =
+    (req?.headers?.['x-actor-email'] && String(req.headers['x-actor-email']).trim()) ||
+    (req?.query?.userEmail && String(req.query.userEmail).trim()) ||
+    (req?.body?.userEmail && String(req.body.userEmail).trim()) ||
+    null;
+  const headerActorName =
+    (req?.headers?.['x-actor-name'] && String(req.headers['x-actor-name']).trim()) ||
+    (req?.body?.actorName && String(req.body.actorName).trim()) ||
+    null;
+
+  if (!actorId) {
+    return {
+      tenantUserId: null, actorUserId: null,
+      role: null, memberId: null, memberName: null,
+      isOwner: true, actorName: headerActorName,
+    };
+  }
+
+  let rows = [];
+  try {
+    const r1 = await pool.query(
+      `SELECT * FROM team_members
+        WHERE clerk_user_id = $1 AND active = TRUE
+        LIMIT 1`,
+      [actorId]
+    );
+    rows = r1.rows;
+
+    // Email-based first-time linkage: rep was added before they signed up,
+    // now we recognise them by email and stamp their clerk_user_id in.
+    if (!rows.length && actorEmail) {
+      const r2 = await pool.query(
+        `SELECT * FROM team_members
+          WHERE clerk_user_id IS NULL
+            AND LOWER(email) = LOWER($1)
+            AND active = TRUE
+          LIMIT 1`,
+        [actorEmail]
+      );
+      if (r2.rows.length) {
+        await pool.query(
+          `UPDATE team_members
+              SET clerk_user_id = $1, updated_at = NOW()
+            WHERE id = $2`,
+          [actorId, r2.rows[0].id]
+        );
+        r2.rows[0].clerk_user_id = actorId;
+        rows = r2.rows;
+      }
+    }
+  } catch (e) {
+    // team_members table missing or transient DB hiccup — fall back to
+    // legacy single-user mode so the workspace keeps working.
+    console.warn('resolveTeamContext lookup warn:', e.message);
+  }
+
+  if (rows.length) {
+    const m = rows[0];
+    return {
+      tenantUserId: m.team_owner_id,
+      actorUserId:  actorId,
+      role:         m.role,
+      memberId:     m.id,
+      memberName:   m.name,
+      isOwner:      m.role === 'owner',
+      actorName:    headerActorName || m.name,
+    };
+  }
+
+  // Backward compat: unrecognised user = their own one-person team.
+  return {
+    tenantUserId: actorId,
+    actorUserId:  actorId,
+    role:         'owner',
+    memberId:     null,
+    memberName:   null,
+    isOwner:      true,
+    actorName:    headerActorName,
+  };
+}
+
+// Whether a team context can read a row that was assigned to `assignedTo`.
+// Owners see everything; reps see their own + unassigned ("up for grabs").
+function canReadAssignment(ctx, assignedTo) {
+  if (!ctx || ctx.isOwner) return true;
+  if (!assignedTo) return true;
+  return String(assignedTo) === String(ctx.actorUserId);
+}
+
+/* =========================================================
    /api/stones – כל האבנים מטבלת stones (לא selector)
    ========================================================= */
 app.get("/api/stones", async (req, res) => {
@@ -1752,10 +1867,43 @@ const crmReadyPromise = (async () => {
       "CREATE INDEX IF NOT EXISTS idx_crm_occasions_user_date ON crm_occasions(user_id, occurs_on)",
       // Unread DNA leads badge query (polled every 30s by every signed-in user)
       "CREATE INDEX IF NOT EXISTS idx_crm_contacts_dna_recent ON crm_contacts(created_at DESC) WHERE shared = TRUE AND source = 'dna_lead'",
+      // Sprint 3 / Team & Sales-Rep system: every CRM record can be assigned
+      // to a rep so they see their own pipeline by default. NULL = unassigned
+      // ("up for grabs"). Owner always sees everything regardless.
+      "ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS assigned_to TEXT",
+      "ALTER TABLE crm_deals    ADD COLUMN IF NOT EXISTS assigned_to TEXT",
+      "ALTER TABLE crm_tasks    ADD COLUMN IF NOT EXISTS assigned_to TEXT",
+      "CREATE INDEX IF NOT EXISTS idx_crm_contacts_assigned_to ON crm_contacts(assigned_to) WHERE assigned_to IS NOT NULL",
+      "CREATE INDEX IF NOT EXISTS idx_crm_deals_assigned_to    ON crm_deals(assigned_to)    WHERE assigned_to IS NOT NULL",
+      "CREATE INDEX IF NOT EXISTS idx_crm_tasks_assigned_to    ON crm_tasks(assigned_to)    WHERE assigned_to IS NOT NULL",
     ];
     for (const sql of newCols) {
       try { await pool.query(sql); } catch (e) { console.warn("Migration warn:", e.message); }
     }
+
+    // Sprint 3 — Team / Sales-Rep registry. Each row is either the workspace
+    // OWNER (one per team_owner_id, role='owner') or a REP they invited.
+    // `clerk_user_id` is filled in lazily on first sign-in by email match
+    // (see resolveTeamContext).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS team_members (
+        id SERIAL PRIMARY KEY,
+        team_owner_id   TEXT NOT NULL,
+        clerk_user_id   TEXT,
+        email           TEXT NOT NULL,
+        name            TEXT NOT NULL,
+        role            TEXT NOT NULL DEFAULT 'rep',
+        avatar_color    TEXT,
+        commission_pct  NUMERIC(6,2) DEFAULT 0,
+        quota_monthly   NUMERIC(14,2) DEFAULT 0,
+        active          BOOLEAN DEFAULT TRUE,
+        created_at      TIMESTAMP DEFAULT NOW(),
+        updated_at      TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_team_members_clerk      ON team_members(clerk_user_id) WHERE clerk_user_id IS NOT NULL`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_team_members_team_email ON team_members(team_owner_id, LOWER(email))`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_team_members_owner             ON team_members(team_owner_id) WHERE active = TRUE`);
     // FK for folder_id (separate so it doesn't fail if column already added)
     try {
       await pool.query(`
@@ -1892,16 +2040,39 @@ app.use("/api/crm", ensureCrm);
 app.get("/api/crm/contacts", async (req, res) => {
   try {
     const {
-      userId, search, type, status, folderId, country, city, company,
+      search, type, status, folderId, country, city, company,
       hasEmail, hasPhone, hasWebsite, lastContactDays, createdSince, createdUntil, tag,
+      assignedTo, // 'me' | 'unassigned' | <clerk_user_id>
     } = req.query;
-    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    const tenantUserId = ctx.tenantUserId;
 
     // Broadcast: each user sees their own contacts AND any contact flagged as shared
     // (currently used for DNA-lead inquiries that arrive from the public DNA page).
     const conditions = ["(user_id = $1 OR shared = TRUE)"];
-    const values = [userId];
+    const values = [tenantUserId];
     let idx = 2;
+
+    // Sales-rep visibility: reps see records assigned to them OR still
+    // unassigned ("up for grabs"). Owner always sees the whole workspace.
+    if (!ctx.isOwner) {
+      conditions.push(`(assigned_to IS NULL OR assigned_to = $${idx})`);
+      values.push(ctx.actorUserId);
+      idx++;
+    }
+    // Optional explicit "Mine / Unassigned / <rep>" filter from the UI chip.
+    if (assignedTo === 'me') {
+      conditions.push(`assigned_to = $${idx}`);
+      values.push(ctx.actorUserId);
+      idx++;
+    } else if (assignedTo === 'unassigned') {
+      conditions.push(`assigned_to IS NULL`);
+    } else if (assignedTo && assignedTo !== 'all') {
+      conditions.push(`assigned_to = $${idx}`);
+      values.push(assignedTo);
+      idx++;
+    }
 
     if (search) {
       conditions.push(`(name ILIKE $${idx} OR company ILIKE $${idx} OR phone ILIKE $${idx} OR email ILIKE $${idx} OR title ILIKE $${idx})`);
@@ -1972,6 +2143,7 @@ app.get("/api/crm/contacts", async (req, res) => {
             c.source, c.status, c.tags,
             c.folder_id,
             c.dna_sku, c.shared,
+            c.assigned_to,
             (c.card_image_front IS NOT NULL) AS has_card_front,
             (c.card_image_back IS NOT NULL) AS has_card_back,
             (c.card_image_thumb IS NOT NULL) AS has_card_thumb,
@@ -2086,43 +2258,53 @@ app.get("/api/crm/contacts/:id", async (req, res) => {
 app.post("/api/crm/contacts", async (req, res) => {
   try {
     const {
-      userId, name, type, title, company, phone, phoneAlt, email, website,
+      name, type, title, company, phone, phoneAlt, email, website,
       country, city, address, source, status, tags, preferences, notes, avatarUrl,
       folderId, linkedContactIds, cardBackNotes,
       cardImageFront, cardImageBack, cardImageThumb,
+      assignedTo, // optional; defaults to the actor (auto-assign on create)
     } = req.body;
-    if (!userId || !name) return res.status(400).json({ error: "userId and name are required" });
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (!name) return res.status(400).json({ error: "name is required" });
+    const tenantUserId = ctx.tenantUserId;
+    // Reps can only assign to themselves; admin can assign to anyone.
+    const finalAssignee = ctx.isOwner
+      ? (assignedTo === undefined ? ctx.actorUserId : assignedTo || null)
+      : ctx.actorUserId;
 
     const result = await pool.query(
       `INSERT INTO crm_contacts (
          user_id, name, type, title, company, phone, phone_alt, email, website,
          country, city, address, source, status, tags, preferences, notes, avatar_url,
          folder_id, linked_contact_ids, card_back_notes,
-         card_image_front, card_image_back, card_image_thumb
+         card_image_front, card_image_back, card_image_thumb, assigned_to
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
        RETURNING id, user_id, name, type, title, company, phone, phone_alt, email, website,
                  country, city, address, source, status, tags, preferences, notes, avatar_url,
                  folder_id, linked_contact_ids, card_back_notes, card_image_thumb,
+                 assigned_to,
                  (card_image_front IS NOT NULL) AS has_card_front,
                  (card_image_back IS NOT NULL) AS has_card_back,
                  last_contact_at, created_at, updated_at`,
       [
-        userId, name.trim(), type || 'lead', title || null, company || null,
+        tenantUserId, name.trim(), type || 'lead', title || null, company || null,
         phone || null, phoneAlt || null, email || null, website || null,
         country || null, city || null, address || null, source || null, status || 'active',
         JSON.stringify(tags || []), JSON.stringify(preferences || {}),
         notes || null, avatarUrl || null,
         folderId || null, JSON.stringify(linkedContactIds || []), cardBackNotes || null,
         cardImageFront || null, cardImageBack || null, cardImageThumb || null,
+        finalAssignee,
       ]
     );
     res.status(201).json(result.rows[0]);
 
-    const { actorId, actorName } = getActor(req);
     logActivity({
-      userId,
-      actorId, actorName,
+      userId:    tenantUserId,
+      actorId:   ctx.actorUserId,
+      actorName: ctx.actorName,
       entityType: 'contact',
       entityId:   result.rows[0].id,
       action:     'created',
@@ -2140,11 +2322,13 @@ app.post("/api/crm/contacts", async (req, res) => {
 app.put("/api/crm/contacts/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const allowed = [
       'name','type','title','company','phone','phone_alt','email','website',
       'country','city','address','source','status','tags','preferences','notes','avatar_url','last_contact_at',
       'folder_id','linked_contact_ids','card_back_notes',
-      'card_image_front','card_image_back','card_image_thumb'
+      'card_image_front','card_image_back','card_image_thumb',
+      'assigned_to',
     ];
     const fields = [];
     const values = [];
@@ -2153,6 +2337,12 @@ app.put("/api/crm/contacts/:id", async (req, res) => {
     for (const key of allowed) {
       const camel = key.replace(/_([a-z])/g, (_,c) => c.toUpperCase());
       if (req.body[camel] !== undefined) {
+        // Reps can only assign records to themselves; admin can re-assign freely.
+        if (key === 'assigned_to' && ctx.actorUserId && !ctx.isOwner) {
+          if (req.body[camel] && String(req.body[camel]) !== String(ctx.actorUserId)) {
+            return res.status(403).json({ error: 'Reps can only assign records to themselves' });
+          }
+        }
         if (key === 'tags' || key === 'preferences' || key === 'linked_contact_ids') {
           fields.push(`${key} = $${idx++}`);
           values.push(JSON.stringify(req.body[camel]));
@@ -2892,13 +3082,32 @@ app.delete("/api/crm/interactions/:id", async (req, res) => {
 
 app.get("/api/crm/deals", async (req, res) => {
   try {
-    const { userId, stage, contactId } = req.query;
-    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const { stage, contactId, assignedTo } = req.query;
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    const tenantUserId = ctx.tenantUserId;
 
     // Broadcast: each user sees their own deals AND any deal flagged as shared (DNA leads)
     const conditions = ["(d.user_id = $1 OR d.shared = TRUE)"];
-    const values = [userId];
+    const values = [tenantUserId];
     let idx = 2;
+
+    if (!ctx.isOwner) {
+      conditions.push(`(d.assigned_to IS NULL OR d.assigned_to = $${idx})`);
+      values.push(ctx.actorUserId);
+      idx++;
+    }
+    if (assignedTo === 'me') {
+      conditions.push(`d.assigned_to = $${idx}`);
+      values.push(ctx.actorUserId);
+      idx++;
+    } else if (assignedTo === 'unassigned') {
+      conditions.push(`d.assigned_to IS NULL`);
+    } else if (assignedTo && assignedTo !== 'all') {
+      conditions.push(`d.assigned_to = $${idx}`);
+      values.push(assignedTo);
+      idx++;
+    }
 
     if (stage && stage !== 'all') { conditions.push(`d.stage = $${idx++}`); values.push(stage); }
     if (contactId) { conditions.push(`d.contact_id = $${idx++}`); values.push(contactId); }
@@ -2952,13 +3161,19 @@ app.get("/api/crm/deals/:id", async (req, res) => {
 
 app.post("/api/crm/deals", async (req, res) => {
   try {
-    const { userId, contactId, title, stage, value, currency, probability, expectedClose, notes, items } = req.body;
-    if (!userId || !contactId || !title) return res.status(400).json({ error: "userId, contactId and title are required" });
+    const { contactId, title, stage, value, currency, probability, expectedClose, notes, items, assignedTo } = req.body;
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (!contactId || !title) return res.status(400).json({ error: "contactId and title are required" });
+    const tenantUserId = ctx.tenantUserId;
+    const finalAssignee = ctx.isOwner
+      ? (assignedTo === undefined ? ctx.actorUserId : assignedTo || null)
+      : ctx.actorUserId;
 
     const result = await pool.query(
-      `INSERT INTO crm_deals (user_id, contact_id, title, stage, value, currency, probability, expected_close, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [userId, contactId, title.trim(), stage || 'lead', value || 0, currency || 'USD', probability || 0, expectedClose || null, notes || null]
+      `INSERT INTO crm_deals (user_id, contact_id, title, stage, value, currency, probability, expected_close, notes, assigned_to)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      [tenantUserId, contactId, title.trim(), stage || 'lead', value || 0, currency || 'USD', probability || 0, expectedClose || null, notes || null, finalAssignee]
     );
     const deal = result.rows[0];
 
@@ -2973,10 +3188,10 @@ app.post("/api/crm/deals", async (req, res) => {
     }
     res.status(201).json(deal);
 
-    const { actorId, actorName } = getActor(req);
     logActivity({
-      userId,
-      actorId, actorName,
+      userId:    tenantUserId,
+      actorId:   ctx.actorUserId,
+      actorName: ctx.actorName,
       entityType: 'deal',
       entityId:   deal.id,
       action:     'created',
@@ -2995,7 +3210,8 @@ app.post("/api/crm/deals", async (req, res) => {
 app.put("/api/crm/deals/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const allowed = ['title','stage','value','currency','probability','expected_close','actual_close','notes'];
+    const ctx = await resolveTeamContext(req);
+    const allowed = ['title','stage','value','currency','probability','expected_close','actual_close','notes','assigned_to'];
     const fields = [];
     const values = [];
     let idx = 1;
@@ -3003,6 +3219,11 @@ app.put("/api/crm/deals/:id", async (req, res) => {
     for (const key of allowed) {
       const camel = key.replace(/_([a-z])/g, (_,c) => c.toUpperCase());
       if (req.body[camel] !== undefined) {
+        if (key === 'assigned_to' && ctx.actorUserId && !ctx.isOwner) {
+          if (req.body[camel] && String(req.body[camel]) !== String(ctx.actorUserId)) {
+            return res.status(403).json({ error: 'Reps can only assign records to themselves' });
+          }
+        }
         fields.push(`${key} = $${idx++}`);
         values.push(req.body[camel]);
       }
@@ -3169,12 +3390,30 @@ app.delete("/api/crm/deal-items/:itemId", async (req, res) => {
 
 app.get("/api/crm/tasks", async (req, res) => {
   try {
-    const { userId, status, contactId, dealId } = req.query;
-    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const { status, contactId, dealId, assignedTo } = req.query;
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    const tenantUserId = ctx.tenantUserId;
 
     const conditions = ["t.user_id = $1"];
-    const values = [userId];
+    const values = [tenantUserId];
     let idx = 2;
+    if (!ctx.isOwner) {
+      conditions.push(`(t.assigned_to IS NULL OR t.assigned_to = $${idx})`);
+      values.push(ctx.actorUserId);
+      idx++;
+    }
+    if (assignedTo === 'me') {
+      conditions.push(`t.assigned_to = $${idx}`);
+      values.push(ctx.actorUserId);
+      idx++;
+    } else if (assignedTo === 'unassigned') {
+      conditions.push(`t.assigned_to IS NULL`);
+    } else if (assignedTo && assignedTo !== 'all') {
+      conditions.push(`t.assigned_to = $${idx}`);
+      values.push(assignedTo);
+      idx++;
+    }
     if (status && status !== 'all') { conditions.push(`t.status = $${idx++}`); values.push(status); }
     if (contactId) { conditions.push(`t.contact_id = $${idx++}`); values.push(contactId); }
     if (dealId) { conditions.push(`t.deal_id = $${idx++}`); values.push(dealId); }
@@ -3197,21 +3436,27 @@ app.get("/api/crm/tasks", async (req, res) => {
 
 app.post("/api/crm/tasks", async (req, res) => {
   try {
-    const { userId, contactId, dealId, title, description, dueDate, priority, status } = req.body;
-    if (!userId || !title) return res.status(400).json({ error: "userId and title are required" });
+    const { contactId, dealId, title, description, dueDate, priority, status, assignedTo } = req.body;
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (!title) return res.status(400).json({ error: "title is required" });
+    const tenantUserId = ctx.tenantUserId;
+    const finalAssignee = ctx.isOwner
+      ? (assignedTo === undefined ? ctx.actorUserId : assignedTo || null)
+      : ctx.actorUserId;
 
     const result = await pool.query(
-      `INSERT INTO crm_tasks (user_id, contact_id, deal_id, title, description, due_date, priority, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [userId, contactId || null, dealId || null, title.trim(), description || null, dueDate || null, priority || 'normal', status || 'pending']
+      `INSERT INTO crm_tasks (user_id, contact_id, deal_id, title, description, due_date, priority, status, assigned_to)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [tenantUserId, contactId || null, dealId || null, title.trim(), description || null, dueDate || null, priority || 'normal', status || 'pending', finalAssignee]
     );
     res.status(201).json(result.rows[0]);
 
     const task = result.rows[0];
-    const { actorId, actorName } = getActor(req);
     logActivity({
-      userId,
-      actorId, actorName,
+      userId:    tenantUserId,
+      actorId:   ctx.actorUserId,
+      actorName: ctx.actorName,
       entityType: 'task',
       entityId:   task.id,
       action:     'created',
@@ -3230,13 +3475,19 @@ app.post("/api/crm/tasks", async (req, res) => {
 app.put("/api/crm/tasks/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const allowed = ['title','description','due_date','priority','status'];
+    const ctx = await resolveTeamContext(req);
+    const allowed = ['title','description','due_date','priority','status','assigned_to'];
     const fields = [];
     const values = [];
     let idx = 1;
     for (const key of allowed) {
       const camel = key.replace(/_([a-z])/g, (_,c) => c.toUpperCase());
       if (req.body[camel] !== undefined) {
+        if (key === 'assigned_to' && ctx.actorUserId && !ctx.isOwner) {
+          if (req.body[camel] && String(req.body[camel]) !== String(ctx.actorUserId)) {
+            return res.status(403).json({ error: 'Reps can only assign records to themselves' });
+          }
+        }
         fields.push(`${key} = $${idx++}`);
         values.push(req.body[camel]);
       }
@@ -5991,6 +6242,10 @@ const jewelryReadyPromise = (async () => {
     const ijewelMigrations = [
       "ALTER TABLE jewelry_items ADD COLUMN IF NOT EXISTS ijewel_file_id TEXT",
       "ALTER TABLE jewelry_items ADD COLUMN IF NOT EXISTS ijewel_instance TEXT",
+      // Sprint 3 — sales-rep assignment for the workshop too: any
+      // jewelry_item can be the responsibility of a specific rep.
+      "ALTER TABLE jewelry_items ADD COLUMN IF NOT EXISTS assigned_to TEXT",
+      "CREATE INDEX IF NOT EXISTS idx_jewelry_items_assigned_to ON jewelry_items(assigned_to) WHERE assigned_to IS NOT NULL",
     ];
     for (const sql of ijewelMigrations) {
       try { await pool.query(sql); } catch (e) { console.warn('iJewel migration warn:', e.message); }
@@ -6075,15 +6330,34 @@ async function generateJewelrySku() {
 /* ---------- Jewelry Items: List ---------- */
 app.get('/api/jewelry-items', async (req, res) => {
   try {
-    const { userId, status, type, contactId, search, includeArchived } = req.query;
-    if (!userId) return res.status(400).json({ error: 'userId is required' });
+    const { status, type, contactId, search, includeArchived, assignedTo } = req.query;
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
+    const tenantUserId = ctx.tenantUserId;
 
     // All filter columns must be prefixed with `ji.` because the JOIN with
     // crm_contacts brings in columns like user_id/name that would otherwise
     // be ambiguous to the planner.
     const where = ['ji.user_id = $1'];
-    const params = [userId];
+    const params = [tenantUserId];
     let p = 2;
+
+    if (!ctx.isOwner) {
+      where.push(`(ji.assigned_to IS NULL OR ji.assigned_to = $${p})`);
+      params.push(ctx.actorUserId);
+      p++;
+    }
+    if (assignedTo === 'me') {
+      where.push(`ji.assigned_to = $${p}`);
+      params.push(ctx.actorUserId);
+      p++;
+    } else if (assignedTo === 'unassigned') {
+      where.push(`ji.assigned_to IS NULL`);
+    } else if (assignedTo && assignedTo !== 'all') {
+      where.push(`ji.assigned_to = $${p}`);
+      params.push(assignedTo);
+      p++;
+    }
 
     if (status) { where.push(`ji.status = $${p++}`); params.push(status); }
     if (type) { where.push(`ji.type = $${p++}`); params.push(type); }
@@ -6191,43 +6465,49 @@ app.get('/api/jewelry-items/:id', async (req, res) => {
 app.post('/api/jewelry-items', async (req, res) => {
   try {
     const {
-      userId, location, name, type = 'custom', category,
+      location, name, type = 'custom', category,
       contactId, dealId, description, internalNotes, size, weightGrams,
-      metalSummary, status = 'draft',
+      metalSummary, status = 'draft', assignedTo,
     } = req.body || {};
-    if (!userId) return res.status(400).json({ error: 'userId is required' });
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
     if (!name || !String(name).trim()) return res.status(400).json({ error: 'name is required' });
     if (!isValidType(type)) return res.status(400).json({ error: 'invalid type' });
     if (!isValidStatus(status)) return res.status(400).json({ error: 'invalid status' });
+    const tenantUserId = ctx.tenantUserId;
+    const finalAssignee = ctx.isOwner
+      ? (assignedTo === undefined ? ctx.actorUserId : assignedTo || null)
+      : ctx.actorUserId;
 
     const sku = await generateJewelrySku();
 
     const r = await pool.query(
       `INSERT INTO jewelry_items
          (user_id, location, sku, name, type, status, contact_id, deal_id,
-          category, metal_summary, weight_grams, size, description, internal_notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          category, metal_summary, weight_grams, size, description, internal_notes, assigned_to)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        RETURNING *`,
       [
-        userId, location || null, sku, name.trim(), type, status,
+        tenantUserId, location || null, sku, name.trim(), type, status,
         contactId || null, dealId || null,
         category || null, metalSummary || null,
         weightGrams || null, size || null, description || null, internalNotes || null,
+        finalAssignee,
       ]
     );
 
     await pool.query(
       `INSERT INTO jewelry_item_history (item_id, from_status, to_status, changed_by, notes)
        VALUES ($1, NULL, $2, $3, $4)`,
-      [r.rows[0].id, status, userId, 'Item created']
+      [r.rows[0].id, status, ctx.actorUserId, 'Item created']
     );
 
     res.json({ item: r.rows[0] });
 
-    const { actorId, actorName } = getActor(req);
     logActivity({
-      userId,
-      actorId, actorName,
+      userId:    tenantUserId,
+      actorId:   ctx.actorUserId,
+      actorName: ctx.actorName,
       entityType: 'jewelry_item',
       entityId:   r.rows[0].id,
       action:     'created',
@@ -6273,11 +6553,16 @@ const pickFirstImageUrl = (raw) => {
 app.post('/api/jewelry-items/from-template', async (req, res) => {
   try {
     const {
-      userId, modelNumber, location,
-      contactId, dealId, name: nameOverride,
+      modelNumber, location,
+      contactId, dealId, name: nameOverride, assignedTo,
     } = req.body || {};
-    if (!userId) return res.status(400).json({ error: 'userId is required' });
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
     if (!modelNumber) return res.status(400).json({ error: 'modelNumber is required' });
+    const tenantUserId = ctx.tenantUserId;
+    const finalAssignee = ctx.isOwner
+      ? (assignedTo === undefined ? ctx.actorUserId : assignedTo || null)
+      : ctx.actorUserId;
 
     const tplRes = await pool.query(
       `SELECT * FROM jewelry_products WHERE model_number = $1 LIMIT 1`,
@@ -6308,29 +6593,29 @@ app.post('/api/jewelry-items/from-template', async (req, res) => {
       `INSERT INTO jewelry_items
          (user_id, location, sku, name, type, status, contact_id, deal_id,
           category, metal_summary, weight_grams, size, description,
-          cover_image_url, template_model_number)
-       VALUES ($1,$2,$3,$4,'custom','design',$5,$6,$7,$8,$9,$10,$11,$12,$13)
+          cover_image_url, template_model_number, assigned_to)
+       VALUES ($1,$2,$3,$4,'custom','design',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        RETURNING *`,
       [
-        userId, location || null, sku, name,
+        tenantUserId, location || null, sku, name,
         contactId || null, dealId || null,
         category, metalSummary, weightGrams, size, description,
-        coverImage, tpl.model_number,
+        coverImage, tpl.model_number, finalAssignee,
       ]
     );
 
     await pool.query(
       `INSERT INTO jewelry_item_history (item_id, from_status, to_status, changed_by, notes)
        VALUES ($1, NULL, 'design', $2, $3)`,
-      [r.rows[0].id, userId, `Created from catalog template ${tpl.model_number}`]
+      [r.rows[0].id, ctx.actorUserId, `Created from catalog template ${tpl.model_number}`]
     );
 
     res.json({ item: r.rows[0], template: { model_number: tpl.model_number, title: tpl.title } });
 
-    const { actorId, actorName } = getActor(req);
     logActivity({
-      userId,
-      actorId, actorName,
+      userId:    tenantUserId,
+      actorId:   ctx.actorUserId,
+      actorName: ctx.actorName,
       entityType: 'jewelry_item',
       entityId:   r.rows[0].id,
       action:     'created',
@@ -6351,11 +6636,13 @@ app.post('/api/jewelry-items/from-template', async (req, res) => {
 app.put('/api/jewelry-items/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const fields = [
       'name', 'type', 'category', 'contact_id', 'deal_id',
       'description', 'internal_notes', 'size', 'weight_grams', 'metal_summary',
       'cover_image_url', 'markup_percent', 'sale_price', 'location',
       'ijewel_file_id', 'ijewel_instance',
+      'assigned_to',
     ];
     const map = {
       name: 'name', type: 'type', category: 'category',
@@ -6365,6 +6652,7 @@ app.put('/api/jewelry-items/:id', async (req, res) => {
       coverImageUrl: 'cover_image_url', markupPercent: 'markup_percent',
       salePrice: 'sale_price', location: 'location',
       ijewelFileId: 'ijewel_file_id', ijewelInstance: 'ijewel_instance',
+      assignedTo: 'assigned_to',
     };
     const sets = [];
     const params = [];
@@ -6374,6 +6662,11 @@ app.put('/api/jewelry-items/:id', async (req, res) => {
       if (col && fields.includes(col)) {
         if (col === 'type' && v && !isValidType(v)) {
           return res.status(400).json({ error: 'invalid type' });
+        }
+        if (col === 'assigned_to' && ctx.actorUserId && !ctx.isOwner) {
+          if (v && String(v) !== String(ctx.actorUserId)) {
+            return res.status(403).json({ error: 'Reps can only assign records to themselves' });
+          }
         }
         sets.push(`${col} = $${p++}`);
         params.push(v === '' ? null : v);
@@ -7579,6 +7872,353 @@ app.post('/api/blob/upload', blobUpload.single('file'), async (req, res) => {
     });
   } catch (e) {
     console.error('Blob upload error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =========================================================
+   Team / Sales-Rep endpoints
+   ---------------------------------------------------------
+   /api/team/me              GET   — who am I + team roster
+   /api/team/members         GET   — full roster (admin + reps)
+   /api/team/members         POST  — invite a new rep (by email)
+   /api/team/members/:id     PUT   — edit name / role / commission / quota
+   /api/team/members/:id     DELETE — soft-deactivate a rep
+   /api/team/leaderboard     GET   — month-to-date KPIs per rep
+   ========================================================= */
+
+// Tiny deterministic palette so each rep gets a stable visual identity even
+// without a real avatar photo. The FE renders initials + this color.
+const TEAM_AVATAR_COLORS = [
+  '#0ea5e9', '#10b981', '#f59e0b', '#8b5cf6', '#ef4444',
+  '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#6366f1',
+];
+function pickAvatarColor(seed) {
+  let h = 0;
+  for (const ch of String(seed || '')) h = ((h << 5) - h + ch.charCodeAt(0)) | 0;
+  return TEAM_AVATAR_COLORS[Math.abs(h) % TEAM_AVATAR_COLORS.length];
+}
+
+// Make sure the workspace owner exists in team_members. Idempotent — safe
+// to call on every /api/team/me hit. We can't auto-create reps (we don't
+// know their emails), but we can guarantee the owner row is always there.
+async function ensureOwnerRow(ctx) {
+  if (!ctx?.actorUserId) return null;
+  // If we already resolved a real member row, nothing to do.
+  if (ctx.memberId) return ctx;
+  try {
+    const existing = await pool.query(
+      `SELECT * FROM team_members
+        WHERE team_owner_id = $1 AND role = 'owner'
+        LIMIT 1`,
+      [ctx.actorUserId]
+    );
+    if (existing.rows.length) {
+      // Backfill clerk_user_id if missing (legacy seed rows).
+      if (!existing.rows[0].clerk_user_id) {
+        await pool.query(
+          `UPDATE team_members SET clerk_user_id = $1, updated_at = NOW() WHERE id = $2`,
+          [ctx.actorUserId, existing.rows[0].id]
+        );
+      }
+      return { ...ctx, memberId: existing.rows[0].id, role: 'owner', isOwner: true };
+    }
+    const email =
+      (ctx.actorEmail && String(ctx.actorEmail).trim()) || `owner-${ctx.actorUserId}@local`;
+    const name = ctx.actorName || 'Workshop Owner';
+    const ins = await pool.query(
+      `INSERT INTO team_members
+         (team_owner_id, clerk_user_id, email, name, role, avatar_color, active)
+       VALUES ($1, $1, $2, $3, 'owner', $4, TRUE)
+       RETURNING *`,
+      [ctx.actorUserId, email, name, pickAvatarColor(ctx.actorUserId)]
+    );
+    return { ...ctx, memberId: ins.rows[0].id, role: 'owner', isOwner: true };
+  } catch (e) {
+    console.warn('ensureOwnerRow warn:', e.message);
+    return ctx;
+  }
+}
+
+// GET /api/team/me  — bootstrap call. Returns: { me, members }
+app.get('/api/team/me', async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
+
+    // For brand-new admins this lazily seeds the owner row.
+    const finalCtx = await ensureOwnerRow(ctx);
+
+    const ownerId = finalCtx.tenantUserId || finalCtx.actorUserId;
+    const all = await pool.query(
+      `SELECT id, team_owner_id, clerk_user_id, email, name, role,
+              avatar_color, commission_pct, quota_monthly, active,
+              created_at, updated_at,
+              (clerk_user_id IS NULL) AS pending
+         FROM team_members
+        WHERE team_owner_id = $1 AND active = TRUE
+        ORDER BY (role = 'owner') DESC, name ASC`,
+      [ownerId]
+    );
+    const me = all.rows.find(
+      (r) => r.clerk_user_id === finalCtx.actorUserId
+    ) || null;
+
+    res.json({
+      me,
+      members: all.rows,
+      tenantUserId: ownerId,
+      actorUserId:  finalCtx.actorUserId,
+      role:         me?.role || finalCtx.role || 'owner',
+      isOwner:      (me?.role || finalCtx.role) === 'owner',
+    });
+  } catch (e) {
+    console.error('GET /api/team/me error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/team/members  — full active roster for the current tenant.
+app.get('/api/team/members', async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
+    const ownerId = ctx.tenantUserId || ctx.actorUserId;
+    const r = await pool.query(
+      `SELECT id, team_owner_id, clerk_user_id, email, name, role,
+              avatar_color, commission_pct, quota_monthly, active,
+              created_at, updated_at,
+              (clerk_user_id IS NULL) AS pending
+         FROM team_members
+        WHERE team_owner_id = $1 AND active = TRUE
+        ORDER BY (role = 'owner') DESC, name ASC`,
+      [ownerId]
+    );
+    res.json({ members: r.rows });
+  } catch (e) {
+    console.error('GET /api/team/members error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/team/members  — admin invites a rep by email + name.
+// The rep doesn't need to exist in Clerk yet; clerk_user_id gets backfilled
+// when they first sign in (resolveTeamContext does the email match).
+app.post('/api/team/members', async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
+    await ensureOwnerRow(ctx);
+    if (!ctx.isOwner) return res.status(403).json({ error: 'Only the workspace owner can invite members' });
+
+    const { email, name, role = 'rep', commissionPct, quotaMonthly, avatarColor } = req.body || {};
+    if (!email || !String(email).trim()) return res.status(400).json({ error: 'email is required' });
+    if (!name || !String(name).trim())  return res.status(400).json({ error: 'name is required' });
+    if (!['rep', 'owner'].includes(role)) return res.status(400).json({ error: 'invalid role' });
+
+    const ownerId = ctx.tenantUserId || ctx.actorUserId;
+
+    // Cap free-tier teams at 10 members so we don't accidentally invite the
+    // whole world. Owner counts as 1.
+    const cnt = await pool.query(
+      `SELECT COUNT(*)::int AS c FROM team_members WHERE team_owner_id = $1 AND active = TRUE`,
+      [ownerId]
+    );
+    if (cnt.rows[0].c >= 11) {
+      return res.status(400).json({ error: 'Team is full (max 10 reps + owner). Deactivate someone first.' });
+    }
+
+    try {
+      const ins = await pool.query(
+        `INSERT INTO team_members
+           (team_owner_id, email, name, role, avatar_color, commission_pct, quota_monthly, active)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+         RETURNING *`,
+        [
+          ownerId,
+          String(email).trim().toLowerCase(),
+          String(name).trim(),
+          role,
+          avatarColor || pickAvatarColor(email),
+          Number(commissionPct) || 0,
+          Number(quotaMonthly)  || 0,
+        ]
+      );
+      res.status(201).json({ member: ins.rows[0] });
+
+      logActivity({
+        userId:     ownerId,
+        actorId:    ctx.actorUserId,
+        actorName:  ctx.actorName,
+        entityType: 'team_member',
+        entityId:   ins.rows[0].id,
+        action:     'invited',
+        summary:    `Invited ${ins.rows[0].name} (${ins.rows[0].email}) as ${ins.rows[0].role}`,
+      });
+    } catch (dupErr) {
+      if (String(dupErr.message || '').includes('duplicate')) {
+        return res.status(409).json({ error: 'A member with this email already exists in your team' });
+      }
+      throw dupErr;
+    }
+  } catch (e) {
+    console.error('POST /api/team/members error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/team/members/:id
+app.put('/api/team/members/:id', async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
+    if (!ctx.isOwner)     return res.status(403).json({ error: 'Only the workspace owner can edit members' });
+
+    const { id } = req.params;
+    const ownerId = ctx.tenantUserId || ctx.actorUserId;
+
+    const allowed = {
+      name: 'name', email: 'email', role: 'role',
+      avatarColor: 'avatar_color',
+      commissionPct: 'commission_pct',
+      quotaMonthly:  'quota_monthly',
+      active: 'active',
+    };
+    const sets = [];
+    const params = [];
+    let p = 1;
+    for (const [k, col] of Object.entries(allowed)) {
+      if (req.body[k] !== undefined) {
+        if (col === 'role' && !['rep', 'owner'].includes(req.body[k])) {
+          return res.status(400).json({ error: 'invalid role' });
+        }
+        sets.push(`${col} = $${p++}`);
+        params.push(col === 'email' ? String(req.body[k]).trim().toLowerCase() : req.body[k]);
+      }
+    }
+    if (!sets.length) return res.status(400).json({ error: 'no fields to update' });
+    sets.push(`updated_at = NOW()`);
+
+    params.push(id, ownerId);
+    const r = await pool.query(
+      `UPDATE team_members SET ${sets.join(', ')}
+        WHERE id = $${p++} AND team_owner_id = $${p}
+        RETURNING *`,
+      params
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'Member not found' });
+    res.json({ member: r.rows[0] });
+  } catch (e) {
+    console.error('PUT /api/team/members error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/team/members/:id  — soft-deactivate (data assignments persist).
+app.delete('/api/team/members/:id', async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
+    if (!ctx.isOwner)     return res.status(403).json({ error: 'Only the workspace owner can remove members' });
+
+    const { id } = req.params;
+    const ownerId = ctx.tenantUserId || ctx.actorUserId;
+
+    const r = await pool.query(
+      `UPDATE team_members
+          SET active = FALSE, updated_at = NOW()
+        WHERE id = $1 AND team_owner_id = $2 AND role <> 'owner'
+        RETURNING *`,
+      [id, ownerId]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'Member not found (cannot remove owner)' });
+    res.json({ success: true, member: r.rows[0] });
+
+    logActivity({
+      userId:     ownerId,
+      actorId:    ctx.actorUserId,
+      actorName:  ctx.actorName,
+      entityType: 'team_member',
+      entityId:   id,
+      action:     'removed',
+      summary:    `Removed ${r.rows[0].name} from the team`,
+    });
+  } catch (e) {
+    console.error('DELETE /api/team/members error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/team/leaderboard
+//   Month-to-date snapshot per rep:
+//   - assigned_contacts: contacts owned right now
+//   - won_deals_mtd / revenue_mtd
+//   - jewelry_in_progress
+app.get('/api/team/leaderboard', async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
+    const ownerId = ctx.tenantUserId || ctx.actorUserId;
+
+    const monthStart = new Date();
+    monthStart.setUTCDate(1);
+    monthStart.setUTCHours(0, 0, 0, 0);
+
+    const members = await pool.query(
+      `SELECT id, clerk_user_id, name, email, role, avatar_color,
+              commission_pct, quota_monthly
+         FROM team_members
+        WHERE team_owner_id = $1 AND active = TRUE
+        ORDER BY (role = 'owner') DESC, name ASC`,
+      [ownerId]
+    );
+
+    const out = [];
+    for (const m of members.rows) {
+      const who = m.clerk_user_id;
+      const [contacts, wonMtd, jewActive] = await Promise.all([
+        pool.query(
+          `SELECT COUNT(*)::int AS c FROM crm_contacts WHERE user_id = $1 AND assigned_to = $2`,
+          [ownerId, who]
+        ),
+        pool.query(
+          `SELECT COUNT(*)::int AS c, COALESCE(SUM(value),0)::numeric AS v
+             FROM crm_deals
+            WHERE user_id = $1 AND assigned_to = $2 AND stage = 'won'
+              AND COALESCE(actual_close, updated_at) >= $3`,
+          [ownerId, who, monthStart]
+        ),
+        pool.query(
+          `SELECT COUNT(*)::int AS c
+             FROM jewelry_items
+            WHERE user_id = $1 AND assigned_to = $2
+              AND status NOT IN ('sold','archived')`,
+          [ownerId, who]
+        ),
+      ]).catch(() => [{ rows: [{ c: 0 }] }, { rows: [{ c: 0, v: 0 }] }, { rows: [{ c: 0 }] }]);
+
+      const revenue = Number(wonMtd.rows[0]?.v || 0);
+      const quota   = Number(m.quota_monthly || 0);
+      out.push({
+        memberId:        m.id,
+        clerkUserId:     m.clerk_user_id,
+        name:            m.name,
+        email:           m.email,
+        role:            m.role,
+        avatarColor:     m.avatar_color,
+        commissionPct:   Number(m.commission_pct || 0),
+        quotaMonthly:    quota,
+        assignedContacts:contacts.rows[0]?.c || 0,
+        wonDealsMtd:     wonMtd.rows[0]?.c || 0,
+        revenueMtd:      revenue,
+        jewelryInProgress: jewActive.rows[0]?.c || 0,
+        commissionEarned:  Math.round(revenue * Number(m.commission_pct || 0)) / 100,
+        quotaPct:          quota > 0 ? Math.round((revenue / quota) * 100) : null,
+      });
+    }
+    res.json({ leaderboard: out, monthStart: monthStart.toISOString() });
+  } catch (e) {
+    console.error('GET /api/team/leaderboard error:', e);
     res.status(500).json({ error: e.message });
   }
 });
