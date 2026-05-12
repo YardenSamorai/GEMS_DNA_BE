@@ -269,16 +269,62 @@ app.get("/api/stones", async (req, res) => {
 
 /* =========================================================
    /api/soap-stones – ל-Stone selector החדש
+   Reps see their own assigned stones + unassigned ones (so they can
+   claim them); admins see everything. Optional ?assignedTo= filter:
+     "me"          → only mine
+     "unassigned"  → only un-claimed
+     <clerk-id>    → that rep's pile (admin-only respect, otherwise
+                     silently coerced to "me" so reps can't snoop)
    ========================================================= */
 app.get("/api/soap-stones", async (req, res) => {
   try {
-    // ⚠️ בלי LIMIT – הכל, הפאגינציה ב-Frontend
-    const result = await pool.query(`
-      SELECT *
-      FROM soap_stones
-      WHERE sku IS NOT NULL
-      ORDER BY updated_at DESC
-    `);
+    const ctx = await resolveTeamContext(req);
+    const ownerId = ctx.tenantUserId || ctx.actorUserId || null;
+
+    // What does the caller *want*?
+    let assignedFilter = req.query?.assignedTo ? String(req.query.assignedTo) : null;
+    if (assignedFilter === 'me') assignedFilter = ctx.actorUserId;
+    // Reps can only ever see their own + unassigned, regardless of filter.
+    if (!ctx.isOwner && assignedFilter && assignedFilter !== 'unassigned' && assignedFilter !== ctx.actorUserId) {
+      assignedFilter = ctx.actorUserId;
+    }
+
+    const whereClauses = [`s.sku IS NOT NULL`];
+    const params = [];
+
+    // Always LEFT JOIN assignments so we can return assigned_to.
+    if (ownerId) params.push(ownerId);
+    const ownerParamIdx = ownerId ? params.length : null;
+
+    // Visibility scope: admin sees all; rep sees mine + unassigned.
+    if (ownerId && !ctx.isOwner) {
+      params.push(ctx.actorUserId);
+      whereClauses.push(`(sa.assigned_to IS NULL OR sa.assigned_to = $${params.length})`);
+    }
+
+    // Optional explicit filter from the UI.
+    if (assignedFilter === 'unassigned') {
+      whereClauses.push(`sa.assigned_to IS NULL`);
+    } else if (assignedFilter && assignedFilter !== 'all') {
+      params.push(assignedFilter);
+      whereClauses.push(`sa.assigned_to = $${params.length}`);
+    }
+
+    const sql = `
+      SELECT s.*,
+             sa.assigned_to AS assigned_to_clerk_id,
+             sa.assigned_by AS assigned_by_clerk_id,
+             sa.notes       AS assigned_notes,
+             sa.updated_at  AS assigned_updated_at
+        FROM soap_stones s
+        ${ownerParamIdx
+            ? `LEFT JOIN stone_assignments sa
+                  ON sa.stone_sku = s.sku AND sa.team_owner_id = $${ownerParamIdx}`
+            : `LEFT JOIN stone_assignments sa ON FALSE`}
+       WHERE ${whereClauses.join(' AND ')}
+       ORDER BY s.updated_at DESC
+    `;
+    const result = await pool.query(sql, params);
 
     const stones = result.rows.map((row) => {
       // בחירת תמונה ראשית
@@ -382,6 +428,15 @@ app.get("/api/soap-stones", async (req, res) => {
 
         // Sync timestamp
         updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+
+        // Sales-rep assignment (loose-stones edition).
+        // Stones don't live in jewelry_items so they have their own table.
+        assignedTo:        row.assigned_to_clerk_id || null,
+        assignedBy:        row.assigned_by_clerk_id || null,
+        assignmentNotes:   row.assigned_notes       || null,
+        assignmentUpdated: row.assigned_updated_at
+          ? new Date(row.assigned_updated_at).toISOString()
+          : null,
       };
     });
 
@@ -1070,6 +1125,81 @@ app.post("/api/stones/:sku/tags", async (req, res) => {
     res.status(201).json(tagResult.rows[0]);
   } catch (error) {
     console.error("❌ Error adding tag to stone:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   /api/stones/:sku/assign  – assign / unassign a loose stone to a rep
+   Body: { assignedTo: <clerk_user_id> | null, notes?: string }
+   - Owners can assign to anyone (or null = unassign).
+   - Reps can only claim a stone for themselves OR clear their own claim;
+     they cannot reassign someone else's stone.
+   ========================================================= */
+app.post("/api/stones/:sku/assign", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
+    const ownerId = ctx.tenantUserId || ctx.actorUserId;
+
+    const { sku } = req.params;
+    let { assignedTo = null, notes = null } = req.body || {};
+    if (assignedTo === '' || assignedTo === undefined) assignedTo = null;
+    if (assignedTo === 'me') assignedTo = ctx.actorUserId;
+
+    // Make sure the stone actually exists in the synced inventory.
+    const exists = await pool.query(
+      `SELECT sku FROM soap_stones WHERE sku = $1 LIMIT 1`,
+      [sku]
+    );
+    if (!exists.rows.length) return res.status(404).json({ error: 'Stone not found' });
+
+    // Reps can only claim/unclaim *for themselves*.
+    if (!ctx.isOwner) {
+      const cur = await pool.query(
+        `SELECT assigned_to FROM stone_assignments
+          WHERE team_owner_id = $1 AND stone_sku = $2`,
+        [ownerId, sku]
+      );
+      const currentAssignee = cur.rows[0]?.assigned_to || null;
+      // If somebody else holds it, we refuse.
+      if (currentAssignee && currentAssignee !== ctx.actorUserId) {
+        return res.status(403).json({ error: 'This stone is already assigned to another rep' });
+      }
+      // The only legal targets for a rep: themselves or null (release).
+      if (assignedTo && assignedTo !== ctx.actorUserId) {
+        return res.status(403).json({ error: 'Reps can only claim a stone for themselves' });
+      }
+    }
+
+    const r = await pool.query(
+      `INSERT INTO stone_assignments
+         (team_owner_id, stone_sku, assigned_to, assigned_by, notes)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (team_owner_id, stone_sku)
+       DO UPDATE SET assigned_to = EXCLUDED.assigned_to,
+                     assigned_by = EXCLUDED.assigned_by,
+                     notes       = COALESCE(EXCLUDED.notes, stone_assignments.notes),
+                     updated_at  = NOW()
+       RETURNING *`,
+      [ownerId, sku, assignedTo, ctx.actorUserId, notes]
+    );
+
+    res.json({ success: true, assignment: r.rows[0] });
+
+    logActivity({
+      userId:     ownerId,
+      actorId:    ctx.actorUserId,
+      actorName:  ctx.actorName,
+      entityType: 'loose_stone',
+      entityId:   sku,
+      action:     assignedTo ? 'assigned' : 'unassigned',
+      summary:    assignedTo
+        ? `Stone ${sku} assigned to ${assignedTo === ctx.actorUserId ? 'self' : 'rep'}`
+        : `Stone ${sku} released back to the unassigned pool`,
+    });
+  } catch (error) {
+    console.error("❌ Error assigning stone:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -1911,6 +2041,26 @@ const crmReadyPromise = (async () => {
     await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS last_invited_at TIMESTAMP`);
     await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS invite_count    INTEGER DEFAULT 0`);
     await pool.query(`UPDATE team_members SET invited_at = created_at WHERE invited_at IS NULL`);
+
+    // Loose-stone assignments. We keep this in a separate table because
+    // soap_stones is synced from an external source — adding columns there
+    // risks getting wiped on the next sync. Stones with no row here are
+    // "unassigned" and visible to every rep so they can claim them.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS stone_assignments (
+        id              SERIAL PRIMARY KEY,
+        team_owner_id   TEXT NOT NULL,
+        stone_sku       TEXT NOT NULL,
+        assigned_to     TEXT,
+        assigned_by     TEXT,
+        notes           TEXT,
+        created_at      TIMESTAMP DEFAULT NOW(),
+        updated_at      TIMESTAMP DEFAULT NOW(),
+        UNIQUE (team_owner_id, stone_sku)
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_stone_assignments_assigned  ON stone_assignments(assigned_to) WHERE assigned_to IS NOT NULL`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_stone_assignments_owner_sku ON stone_assignments(team_owner_id, stone_sku)`);
     // FK for folder_id (separate so it doesn't fail if column already added)
     try {
       await pool.query(`
@@ -7952,11 +8102,11 @@ function buildInviteEmail({ rep, inviter, workspaceName, signInUrl }) {
           </p>
           <p style="margin:0 0 16px 0;font-size:15px;line-height:1.6;color:#44403c;">
             <strong>${inviteName}</strong> just added you as a sales rep on <strong>GEMS DNA</strong> — the
-            workshop platform for managing customers, deals, and jewelry production.
+            workshop platform for managing customers, deals, loose-stone inventory and jewelry production.
           </p>
           <p style="margin:0 0 24px 0;font-size:15px;line-height:1.6;color:#44403c;">
-            You'll see your own contacts, deals, and jewelry items the moment you log in.
-            Just sign in with this exact email to get linked to the team:
+            You'll see your own contacts, deals, jewelry items and the diamonds &amp; gemstones assigned to you
+            the moment you log in. Just sign in with this exact email to get linked to the team:
             <strong style="color:#1c1917;">${repEmail}</strong>
           </p>
         </td></tr>
@@ -7978,6 +8128,7 @@ function buildInviteEmail({ rep, inviter, workspaceName, signInUrl }) {
           </p>
           <ul style="margin:8px 0 0 0;padding:0 0 0 18px;font-size:13px;line-height:1.7;color:#57534e;">
             <li>Manage the contacts &amp; deals assigned to you</li>
+            <li>Sell loose diamonds &amp; gemstones from the workshop inventory</li>
             <li>Track jewelry items in production</li>
             <li>See your own commission &amp; quota progress</li>
           </ul>
@@ -7997,13 +8148,14 @@ function buildInviteEmail({ rep, inviter, workspaceName, signInUrl }) {
   const text = [
     `Hey ${rep?.name || 'there'},`,
     ``,
-    `${inviter?.name || 'Your team admin'} just added you as a sales rep on GEMS DNA — the workshop platform for managing customers, deals, and jewelry production.`,
+    `${inviter?.name || 'Your team admin'} just added you as a sales rep on GEMS DNA — the workshop platform for managing customers, deals, loose-stone inventory and jewelry production.`,
     ``,
     `Accept your invitation by signing in with this exact email: ${rep?.email || ''}`,
     `${ctaUrl}`,
     ``,
     `What you'll be able to do:`,
     `  • Manage the contacts & deals assigned to you`,
+    `  • Sell loose diamonds & gemstones from the workshop inventory`,
     `  • Track jewelry items in production`,
     `  • See your own commission & quota progress`,
     ``,
@@ -8436,8 +8588,11 @@ app.post('/api/team/members/:id/resend-invite', async (req, res) => {
 // GET /api/team/leaderboard
 //   Month-to-date snapshot per rep:
 //   - assigned_contacts: contacts owned right now
-//   - won_deals_mtd / revenue_mtd
-//   - jewelry_in_progress
+//   - won_deals_mtd / revenue_mtd      (covers BOTH jewelry + loose stones —
+//                                       any deal whose stage=won counts here)
+//   - jewelry_in_progress              jewelry items in active production
+//   - stones_in_progress               loose stones the rep has claimed
+//   - inventory_in_progress            jewelry_in_progress + stones_in_progress
 app.get('/api/team/leaderboard', async (req, res) => {
   try {
     const ctx = await resolveTeamContext(req);
@@ -8460,7 +8615,7 @@ app.get('/api/team/leaderboard', async (req, res) => {
     const out = [];
     for (const m of members.rows) {
       const who = m.clerk_user_id;
-      const [contacts, wonMtd, jewActive] = await Promise.all([
+      const [contacts, wonMtd, jewActive, stonesActive] = await Promise.all([
         pool.query(
           `SELECT COUNT(*)::int AS c FROM crm_contacts WHERE user_id = $1 AND assigned_to = $2`,
           [ownerId, who]
@@ -8479,10 +8634,22 @@ app.get('/api/team/leaderboard', async (req, res) => {
               AND status NOT IN ('sold','archived')`,
           [ownerId, who]
         ),
-      ]).catch(() => [{ rows: [{ c: 0 }] }, { rows: [{ c: 0, v: 0 }] }, { rows: [{ c: 0 }] }]);
+        pool.query(
+          `SELECT COUNT(*)::int AS c
+             FROM stone_assignments
+            WHERE team_owner_id = $1 AND assigned_to = $2`,
+          [ownerId, who]
+        ),
+      ]).catch(() => [
+        { rows: [{ c: 0 }] }, { rows: [{ c: 0, v: 0 }] },
+        { rows: [{ c: 0 }] }, { rows: [{ c: 0 }] },
+      ]);
 
-      const revenue = Number(wonMtd.rows[0]?.v || 0);
-      const quota   = Number(m.quota_monthly || 0);
+      const revenue        = Number(wonMtd.rows[0]?.v || 0);
+      const quota          = Number(m.quota_monthly || 0);
+      const jewelryActive  = jewActive.rows[0]?.c || 0;
+      const stonesAssigned = stonesActive.rows[0]?.c || 0;
+
       out.push({
         memberId:        m.id,
         clerkUserId:     m.clerk_user_id,
@@ -8495,9 +8662,11 @@ app.get('/api/team/leaderboard', async (req, res) => {
         assignedContacts:contacts.rows[0]?.c || 0,
         wonDealsMtd:     wonMtd.rows[0]?.c || 0,
         revenueMtd:      revenue,
-        jewelryInProgress: jewActive.rows[0]?.c || 0,
-        commissionEarned:  Math.round(revenue * Number(m.commission_pct || 0)) / 100,
-        quotaPct:          quota > 0 ? Math.round((revenue / quota) * 100) : null,
+        jewelryInProgress:   jewelryActive,
+        stonesInProgress:    stonesAssigned,
+        inventoryInProgress: jewelryActive + stonesAssigned,
+        commissionEarned:    Math.round(revenue * Number(m.commission_pct || 0)) / 100,
+        quotaPct:            quota > 0 ? Math.round((revenue / quota) * 100) : null,
       });
     }
     res.json({ leaderboard: out, monthStart: monthStart.toISOString() });
