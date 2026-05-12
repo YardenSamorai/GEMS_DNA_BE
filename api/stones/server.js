@@ -8235,7 +8235,146 @@ function isDeliverableEmail(value) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
 }
 
-async function sendTeamInviteEmail({ rep, inviter, workspaceName }) {
+/**
+ * createClerkInvitation({ email, redirectUrl, metadata, revokeExisting })
+ *
+ * Talks to Clerk's Backend API to mint an invitation ticket. Required when
+ * the workspace has Sign-up Mode set to "Restricted" — without a ticket,
+ * Clerk blocks self-signup. The ticket URL contains a one-time
+ * `__clerk_ticket=...` query param that the FE `<SignUp />` component picks
+ * up automatically.
+ *
+ * Resolves to:
+ *   { ok: true,  url, ticketId, alreadyUser: false }   -> use `url` in CTA
+ *   { ok: true,  url, ticketId, alreadyUser: true  }   -> existing user, send sign-in URL
+ *   { ok: false, skipped: true, error }                -> CLERK_SECRET_KEY missing
+ *   { ok: false, error }                                -> Clerk API error
+ *
+ * Notes:
+ *   - We always pass `notify: false` because we send our own branded email.
+ *   - Set `revokeExisting=true` (used by /resend-invite) to discard a prior
+ *     pending ticket and mint a fresh one.
+ */
+async function createClerkInvitation({ email, redirectUrl, metadata, revokeExisting = false }) {
+  if (!process.env.CLERK_SECRET_KEY) {
+    return { ok: false, skipped: true, error: 'CLERK_SECRET_KEY not configured' };
+  }
+  if (!isDeliverableEmail(email)) {
+    return { ok: false, error: `invalid email for invitation: ${email}` };
+  }
+
+  const auth = `Bearer ${process.env.CLERK_SECRET_KEY}`;
+
+  // 1. Optionally revoke any existing pending invitation so a fresh URL is minted.
+  //    Clerk identifies the existing one via `meta.invitation_id` on the
+  //    duplicate_record error; we also support the `?status=pending&email_address=`
+  //    list endpoint as a fallback for older API revisions.
+  if (revokeExisting) {
+    try {
+      const list = await fetch(
+        `https://api.clerk.com/v1/invitations?status=pending&query=${encodeURIComponent(email)}`,
+        { headers: { Authorization: auth } }
+      );
+      if (list.ok) {
+        const items = await list.json().catch(() => []);
+        const arr = Array.isArray(items) ? items : (items?.data || []);
+        for (const inv of arr) {
+          if (inv?.email_address?.toLowerCase() === email.toLowerCase() && inv?.id) {
+            await fetch(`https://api.clerk.com/v1/invitations/${inv.id}/revoke`, {
+              method: 'POST',
+              headers: { Authorization: auth },
+            }).catch(() => {});
+          }
+        }
+      }
+    } catch (_) { /* best effort */ }
+  }
+
+  // 2. Create the invitation. `notify: false` -> Clerk does not send its own
+  //    email; we use the returned `url` in our Resend template instead.
+  try {
+    const r = await fetch('https://api.clerk.com/v1/invitations', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: auth,
+      },
+      body: JSON.stringify({
+        email_address: email,
+        redirect_url: redirectUrl,
+        notify: false,
+        ...(metadata ? { public_metadata: metadata } : {}),
+      }),
+    });
+
+    if (r.ok) {
+      const data = await r.json().catch(() => ({}));
+      return {
+        ok: true,
+        url: data?.url || null,
+        ticketId: data?.id || null,
+        alreadyUser: false,
+      };
+    }
+
+    // Common error paths:
+    //  422 duplicate_record   -> a pending invitation already exists
+    //  422 form_identifier_exists / "already exists" / 400 -> user already
+    //                             has a Clerk account, no ticket needed.
+    const body = await r.json().catch(() => ({}));
+    const errors = Array.isArray(body?.errors) ? body.errors : [];
+    const code = errors[0]?.code || '';
+    const msg  = (errors[0]?.message || '').toLowerCase();
+
+    // Existing pending invitation -> fetch its URL so the email still works.
+    if (code === 'duplicate_record' && errors[0]?.meta?.invitation_id) {
+      const invId = errors[0].meta.invitation_id;
+      // Clerk doesn't return the ticket URL on GET, so we revoke + recreate.
+      await fetch(`https://api.clerk.com/v1/invitations/${invId}/revoke`, {
+        method: 'POST',
+        headers: { Authorization: auth },
+      }).catch(() => {});
+      // One retry. If this fails too, surface the original error.
+      const retry = await fetch('https://api.clerk.com/v1/invitations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: auth },
+        body: JSON.stringify({
+          email_address: email,
+          redirect_url: redirectUrl,
+          notify: false,
+          ...(metadata ? { public_metadata: metadata } : {}),
+        }),
+      });
+      if (retry.ok) {
+        const data = await retry.json().catch(() => ({}));
+        return { ok: true, url: data?.url || null, ticketId: data?.id || null, alreadyUser: false };
+      }
+    }
+
+    // Email already belongs to a Clerk user — they should sign IN, not up.
+    if (
+      code === 'form_identifier_exists' ||
+      code === 'identifier_already_signed_up' ||
+      msg.includes('already exists') ||
+      msg.includes('already signed up')
+    ) {
+      return { ok: true, url: null, ticketId: null, alreadyUser: true };
+    }
+
+    return { ok: false, error: errors[0]?.message || `Clerk HTTP ${r.status}` };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/**
+ * sendTeamInviteEmail({ rep, inviter, workspaceName, ctaUrl })
+ *
+ * `ctaUrl` overrides the default sign-up URL. When the caller has a Clerk
+ * invitation ticket URL, it should pass it here; otherwise we fall back to
+ * `/sign-up?email=` (which only works if Clerk Sign-up Mode is Public).
+ */
+async function sendTeamInviteEmail({ rep, inviter, workspaceName, ctaUrl }) {
   if (!process.env.RESEND_API_KEY) {
     return { ok: false, skipped: true, error: 'RESEND_API_KEY not configured' };
   }
@@ -8247,10 +8386,10 @@ async function sendTeamInviteEmail({ rep, inviter, workspaceName }) {
   const fromEmail  = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
   const senderName = (workspaceName || 'GEMS DNA').replace(/[\r\n<>]/g, '');
   const fromHeader = `${senderName} <${fromEmail}>`;
-  // Send invitees to /sign-up because they don't have an account yet. The
-  // sign-up page itself links to /sign-in for already-registered users, so
-  // both flows are reachable from a single CTA.
-  const signInUrl  = `${FRONTEND_URL.replace(/\/$/, '')}/sign-up?email=${encodeURIComponent(rep.email)}`;
+  // Default: send invitees to /sign-up. Callers that have a Clerk ticket
+  // URL should pass it via `ctaUrl` so we don't fall back to a URL that
+  // would be blocked by Restricted sign-up mode.
+  const signInUrl  = ctaUrl || `${FRONTEND_URL.replace(/\/$/, '')}/sign-up?email=${encodeURIComponent(rep.email)}`;
 
   const { subject, html, text } = buildInviteEmail({ rep, inviter, workspaceName, signInUrl });
 
@@ -8498,8 +8637,36 @@ app.post('/api/team/members', async (req, res) => {
 
       // Skip email for owner role — that's the admin themselves.
       let emailResult = { ok: false, skipped: true };
+      let inviteResult = { ok: false, skipped: true };
       if (role === 'rep') {
-        emailResult = await sendTeamInviteEmail({ rep: member, inviter, workspaceName });
+        // Mint a Clerk invitation ticket so the rep can sign up even when
+        // Sign-up Mode is set to Restricted in the Clerk dashboard.
+        inviteResult = await createClerkInvitation({
+          email: member.email,
+          redirectUrl: `${FRONTEND_URL.replace(/\/$/, '')}/dashboard`,
+          metadata: {
+            team_owner_id: ownerId,
+            team_member_id: member.id,
+            role: 'rep',
+          },
+          // First invite: don't bother revoking — there shouldn't be one.
+          revokeExisting: false,
+        });
+
+        let ctaUrl = null;
+        if (inviteResult.ok && inviteResult.url) {
+          ctaUrl = inviteResult.url;
+        } else if (inviteResult.ok && inviteResult.alreadyUser) {
+          // The email already has a Clerk account → send them to /sign-in
+          // with the email pre-filled. No ticket needed; signing in is what
+          // links them to the team_members row.
+          ctaUrl = `${FRONTEND_URL.replace(/\/$/, '')}/sign-in?email=${encodeURIComponent(member.email)}`;
+        }
+        if (!inviteResult.ok && !inviteResult.skipped) {
+          console.warn(`[clerk invite] ${member.email}:`, inviteResult.error);
+        }
+
+        emailResult = await sendTeamInviteEmail({ rep: member, inviter, workspaceName, ctaUrl });
         if (!emailResult.ok && !emailResult.skipped) {
           console.warn(`[team invite] failed to email ${member.email}:`, emailResult.error);
         }
@@ -8511,6 +8678,12 @@ app.post('/api/team/members', async (req, res) => {
           sent:    emailResult.ok === true,
           skipped: emailResult.skipped === true,
           error:   emailResult.ok ? null : (emailResult.error || null),
+        },
+        invite: {
+          ticketed:    inviteResult.ok === true && !inviteResult.alreadyUser && !!inviteResult.url,
+          alreadyUser: inviteResult.alreadyUser === true,
+          skipped:     inviteResult.skipped === true,
+          error:       inviteResult.ok ? null : (inviteResult.error || null),
         },
       });
 
@@ -8656,7 +8829,32 @@ app.post('/api/team/members/:id/resend-invite', async (req, res) => {
     } catch (_) { inviter = { name: ctx.actorName, email: ctx.actorEmail }; }
 
     const workspaceName = inviter?.name ? `${inviter.name}'s workshop` : 'GEMS DNA Workshop';
-    const emailResult = await sendTeamInviteEmail({ rep: member, inviter, workspaceName });
+
+    // Mint a fresh Clerk invitation ticket. Pass `revokeExisting: true` so
+    // any prior pending ticket is discarded and the new email always points
+    // at a working URL (Clerk doesn't expose ticket URLs on GET).
+    const inviteResult = await createClerkInvitation({
+      email: member.email,
+      redirectUrl: `${FRONTEND_URL.replace(/\/$/, '')}/dashboard`,
+      metadata: {
+        team_owner_id: ownerId,
+        team_member_id: member.id,
+        role: 'rep',
+      },
+      revokeExisting: true,
+    });
+
+    let ctaUrl = null;
+    if (inviteResult.ok && inviteResult.url) {
+      ctaUrl = inviteResult.url;
+    } else if (inviteResult.ok && inviteResult.alreadyUser) {
+      ctaUrl = `${FRONTEND_URL.replace(/\/$/, '')}/sign-in?email=${encodeURIComponent(member.email)}`;
+    }
+    if (!inviteResult.ok && !inviteResult.skipped) {
+      console.warn(`[clerk invite resend] ${member.email}:`, inviteResult.error);
+    }
+
+    const emailResult = await sendTeamInviteEmail({ rep: member, inviter, workspaceName, ctaUrl });
 
     // Bump counters even if RESEND is misconfigured — admin still tried.
     const upd = await pool.query(
@@ -8683,6 +8881,12 @@ app.post('/api/team/members/:id/resend-invite', async (req, res) => {
       success: true,
       member: upd.rows[0],
       email:  { sent: true, id: emailResult.id || null },
+      invite: {
+        ticketed:    inviteResult.ok === true && !inviteResult.alreadyUser && !!inviteResult.url,
+        alreadyUser: inviteResult.alreadyUser === true,
+        skipped:     inviteResult.skipped === true,
+        error:       inviteResult.ok ? null : (inviteResult.error || null),
+      },
     });
 
     logActivity({
