@@ -448,6 +448,54 @@ app.get("/api/soap-stones", async (req, res) => {
 });
 
 /* =========================================================
+   /api/stones/inventory-status – bulk status map
+   Returns one row per SKU that currently has a non-final
+   jewelry usage. The inventory list calls this once and
+   merges client-side; SKUs not in the map are 'available'.
+
+   IMPORTANT: this static path MUST be registered before the
+   /api/stones/:stone_id wildcard below, otherwise Express
+   matches "inventory-status" as a stone id and returns 404.
+   ========================================================= */
+app.get("/api/stones/inventory-status", async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT jis.stone_sku,
+              jis.inventory_status,
+              ji.id   AS jewelry_item_id,
+              ji.sku  AS jewelry_sku,
+              ji.name AS jewelry_name,
+              ji.status AS jewelry_status
+         FROM jewelry_item_stones jis
+         JOIN jewelry_items ji ON ji.id = jis.item_id
+        WHERE jis.stone_sku IS NOT NULL
+          AND jis.consume_from_inventory = TRUE
+          AND jis.inventory_status IS NOT NULL`
+    );
+    const map = {};
+    for (const row of r.rows) {
+      const sku = row.stone_sku;
+      const cur = map[sku];
+      // Active (reserved/set) wins over sold; among active, set wins over reserved.
+      const rank = (s) => (s === "set" ? 3 : s === "reserved" ? 2 : s === "sold" ? 1 : 0);
+      if (!cur || rank(row.inventory_status) > rank(cur.status)) {
+        map[sku] = {
+          status: row.inventory_status,
+          jewelry_item_id: row.jewelry_item_id,
+          jewelry_sku: row.jewelry_sku,
+          jewelry_name: row.jewelry_name,
+          jewelry_status: row.jewelry_status,
+        };
+      }
+    }
+    res.json({ statuses: map });
+  } catch (e) {
+    console.error("Inventory-status error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =========================================================
    /api/stones/:stone_id – אבן ספציפית (מ-soap_stones)
    ========================================================= */
 app.get("/api/stones/:stone_id", async (req, res) => {
@@ -698,50 +746,6 @@ app.get("/api/stones/:sku/usage", async (req, res) => {
     });
   } catch (e) {
     console.error("Stone usage error:", e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-/* =========================================================
-   /api/stones/inventory-status – bulk status map
-   Returns one row per SKU that currently has a non-final
-   jewelry usage. The inventory list calls this once and
-   merges client-side; SKUs not in the map are 'available'.
-   ========================================================= */
-app.get("/api/stones/inventory-status", async (req, res) => {
-  try {
-    const r = await pool.query(
-      `SELECT jis.stone_sku,
-              jis.inventory_status,
-              ji.id   AS jewelry_item_id,
-              ji.sku  AS jewelry_sku,
-              ji.name AS jewelry_name,
-              ji.status AS jewelry_status
-         FROM jewelry_item_stones jis
-         JOIN jewelry_items ji ON ji.id = jis.item_id
-        WHERE jis.stone_sku IS NOT NULL
-          AND jis.consume_from_inventory = TRUE
-          AND jis.inventory_status IS NOT NULL`
-    );
-    const map = {};
-    for (const row of r.rows) {
-      const sku = row.stone_sku;
-      const cur = map[sku];
-      // Active (reserved/set) wins over sold; among active, set wins over reserved.
-      const rank = (s) => (s === "set" ? 3 : s === "reserved" ? 2 : s === "sold" ? 1 : 0);
-      if (!cur || rank(row.inventory_status) > rank(cur.status)) {
-        map[sku] = {
-          status: row.inventory_status,
-          jewelry_item_id: row.jewelry_item_id,
-          jewelry_sku: row.jewelry_sku,
-          jewelry_name: row.jewelry_name,
-          jewelry_status: row.jewelry_status,
-        };
-      }
-    }
-    res.json({ statuses: map });
-  } catch (e) {
-    console.error("Inventory-status error:", e);
     res.status(500).json({ error: e.message });
   }
 });
