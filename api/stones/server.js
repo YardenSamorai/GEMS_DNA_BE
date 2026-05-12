@@ -2032,7 +2032,12 @@ const crmReadyPromise = (async () => {
       )
     `);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_team_members_clerk      ON team_members(clerk_user_id) WHERE clerk_user_id IS NOT NULL`);
-    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_team_members_team_email ON team_members(team_owner_id, LOWER(email))`);
+    // Old (non-partial) email uniqueness index used to block re-inviting a
+    // soft-deleted rep with the same email. Drop it and recreate as a
+    // partial index so the email slot is freed the moment a row goes
+    // inactive (= "Removed" from the UI).
+    await pool.query(`DROP INDEX IF EXISTS idx_team_members_team_email`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_team_members_team_email ON team_members(team_owner_id, LOWER(email)) WHERE active = TRUE`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_team_members_owner             ON team_members(team_owner_id) WHERE active = TRUE`);
 
     // Invitation lifecycle metadata. Older rows (pre-email integration) get
@@ -8349,22 +8354,69 @@ app.post('/api/team/members', async (req, res) => {
     }
 
     try {
-      const ins = await pool.query(
-        `INSERT INTO team_members
-           (team_owner_id, email, name, role, avatar_color, commission_pct, quota_monthly, active, invited_at, last_invited_at, invite_count)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, NOW(), NOW(), 1)
-         RETURNING *`,
-        [
-          ownerId,
-          String(email).trim().toLowerCase(),
-          String(name).trim(),
-          role,
-          avatarColor || pickAvatarColor(email),
-          Number(commissionPct) || 0,
-          Number(quotaMonthly)  || 0,
-        ]
+      // If we previously had this email as a *removed* (active=FALSE) row,
+      // bring it back to life instead of erroring out with a duplicate.
+      // This is what the admin actually expects when they hit "Remove" and
+      // then re-invite the same person.
+      const normalizedEmail = String(email).trim().toLowerCase();
+      const inactivePrior = await pool.query(
+        `SELECT * FROM team_members
+          WHERE team_owner_id = $1
+            AND LOWER(email) = $2
+            AND active = FALSE
+          ORDER BY updated_at DESC
+          LIMIT 1`,
+        [ownerId, normalizedEmail]
       );
-      const member = ins.rows[0];
+
+      let member;
+      if (inactivePrior.rows.length) {
+        const prior = inactivePrior.rows[0];
+        const upd = await pool.query(
+          `UPDATE team_members
+              SET active          = TRUE,
+                  name            = $1,
+                  role            = $2,
+                  avatar_color    = COALESCE($3, avatar_color),
+                  commission_pct  = $4,
+                  quota_monthly   = $5,
+                  invited_at      = NOW(),
+                  last_invited_at = NOW(),
+                  invite_count    = COALESCE(invite_count, 0) + 1,
+                  -- Wipe any stale Clerk linkage from the previous life so
+                  -- the new rep gets re-linked cleanly on their first sign-in.
+                  clerk_user_id   = NULL,
+                  updated_at      = NOW()
+            WHERE id = $6
+            RETURNING *`,
+          [
+            String(name).trim(),
+            role,
+            avatarColor || pickAvatarColor(email),
+            Number(commissionPct) || 0,
+            Number(quotaMonthly)  || 0,
+            prior.id,
+          ]
+        );
+        member = upd.rows[0];
+      } else {
+        const ins = await pool.query(
+          `INSERT INTO team_members
+             (team_owner_id, email, name, role, avatar_color, commission_pct, quota_monthly, active, invited_at, last_invited_at, invite_count)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, NOW(), NOW(), 1)
+           RETURNING *`,
+          [
+            ownerId,
+            normalizedEmail,
+            String(name).trim(),
+            role,
+            avatarColor || pickAvatarColor(email),
+            Number(commissionPct) || 0,
+            Number(quotaMonthly)  || 0,
+          ]
+        );
+        member = ins.rows[0];
+      }
 
       // Look up the inviter (admin) row for the email "from" name + reply-to.
       let inviter = null;
