@@ -824,7 +824,7 @@ app.post("/api/jewelry/import-csv", async (req, res) => {
       'full_description','jewelry_size','instructions_main'
     ];
 
-    const values = rows.map(r => [
+    const rawValues = rows.map(r => [
       r['Model Number'] || null,
       r['Stock Number'] || null,
       r['Jewelry Type'] || null,
@@ -852,9 +852,36 @@ app.post("/api/jewelry/import-csv", async (req, res) => {
       r['full_description'] || null,
       r['jewelry_size'] || null,
       r['Instructions_main'] || null,
-    ]).filter(v => v[0] !== null);
+    ]).filter(v => v[0] !== null && String(v[0]).trim() !== '');
 
-    jewelryImportProgress = { ...jewelryImportProgress, phase: 'clearing', progress: 40, detail: 'Preparing database...' };
+    // De-duplicate by model_number BEFORE issuing the upsert. If a single
+    // CSV contains the same Model Number more than once, Postgres chokes
+    // with: "ON CONFLICT DO UPDATE command cannot affect row a second time"
+    // because the upsert can't touch the same target row twice in one
+    // statement. Last occurrence wins (assumes the bottom of the file is
+    // the freshest data).
+    const dedupMap = new Map();
+    let duplicateModelCount = 0;
+    for (const row of rawValues) {
+      const key = String(row[0]).trim();
+      if (dedupMap.has(key)) duplicateModelCount += 1;
+      dedupMap.set(key, row);
+    }
+    const values = Array.from(dedupMap.values());
+    if (duplicateModelCount > 0) {
+      console.warn(
+        `[jewelry CSV import] Collapsed ${duplicateModelCount} duplicate Model Number row(s); kept the last occurrence of each.`
+      );
+    }
+
+    jewelryImportProgress = {
+      ...jewelryImportProgress,
+      phase: 'clearing',
+      progress: 40,
+      detail: duplicateModelCount > 0
+        ? `Preparing database (collapsed ${duplicateModelCount} duplicate rows)...`
+        : 'Preparing database...',
+    };
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS jewelry_products (
@@ -907,10 +934,19 @@ app.post("/api/jewelry/import-csv", async (req, res) => {
       jewelryImportProgress = { ...jewelryImportProgress, progress: pct, processed: Math.min(i + CHUNK, values.length), detail: `Inserted ${Math.min(i + CHUNK, values.length)} / ${values.length} items` };
     }
 
-    jewelryImportProgress = { active: false, phase: 'complete', progress: 100, detail: `Successfully imported ${values.length} jewelry items!`, total: values.length, processed: values.length };
-    console.log(`Jewelry CSV import completed: ${values.length} items`);
+    const completionDetail = duplicateModelCount > 0
+      ? `Successfully imported ${values.length} jewelry items (collapsed ${duplicateModelCount} duplicate Model Number rows).`
+      : `Successfully imported ${values.length} jewelry items!`;
 
-    res.json({ success: true, count: values.length, status: "completed" });
+    jewelryImportProgress = { active: false, phase: 'complete', progress: 100, detail: completionDetail, total: values.length, processed: values.length };
+    console.log(`Jewelry CSV import completed: ${values.length} items` + (duplicateModelCount > 0 ? ` (${duplicateModelCount} duplicates collapsed)` : ''));
+
+    res.json({
+      success: true,
+      count: values.length,
+      duplicatesCollapsed: duplicateModelCount,
+      status: "completed",
+    });
   } catch (error) {
     console.error("Jewelry CSV import error:", error);
     jewelryImportProgress = { active: false, phase: 'error', progress: 0, detail: error.message, total: 0, processed: 0 };
