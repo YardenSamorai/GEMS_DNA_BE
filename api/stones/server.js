@@ -8222,11 +8222,27 @@ function buildInviteEmail({ rep, inviter, workspaceName, signInUrl }) {
  * return { ok: false, skipped: true } so the row stays as Pending sign-in
  * but the admin can still copy the sign-in URL manually.
  */
+// Resend rejects anything that isn't a real-looking address (e.g. our
+// synthetic `owner-user_xxx@local` placeholder used when the owner row
+// has no Clerk email). Keep this strict-but-loose: must have an @, a TLD,
+// and not be the `@local` placeholder we generate internally.
+function isDeliverableEmail(value) {
+  if (!value || typeof value !== 'string') return false;
+  const v = value.trim();
+  if (!v || v.length > 254) return false;
+  if (/@local$/i.test(v)) return false;
+  // RFC-ish: local@domain.tld (no spaces, at least one dot in the domain)
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+}
+
 async function sendTeamInviteEmail({ rep, inviter, workspaceName }) {
   if (!process.env.RESEND_API_KEY) {
     return { ok: false, skipped: true, error: 'RESEND_API_KEY not configured' };
   }
   if (!rep?.email) return { ok: false, error: 'rep email missing' };
+  if (!isDeliverableEmail(rep.email)) {
+    return { ok: false, error: `rep email is not deliverable: ${rep.email}` };
+  }
 
   const fromEmail  = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
   const senderName = (workspaceName || 'GEMS DNA').replace(/[\r\n<>]/g, '');
@@ -8234,6 +8250,10 @@ async function sendTeamInviteEmail({ rep, inviter, workspaceName }) {
   const signInUrl  = `${FRONTEND_URL.replace(/\/$/, '')}/sign-in?email=${encodeURIComponent(rep.email)}`;
 
   const { subject, html, text } = buildInviteEmail({ rep, inviter, workspaceName, signInUrl });
+
+  // Only set reply_to if the inviter has a real email address. Otherwise
+  // Resend rejects the whole request with a 422 validation_error.
+  const replyTo = isDeliverableEmail(inviter?.email) ? inviter.email : null;
 
   try {
     const r = await fetch('https://api.resend.com/emails', {
@@ -8248,7 +8268,7 @@ async function sendTeamInviteEmail({ rep, inviter, workspaceName }) {
         subject,
         html,
         text,
-        ...(inviter?.email ? { reply_to: inviter.email } : {}),
+        ...(replyTo ? { reply_to: replyTo } : {}),
       }),
     });
     if (!r.ok) {
