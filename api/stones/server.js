@@ -1904,6 +1904,13 @@ const crmReadyPromise = (async () => {
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_team_members_clerk      ON team_members(clerk_user_id) WHERE clerk_user_id IS NOT NULL`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_team_members_team_email ON team_members(team_owner_id, LOWER(email))`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_team_members_owner             ON team_members(team_owner_id) WHERE active = TRUE`);
+
+    // Invitation lifecycle metadata. Older rows (pre-email integration) get
+    // back-filled to created_at so the UI can show a sane "Invited X ago".
+    await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS invited_at      TIMESTAMP`);
+    await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS last_invited_at TIMESTAMP`);
+    await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS invite_count    INTEGER DEFAULT 0`);
+    await pool.query(`UPDATE team_members SET invited_at = created_at WHERE invited_at IS NULL`);
     // FK for folder_id (separate so it doesn't fail if column already added)
     try {
       await pool.query(`
@@ -7899,6 +7906,165 @@ function pickAvatarColor(seed) {
   return TEAM_AVATAR_COLORS[Math.abs(h) % TEAM_AVATAR_COLORS.length];
 }
 
+// Tiny HTML escaper for the invite email — we never want a workspace name to
+// leak as raw HTML.
+function escHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/**
+ * buildInviteEmail({ rep, inviter, workspaceName, signInUrl })
+ *
+ * Returns { subject, html, text } so the same template is reused by the
+ * initial POST and the "Resend invitation" endpoint.
+ */
+function buildInviteEmail({ rep, inviter, workspaceName, signInUrl }) {
+  const repName    = escHtml(rep?.name || 'there');
+  const inviteName = escHtml(inviter?.name || inviter?.email || 'Your team admin');
+  const wsName     = escHtml(workspaceName || 'GEMS DNA workspace');
+  const ctaUrl     = signInUrl || 'https://www.gems-dna.com/sign-in';
+  const repEmail   = escHtml(rep?.email || '');
+
+  const subject = `${inviter?.name || 'Your team admin'} invited you to join ${workspaceName || 'GEMS DNA'}`;
+
+  const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8" /><title>${escHtml(subject)}</title></head>
+<body style="margin:0;padding:0;background:#f5f5f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1c1917;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f5f5f4;padding:32px 16px;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,0.04);">
+        <tr><td style="padding:28px 32px 0 32px;">
+          <div style="display:inline-flex;align-items:center;gap:8px;">
+            <div style="width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#10b981 0%,#059669 100%);display:inline-block;line-height:36px;text-align:center;color:white;font-weight:700;font-size:16px;">GD</div>
+            <div style="font-weight:700;color:#1c1917;font-size:18px;letter-spacing:-0.01em;">GEMS DNA</div>
+          </div>
+        </td></tr>
+        <tr><td style="padding:24px 32px 8px 32px;">
+          <h1 style="margin:0 0 8px 0;font-size:22px;font-weight:700;color:#1c1917;line-height:1.3;">
+            You're invited to join <span style="color:#059669;">${wsName}</span>
+          </h1>
+          <p style="margin:0 0 16px 0;font-size:15px;line-height:1.6;color:#44403c;">
+            Hey ${repName},
+          </p>
+          <p style="margin:0 0 16px 0;font-size:15px;line-height:1.6;color:#44403c;">
+            <strong>${inviteName}</strong> just added you as a sales rep on <strong>GEMS DNA</strong> — the
+            workshop platform for managing customers, deals, and jewelry production.
+          </p>
+          <p style="margin:0 0 24px 0;font-size:15px;line-height:1.6;color:#44403c;">
+            You'll see your own contacts, deals, and jewelry items the moment you log in.
+            Just sign in with this exact email to get linked to the team:
+            <strong style="color:#1c1917;">${repEmail}</strong>
+          </p>
+        </td></tr>
+        <tr><td align="center" style="padding:0 32px 8px 32px;">
+          <a href="${ctaUrl}"
+             style="display:inline-block;background:#059669;color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:10px;font-weight:600;font-size:15px;letter-spacing:0.01em;">
+             Accept invitation
+          </a>
+        </td></tr>
+        <tr><td style="padding:16px 32px 8px 32px;">
+          <p style="margin:0;font-size:12px;line-height:1.6;color:#78716c;text-align:center;">
+            Or paste this link into your browser:<br/>
+            <a href="${ctaUrl}" style="color:#059669;word-break:break-all;">${ctaUrl}</a>
+          </p>
+        </td></tr>
+        <tr><td style="padding:24px 32px;border-top:1px solid #f5f5f4;margin-top:16px;">
+          <p style="margin:0;font-size:12px;line-height:1.5;color:#a8a29e;">
+            What you'll be able to do:
+          </p>
+          <ul style="margin:8px 0 0 0;padding:0 0 0 18px;font-size:13px;line-height:1.7;color:#57534e;">
+            <li>Manage the contacts &amp; deals assigned to you</li>
+            <li>Track jewelry items in production</li>
+            <li>See your own commission &amp; quota progress</li>
+          </ul>
+        </td></tr>
+        <tr><td style="padding:18px 32px 28px 32px;background:#fafaf9;">
+          <p style="margin:0;font-size:11px;line-height:1.5;color:#a8a29e;text-align:center;">
+            If you weren't expecting this invitation you can safely ignore this email — you won't be added until you sign in.
+          </p>
+        </td></tr>
+      </table>
+      <p style="margin:16px 0 0 0;font-size:11px;color:#a8a29e;">© GEMS DNA · Sent because ${inviteName} added you to a workspace.</p>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+  const text = [
+    `Hey ${rep?.name || 'there'},`,
+    ``,
+    `${inviter?.name || 'Your team admin'} just added you as a sales rep on GEMS DNA — the workshop platform for managing customers, deals, and jewelry production.`,
+    ``,
+    `Accept your invitation by signing in with this exact email: ${rep?.email || ''}`,
+    `${ctaUrl}`,
+    ``,
+    `What you'll be able to do:`,
+    `  • Manage the contacts & deals assigned to you`,
+    `  • Track jewelry items in production`,
+    `  • See your own commission & quota progress`,
+    ``,
+    `If you weren't expecting this invitation, you can safely ignore this email — you won't be added until you sign in.`,
+    ``,
+    `— GEMS DNA`,
+  ].join('\n');
+
+  return { subject, html, text };
+}
+
+/**
+ * sendTeamInviteEmail({ rep, inviter, workspaceName })
+ *
+ * Returns { ok: true, id } on success, { ok: false, error } on failure.
+ * Never throws — callers can decide whether to surface the error.
+ *
+ * Honors RESEND_API_KEY / RESEND_FROM_EMAIL. If RESEND is not configured we
+ * return { ok: false, skipped: true } so the row stays as Pending sign-in
+ * but the admin can still copy the sign-in URL manually.
+ */
+async function sendTeamInviteEmail({ rep, inviter, workspaceName }) {
+  if (!process.env.RESEND_API_KEY) {
+    return { ok: false, skipped: true, error: 'RESEND_API_KEY not configured' };
+  }
+  if (!rep?.email) return { ok: false, error: 'rep email missing' };
+
+  const fromEmail  = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
+  const senderName = (workspaceName || 'GEMS DNA').replace(/[\r\n<>]/g, '');
+  const fromHeader = `${senderName} <${fromEmail}>`;
+  const signInUrl  = `${FRONTEND_URL.replace(/\/$/, '')}/sign-in?email=${encodeURIComponent(rep.email)}`;
+
+  const { subject, html, text } = buildInviteEmail({ rep, inviter, workspaceName, signInUrl });
+
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      },
+      body: JSON.stringify({
+        from: fromHeader,
+        to: [rep.email],
+        subject,
+        html,
+        text,
+        ...(inviter?.email ? { reply_to: inviter.email } : {}),
+      }),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      return { ok: false, error: txt.slice(0, 300) || `HTTP ${r.status}` };
+    }
+    const data = await r.json().catch(() => ({}));
+    return { ok: true, id: data?.id || null };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
 // Make sure the workspace owner exists in team_members. Idempotent — safe
 // to call on every /api/team/me hit. We can't auto-create reps (we don't
 // know their emails), but we can guarantee the owner row is always there.
@@ -7954,6 +8120,7 @@ app.get('/api/team/me', async (req, res) => {
       `SELECT id, team_owner_id, clerk_user_id, email, name, role,
               avatar_color, commission_pct, quota_monthly, active,
               created_at, updated_at,
+              invited_at, last_invited_at, invite_count,
               (clerk_user_id IS NULL) AS pending
          FROM team_members
         WHERE team_owner_id = $1 AND active = TRUE
@@ -7988,6 +8155,7 @@ app.get('/api/team/members', async (req, res) => {
       `SELECT id, team_owner_id, clerk_user_id, email, name, role,
               avatar_color, commission_pct, quota_monthly, active,
               created_at, updated_at,
+              invited_at, last_invited_at, invite_count,
               (clerk_user_id IS NULL) AS pending
          FROM team_members
         WHERE team_owner_id = $1 AND active = TRUE
@@ -8031,8 +8199,8 @@ app.post('/api/team/members', async (req, res) => {
     try {
       const ins = await pool.query(
         `INSERT INTO team_members
-           (team_owner_id, email, name, role, avatar_color, commission_pct, quota_monthly, active)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+           (team_owner_id, email, name, role, avatar_color, commission_pct, quota_monthly, active, invited_at, last_invited_at, invite_count)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, NOW(), NOW(), 1)
          RETURNING *`,
         [
           ownerId,
@@ -8044,16 +8212,50 @@ app.post('/api/team/members', async (req, res) => {
           Number(quotaMonthly)  || 0,
         ]
       );
-      res.status(201).json({ member: ins.rows[0] });
+      const member = ins.rows[0];
+
+      // Look up the inviter (admin) row for the email "from" name + reply-to.
+      let inviter = null;
+      try {
+        const ownerRow = await pool.query(
+          `SELECT name, email FROM team_members
+            WHERE team_owner_id = $1 AND role = 'owner' LIMIT 1`,
+          [ownerId]
+        );
+        inviter = ownerRow.rows[0] || { name: ctx.actorName, email: ctx.actorEmail };
+      } catch (_) { inviter = { name: ctx.actorName, email: ctx.actorEmail }; }
+
+      // Reps only show up under one workspace, so we treat the inviter's name
+      // (or "GEMS DNA Workshop") as the workspace label.
+      const workspaceName = inviter?.name ? `${inviter.name}'s workshop` : 'GEMS DNA Workshop';
+
+      // Skip email for owner role — that's the admin themselves.
+      let emailResult = { ok: false, skipped: true };
+      if (role === 'rep') {
+        emailResult = await sendTeamInviteEmail({ rep: member, inviter, workspaceName });
+        if (!emailResult.ok && !emailResult.skipped) {
+          console.warn(`[team invite] failed to email ${member.email}:`, emailResult.error);
+        }
+      }
+
+      res.status(201).json({
+        member,
+        email: {
+          sent:    emailResult.ok === true,
+          skipped: emailResult.skipped === true,
+          error:   emailResult.ok ? null : (emailResult.error || null),
+        },
+      });
 
       logActivity({
         userId:     ownerId,
         actorId:    ctx.actorUserId,
         actorName:  ctx.actorName,
         entityType: 'team_member',
-        entityId:   ins.rows[0].id,
+        entityId:   member.id,
         action:     'invited',
-        summary:    `Invited ${ins.rows[0].name} (${ins.rows[0].email}) as ${ins.rows[0].role}`,
+        summary:    `Invited ${member.name} (${member.email}) as ${member.role}` +
+                    (emailResult.ok ? ' · email sent' : ''),
       });
     } catch (dupErr) {
       if (String(dupErr.message || '').includes('duplicate')) {
@@ -8145,6 +8347,88 @@ app.delete('/api/team/members/:id', async (req, res) => {
     });
   } catch (e) {
     console.error('DELETE /api/team/members error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/team/members/:id/resend-invite
+//   Owner-only. Re-sends the invitation email and bumps invite_count /
+//   last_invited_at. Returns the updated row + the email status.
+app.post('/api/team/members/:id/resend-invite', async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
+    if (!ctx.isOwner)     return res.status(403).json({ error: 'Only the workspace owner can resend invitations' });
+
+    const { id } = req.params;
+    const ownerId = ctx.tenantUserId || ctx.actorUserId;
+
+    const memberRes = await pool.query(
+      `SELECT * FROM team_members
+        WHERE id = $1 AND team_owner_id = $2 AND active = TRUE`,
+      [id, ownerId]
+    );
+    if (!memberRes.rows[0]) return res.status(404).json({ error: 'Member not found' });
+    const member = memberRes.rows[0];
+
+    if (member.role === 'owner') {
+      return res.status(400).json({ error: 'Cannot send invitation to the workspace owner' });
+    }
+    if (member.clerk_user_id) {
+      return res.status(400).json({ error: `${member.name} has already accepted and signed in` });
+    }
+
+    let inviter = null;
+    try {
+      const ownerRow = await pool.query(
+        `SELECT name, email FROM team_members
+          WHERE team_owner_id = $1 AND role = 'owner' LIMIT 1`,
+        [ownerId]
+      );
+      inviter = ownerRow.rows[0] || { name: ctx.actorName, email: ctx.actorEmail };
+    } catch (_) { inviter = { name: ctx.actorName, email: ctx.actorEmail }; }
+
+    const workspaceName = inviter?.name ? `${inviter.name}'s workshop` : 'GEMS DNA Workshop';
+    const emailResult = await sendTeamInviteEmail({ rep: member, inviter, workspaceName });
+
+    // Bump counters even if RESEND is misconfigured — admin still tried.
+    const upd = await pool.query(
+      `UPDATE team_members
+          SET last_invited_at = NOW(),
+              invite_count    = COALESCE(invite_count, 0) + 1,
+              updated_at      = NOW()
+        WHERE id = $1
+        RETURNING *`,
+      [id]
+    );
+
+    if (!emailResult.ok) {
+      const status = emailResult.skipped ? 503 : 502;
+      return res.status(status).json({
+        error: emailResult.skipped
+          ? 'Email service is not configured (set RESEND_API_KEY).'
+          : `Failed to send invitation: ${emailResult.error || 'unknown error'}`,
+        member: upd.rows[0],
+      });
+    }
+
+    res.json({
+      success: true,
+      member: upd.rows[0],
+      email:  { sent: true, id: emailResult.id || null },
+    });
+
+    logActivity({
+      userId:     ownerId,
+      actorId:    ctx.actorUserId,
+      actorName:  ctx.actorName,
+      entityType: 'team_member',
+      entityId:   id,
+      action:     'invite_resent',
+      summary:    `Re-sent invitation email to ${member.name} (${member.email})`,
+    });
+  } catch (e) {
+    console.error('POST /api/team/members/:id/resend-invite error:', e);
     res.status(500).json({ error: e.message });
   }
 });
