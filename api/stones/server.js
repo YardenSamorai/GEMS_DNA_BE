@@ -2241,8 +2241,145 @@ const crmReadyPromise = (async () => {
       console.warn("DNA backfill warn:", e.message);
     }
 
+    /* ────────────────────────────────────────────────────────────────
+       Sprint 4 — Companies (retail stores) + Memo (consignment) system.
+
+       Goal: track jewelry/stones we send out on consignment to retail
+       stores. A "company" is a store entity that can have many CRM
+       contacts inside it (owner, manager, salespeople). A "memo" is a
+       dated bundle of items sent to a company; each item has its own
+       lifecycle (out → returned / sold) so a memo can be partially
+       closed without affecting the rest.
+
+       Design notes:
+         - Pricing: only memo_price is recorded per item. The store
+           never sees Bruto/Neto/cost — they only see what we'd charge
+           them if the item is sold from the memo.
+         - Inventory awareness: items currently on an active memo
+           (status='out') should NOT appear as "available" in the rep's
+           inventory. We expose this via a small index used by the FE.
+         - Polymorphic items: an item is either a loose stone (matched
+           by sku from soap_stones) or a jewelry piece (matched by
+           model_number/sku from jewelry_items). We store snapshot JSON
+           so the memo doesn't break if inventory data changes later.
+       ─────────────────────────────────────────────────────────────── */
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_companies (
+        id                SERIAL PRIMARY KEY,
+        user_id           TEXT NOT NULL,
+        name              TEXT NOT NULL,
+        type              TEXT NOT NULL DEFAULT 'retail_store',
+        primary_contact   TEXT,
+        email             TEXT,
+        phone             TEXT,
+        website           TEXT,
+        country           TEXT,
+        city              TEXT,
+        address           TEXT,
+        tax_id            TEXT,
+        notes             TEXT,
+        tags              JSONB DEFAULT '[]',
+        default_memo_days INTEGER DEFAULT 30,
+        payment_terms     TEXT,
+        credit_limit      NUMERIC(14,2),
+        status            TEXT DEFAULT 'active',
+        assigned_to       TEXT,
+        shared            BOOLEAN DEFAULT FALSE,
+        logo_url          TEXT,
+        created_at        TIMESTAMP DEFAULT NOW(),
+        updated_at        TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_companies_user        ON crm_companies(user_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_companies_type        ON crm_companies(type)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_companies_assigned_to ON crm_companies(assigned_to) WHERE assigned_to IS NOT NULL`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_companies_email_lower ON crm_companies(LOWER(email))`);
+
+    // Link contacts and deals to a company (idempotent — column may
+    // already exist from a previous boot). FK is added separately so
+    // adding the column never depends on the FK succeeding.
+    try { await pool.query(`ALTER TABLE crm_contacts ADD COLUMN IF NOT EXISTS company_id INTEGER`); } catch (_) {}
+    try { await pool.query(`ALTER TABLE crm_deals    ADD COLUMN IF NOT EXISTS company_id INTEGER`); } catch (_) {}
+    try {
+      await pool.query(`
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.table_constraints
+            WHERE constraint_name = 'crm_contacts_company_fk'
+          ) THEN
+            ALTER TABLE crm_contacts
+            ADD CONSTRAINT crm_contacts_company_fk
+            FOREIGN KEY (company_id) REFERENCES crm_companies(id) ON DELETE SET NULL;
+          END IF;
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.table_constraints
+            WHERE constraint_name = 'crm_deals_company_fk'
+          ) THEN
+            ALTER TABLE crm_deals
+            ADD CONSTRAINT crm_deals_company_fk
+            FOREIGN KEY (company_id) REFERENCES crm_companies(id) ON DELETE SET NULL;
+          END IF;
+        END $$;
+      `);
+    } catch (e) { console.warn("Company FK migration warn:", e.message); }
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_contacts_company_id ON crm_contacts(company_id) WHERE company_id IS NOT NULL`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_deals_company_id    ON crm_deals(company_id)    WHERE company_id IS NOT NULL`);
+
+    // Memo header.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS memos (
+        id              SERIAL PRIMARY KEY,
+        user_id         TEXT NOT NULL,
+        memo_number     TEXT NOT NULL,
+        company_id      INTEGER NOT NULL REFERENCES crm_companies(id) ON DELETE CASCADE,
+        contact_id      INTEGER REFERENCES crm_contacts(id) ON DELETE SET NULL,
+        status          TEXT NOT NULL DEFAULT 'draft',
+        issued_at       TIMESTAMP,
+        due_at          DATE,
+        closed_at       TIMESTAMP,
+        total_value     NUMERIC(14,2) DEFAULT 0,
+        currency        TEXT DEFAULT 'USD',
+        notes           TEXT,
+        internal_notes  TEXT,
+        created_by      TEXT,
+        assigned_to     TEXT,
+        created_at      TIMESTAMP DEFAULT NOW(),
+        updated_at      TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_memos_user_number    ON memos(user_id, memo_number)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS        idx_memos_company        ON memos(company_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS        idx_memos_status         ON memos(status)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS        idx_memos_user_status    ON memos(user_id, status)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS        idx_memos_assigned_to    ON memos(assigned_to) WHERE assigned_to IS NOT NULL`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS        idx_memos_due_at_open    ON memos(due_at) WHERE status IN ('out','partially_returned')`);
+
+    // Memo line items. Polymorphic: item_type is 'stone' or 'jewelry'.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS memo_items (
+        id            SERIAL PRIMARY KEY,
+        memo_id       INTEGER NOT NULL REFERENCES memos(id) ON DELETE CASCADE,
+        item_type     TEXT NOT NULL,
+        item_sku      TEXT NOT NULL,
+        item_id       TEXT,
+        snapshot      JSONB DEFAULT '{}',
+        memo_price    NUMERIC(14,2),
+        quantity      INTEGER DEFAULT 1,
+        status        TEXT NOT NULL DEFAULT 'out',
+        returned_at   TIMESTAMP,
+        sold_at       TIMESTAMP,
+        notes         TEXT,
+        created_at    TIMESTAMP DEFAULT NOW(),
+        updated_at    TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_items_memo        ON memo_items(memo_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_items_sku         ON memo_items(item_sku)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_items_active      ON memo_items(item_sku, status) WHERE status = 'out'`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_items_status      ON memo_items(status)`);
+
     crmReady = true;
-    console.log("CRM tables ready");
+    console.log("CRM tables ready (incl. companies + memos)");
   } catch (err) {
     console.error("❌ CRM table creation error:", err);
   }
@@ -5249,6 +5386,737 @@ Rules:
   } catch (error) {
     console.error("Error scanning card:", error);
     res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
+   CRM – Companies (retail stores / wholesale partners)
+
+   A "company" is a tenant of the CRM that groups several contacts
+   together (e.g. a store has an owner + a manager + 2 salespeople).
+   Memos live under a company, not a single person, so any contact at
+   the store can interact with the same memo.
+   ========================================================= */
+
+const CO_FIELDS = [
+  'name','type','primary_contact','email','phone','website',
+  'country','city','address','tax_id','notes','tags',
+  'default_memo_days','payment_terms','credit_limit','status',
+  'assigned_to','logo_url',
+];
+
+app.get("/api/crm/companies", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    const tenantUserId = ctx.tenantUserId;
+    const { search, type, status, assignedTo } = req.query;
+
+    const where = ['user_id = $1'];
+    const args = [tenantUserId];
+    let idx = 2;
+    if (search) {
+      where.push(`(name ILIKE $${idx} OR email ILIKE $${idx} OR city ILIKE $${idx} OR primary_contact ILIKE $${idx})`);
+      args.push(`%${search}%`); idx++;
+    }
+    if (type)    { where.push(`type = $${idx}`);    args.push(type);    idx++; }
+    if (status)  { where.push(`status = $${idx}`);  args.push(status);  idx++; }
+    if (assignedTo === 'unassigned') {
+      where.push('assigned_to IS NULL');
+    } else if (assignedTo === 'me') {
+      where.push(`assigned_to = $${idx}`); args.push(ctx.actorUserId); idx++;
+    } else if (assignedTo) {
+      where.push(`assigned_to = $${idx}`); args.push(assignedTo); idx++;
+    }
+
+    // Reps see: explicitly assigned to them OR unassigned (so they can claim).
+    if (!ctx.isOwner && ctx.actorUserId) {
+      where.push(`(assigned_to IS NULL OR assigned_to = $${idx})`);
+      args.push(ctx.actorUserId); idx++;
+    }
+
+    const sql = `
+      SELECT c.*,
+        (SELECT COUNT(*)::int FROM memos m WHERE m.company_id = c.id AND m.status IN ('out','partially_returned')) AS active_memos,
+        (SELECT COUNT(*)::int FROM memos m WHERE m.company_id = c.id) AS total_memos,
+        (SELECT COUNT(*)::int FROM crm_contacts ct WHERE ct.company_id = c.id) AS contact_count
+      FROM crm_companies c
+      WHERE ${where.join(' AND ')}
+      ORDER BY c.updated_at DESC
+    `;
+    const r = await pool.query(sql, args);
+    res.json(r.rows);
+  } catch (error) {
+    console.error("Error fetching companies:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/crm/companies/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    const tenantUserId = ctx.tenantUserId;
+
+    const compRes = await pool.query(
+      `SELECT * FROM crm_companies WHERE id = $1 AND user_id = $2`,
+      [id, tenantUserId]
+    );
+    if (compRes.rows.length === 0) return res.status(404).json({ error: "Company not found" });
+    const company = compRes.rows[0];
+    if (!ctx.isOwner && company.assigned_to && company.assigned_to !== ctx.actorUserId) {
+      return res.status(404).json({ error: "Company not found" });
+    }
+
+    const [contacts, memos] = await Promise.all([
+      pool.query(`SELECT id, name, title, email, phone, type FROM crm_contacts WHERE company_id = $1 ORDER BY name`, [id]),
+      pool.query(`SELECT id, memo_number, status, issued_at, due_at, total_value, currency,
+                         (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id) AS item_count
+                  FROM memos m WHERE company_id = $1 ORDER BY created_at DESC LIMIT 50`, [id]),
+    ]);
+    res.json({ ...company, contacts: contacts.rows, memos: memos.rows });
+  } catch (error) {
+    console.error("Error fetching company:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/crm/companies", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (!req.body.name) return res.status(400).json({ error: "name is required" });
+    const tenantUserId = ctx.tenantUserId;
+
+    // Reps default-assign the new company to themselves so it doesn't
+    // disappear from their list the moment they create it.
+    const cols = ['user_id'];
+    const vals = [tenantUserId];
+    let idx = 2;
+    const placeholders = ['$1'];
+    for (const f of CO_FIELDS) {
+      const camel = f.replace(/_([a-z])/g, (_,c) => c.toUpperCase());
+      if (req.body[camel] !== undefined) {
+        cols.push(f);
+        vals.push(f === 'tags' ? JSON.stringify(req.body[camel] || []) : req.body[camel]);
+        placeholders.push(`$${idx++}`);
+      }
+    }
+    if (!ctx.isOwner && !cols.includes('assigned_to')) {
+      cols.push('assigned_to');
+      vals.push(ctx.actorUserId);
+      placeholders.push(`$${idx++}`);
+    }
+
+    const r = await pool.query(
+      `INSERT INTO crm_companies (${cols.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`,
+      vals
+    );
+    const company = r.rows[0];
+
+    const { actorId, actorName } = getActor(req);
+    logActivity({
+      userId: tenantUserId, actorId, actorName,
+      entityType: 'company', entityId: String(company.id), action: 'created',
+      summary: `Added company "${company.name}"`,
+    });
+
+    res.status(201).json(company);
+  } catch (error) {
+    console.error("Error creating company:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/crm/companies/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    for (const f of CO_FIELDS) {
+      const camel = f.replace(/_([a-z])/g, (_,c) => c.toUpperCase());
+      if (req.body[camel] !== undefined) {
+        if (f === 'assigned_to' && ctx.actorUserId && !ctx.isOwner) {
+          if (req.body[camel] && String(req.body[camel]) !== String(ctx.actorUserId)) {
+            return res.status(403).json({ error: 'Reps can only assign records to themselves' });
+          }
+        }
+        fields.push(`${f} = $${idx++}`);
+        values.push(f === 'tags' ? JSON.stringify(req.body[camel] || []) : req.body[camel]);
+      }
+    }
+    if (!fields.length) return res.status(400).json({ error: 'No updatable fields supplied' });
+    fields.push(`updated_at = NOW()`);
+    values.push(id);
+
+    const r = await pool.query(
+      `UPDATE crm_companies SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Company not found' });
+
+    const { actorId, actorName } = getActor(req);
+    logActivity({
+      userId: r.rows[0].user_id, actorId, actorName,
+      entityType: 'company', entityId: String(id), action: 'updated',
+      summary: `Updated company "${r.rows[0].name}"`,
+    });
+
+    res.json(r.rows[0]);
+  } catch (error) {
+    console.error("Error updating company:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/crm/companies/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const before = await pool.query(`SELECT user_id, name FROM crm_companies WHERE id = $1`, [id]);
+    // Refuse to delete a company that has open memos — those would
+    // silently disappear, hiding inventory we sent out. The user has
+    // to close/return those memos first.
+    const open = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM memos WHERE company_id = $1 AND status IN ('out','partially_returned')`,
+      [id]
+    );
+    if (open.rows[0].n > 0) {
+      return res.status(409).json({ error: 'Company has open memos — close them before deleting' });
+    }
+    await pool.query(`DELETE FROM crm_companies WHERE id = $1`, [id]);
+    res.json({ success: true });
+
+    if (before.rows[0]) {
+      const { actorId, actorName } = getActor(req);
+      logActivity({
+        userId: before.rows[0].user_id, actorId, actorName,
+        entityType: 'company', entityId: String(id), action: 'deleted',
+        summary: `Deleted company "${before.rows[0].name}"`,
+      });
+    }
+  } catch (error) {
+    console.error("Error deleting company:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/* =========================================================
+   Memos (consignment) — list, detail, create, update,
+   line-items, lifecycle transitions.
+
+   Lifecycle:
+     draft → out (issue)
+     out   → partially_returned (when at least one item is returned/sold but others still out)
+     out / partially_returned → closed (manually OR when all items are returned/sold)
+     out / partially_returned → expired (cron / lazy on read when due_at is past)
+
+   Item statuses: out → returned | sold (terminal).
+   ========================================================= */
+
+const MEMO_FIELDS = [
+  'company_id','contact_id','status','issued_at','due_at','closed_at',
+  'total_value','currency','notes','internal_notes','assigned_to',
+];
+
+const generateMemoNumber = async (tenantUserId) => {
+  // MEMO-YYYY-#### — sequential per workspace per year.
+  const year = new Date().getFullYear();
+  const r = await pool.query(
+    `SELECT memo_number FROM memos
+      WHERE user_id = $1 AND memo_number LIKE $2
+   ORDER BY id DESC LIMIT 1`,
+    [tenantUserId, `MEMO-${year}-%`]
+  );
+  let next = 1;
+  if (r.rows.length) {
+    const m = /MEMO-\d{4}-(\d+)$/.exec(r.rows[0].memo_number);
+    if (m) next = parseInt(m[1], 10) + 1;
+  }
+  return `MEMO-${year}-${String(next).padStart(4, '0')}`;
+};
+
+const recomputeMemoTotals = async (memoId) => {
+  // Sum live (non-returned) memo prices into total_value, and flip the
+  // header status when items move out/return/sell. Called after every
+  // item-level mutation.
+  const itemRes = await pool.query(
+    `SELECT status, COALESCE(memo_price,0) AS memo_price
+       FROM memo_items WHERE memo_id = $1`,
+    [memoId]
+  );
+  const items = itemRes.rows;
+  const total = items.reduce((a, i) => a + Number(i.memo_price || 0), 0);
+  const allDone   = items.length > 0 && items.every((i) => i.status !== 'out');
+  const someOut   = items.some((i) => i.status === 'out');
+  const someClosed = items.some((i) => i.status !== 'out');
+
+  const headerRes = await pool.query(`SELECT status FROM memos WHERE id = $1`, [memoId]);
+  if (!headerRes.rows.length) return;
+  const cur = headerRes.rows[0].status;
+
+  let nextStatus = cur;
+  if (cur === 'out' || cur === 'partially_returned') {
+    if (allDone)              nextStatus = 'closed';
+    else if (someOut && someClosed) nextStatus = 'partially_returned';
+    else if (someOut)         nextStatus = 'out';
+  }
+
+  await pool.query(
+    `UPDATE memos
+        SET total_value = $1,
+            status      = $2,
+            closed_at   = CASE WHEN $2 = 'closed' AND closed_at IS NULL THEN NOW() ELSE closed_at END,
+            updated_at  = NOW()
+      WHERE id = $3`,
+    [total, nextStatus, memoId]
+  );
+};
+
+app.get("/api/memos", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    const tenantUserId = ctx.tenantUserId;
+    const { companyId, status, assignedTo, search } = req.query;
+
+    const where = ['m.user_id = $1'];
+    const args = [tenantUserId];
+    let idx = 2;
+    if (companyId)  { where.push(`m.company_id = $${idx}`); args.push(companyId); idx++; }
+    if (status)     { where.push(`m.status = $${idx}`);     args.push(status);    idx++; }
+    if (search) {
+      where.push(`(m.memo_number ILIKE $${idx} OR c.name ILIKE $${idx})`);
+      args.push(`%${search}%`); idx++;
+    }
+    if (assignedTo === 'unassigned') where.push('m.assigned_to IS NULL');
+    else if (assignedTo === 'me')   { where.push(`m.assigned_to = $${idx}`); args.push(ctx.actorUserId); idx++; }
+    else if (assignedTo)            { where.push(`m.assigned_to = $${idx}`); args.push(assignedTo);     idx++; }
+
+    if (!ctx.isOwner && ctx.actorUserId) {
+      where.push(`(m.assigned_to IS NULL OR m.assigned_to = $${idx})`);
+      args.push(ctx.actorUserId); idx++;
+    }
+
+    const r = await pool.query(`
+      SELECT m.*, c.name AS company_name, c.logo_url AS company_logo,
+             ct.name AS contact_name,
+             (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id) AS item_count,
+             (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id AND mi.status = 'out') AS items_out
+        FROM memos m
+        JOIN crm_companies c ON c.id = m.company_id
+   LEFT JOIN crm_contacts ct ON ct.id = m.contact_id
+       WHERE ${where.join(' AND ')}
+    ORDER BY m.created_at DESC
+    `, args);
+
+    // Lazy-mark expired: any 'out' memo whose due_at is in the past.
+    // We don't update the DB here (cron does that); the FE can show the
+    // chip as "expired" if status is out/partially_returned and due_at < today.
+    res.json(r.rows);
+  } catch (error) {
+    console.error("Error fetching memos:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/memos/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    const tenantUserId = ctx.tenantUserId;
+
+    const memoRes = await pool.query(`
+      SELECT m.*, c.name AS company_name, c.email AS company_email,
+             c.phone AS company_phone, c.address AS company_address,
+             c.city AS company_city, c.country AS company_country,
+             c.logo_url AS company_logo,
+             ct.name AS contact_name, ct.email AS contact_email, ct.phone AS contact_phone
+        FROM memos m
+        JOIN crm_companies c ON c.id = m.company_id
+   LEFT JOIN crm_contacts ct ON ct.id = m.contact_id
+       WHERE m.id = $1 AND m.user_id = $2
+    `, [id, tenantUserId]);
+    if (memoRes.rows.length === 0) return res.status(404).json({ error: "Memo not found" });
+    const memo = memoRes.rows[0];
+    if (!ctx.isOwner && memo.assigned_to && memo.assigned_to !== ctx.actorUserId) {
+      return res.status(404).json({ error: "Memo not found" });
+    }
+
+    const items = await pool.query(
+      `SELECT * FROM memo_items WHERE memo_id = $1 ORDER BY created_at ASC`,
+      [id]
+    );
+    res.json({ ...memo, items: items.rows });
+  } catch (error) {
+    console.error("Error fetching memo:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/memos", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (!req.body.companyId) return res.status(400).json({ error: "companyId is required" });
+    const tenantUserId = ctx.tenantUserId;
+
+    // Pull defaults off the company so reps don't have to retype them.
+    const company = await pool.query(
+      `SELECT default_memo_days, currency FROM crm_companies WHERE id = $1 AND user_id = $2`,
+      [req.body.companyId, tenantUserId]
+    );
+    if (company.rows.length === 0) return res.status(404).json({ error: "Company not found" });
+    const defaultDays = company.rows[0].default_memo_days || 30;
+
+    const memoNumber = await generateMemoNumber(tenantUserId);
+    const dueAt = req.body.dueAt
+      ? new Date(req.body.dueAt)
+      : new Date(Date.now() + defaultDays * 86400 * 1000);
+
+    const r = await pool.query(
+      `INSERT INTO memos (
+         user_id, memo_number, company_id, contact_id, status, due_at,
+         currency, notes, internal_notes, created_by,
+         assigned_to
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+      [
+        tenantUserId, memoNumber, req.body.companyId,
+        req.body.contactId || null, 'draft', dueAt,
+        req.body.currency || 'USD', req.body.notes || null,
+        req.body.internalNotes || null, ctx.actorUserId,
+        ctx.isOwner ? (req.body.assignedTo || null) : ctx.actorUserId,
+      ]
+    );
+    const memo = r.rows[0];
+
+    // If the caller supplied items in the same request, insert them too
+    // — saves a round-trip from the FE wizard.
+    if (Array.isArray(req.body.items) && req.body.items.length) {
+      for (const it of req.body.items) {
+        await pool.query(
+          `INSERT INTO memo_items
+             (memo_id, item_type, item_sku, item_id, snapshot, memo_price, quantity, notes)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [
+            memo.id, it.itemType || 'stone', it.itemSku, it.itemId || null,
+            JSON.stringify(it.snapshot || {}),
+            it.memoPrice != null ? Number(it.memoPrice) : null,
+            it.quantity || 1, it.notes || null,
+          ]
+        );
+      }
+      await recomputeMemoTotals(memo.id);
+    }
+
+    const { actorId, actorName } = getActor(req);
+    logActivity({
+      userId: tenantUserId, actorId, actorName,
+      entityType: 'memo', entityId: String(memo.id), action: 'created',
+      summary: `Created memo ${memoNumber}`,
+      related: [{ type: 'company', id: memo.company_id }],
+    });
+
+    const full = await pool.query(`SELECT * FROM memos WHERE id = $1`, [memo.id]);
+    const items = await pool.query(`SELECT * FROM memo_items WHERE memo_id = $1`, [memo.id]);
+    res.status(201).json({ ...full.rows[0], items: items.rows });
+  } catch (error) {
+    console.error("Error creating memo:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/memos/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    for (const f of MEMO_FIELDS) {
+      const camel = f.replace(/_([a-z])/g, (_,c) => c.toUpperCase());
+      if (req.body[camel] !== undefined) {
+        if (f === 'assigned_to' && ctx.actorUserId && !ctx.isOwner) {
+          if (req.body[camel] && String(req.body[camel]) !== String(ctx.actorUserId)) {
+            return res.status(403).json({ error: 'Reps can only assign records to themselves' });
+          }
+        }
+        fields.push(`${f} = $${idx++}`);
+        values.push(req.body[camel]);
+      }
+    }
+    if (!fields.length) return res.status(400).json({ error: 'No updatable fields supplied' });
+    fields.push(`updated_at = NOW()`);
+    values.push(id);
+
+    const r = await pool.query(
+      `UPDATE memos SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Memo not found' });
+    res.json(r.rows[0]);
+  } catch (error) {
+    console.error("Error updating memo:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/memos/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    // Refuse to delete a memo that's already been issued — those have
+    // physical items at the customer. Only drafts can be removed.
+    const r = await pool.query(`SELECT user_id, status, memo_number FROM memos WHERE id = $1`, [id]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Memo not found' });
+    if (r.rows[0].status !== 'draft') {
+      return res.status(409).json({ error: 'Only draft memos can be deleted — close it instead' });
+    }
+    await pool.query(`DELETE FROM memos WHERE id = $1`, [id]);
+    res.json({ success: true });
+
+    const { actorId, actorName } = getActor(req);
+    logActivity({
+      userId: r.rows[0].user_id, actorId, actorName,
+      entityType: 'memo', entityId: String(id), action: 'deleted',
+      summary: `Deleted draft memo ${r.rows[0].memo_number}`,
+    });
+  } catch (error) {
+    console.error("Error deleting memo:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/* ----- memo line items ------------------------------------------ */
+
+app.post("/api/memos/:id/items", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { items } = req.body;
+    if (!Array.isArray(items) || !items.length) {
+      return res.status(400).json({ error: 'items array is required' });
+    }
+
+    // Block adding items that are already on another OPEN memo — same
+    // physical stone/jewelry can't sit at two stores at once.
+    for (const it of items) {
+      if (!it.itemSku) continue;
+      const conflict = await pool.query(
+        `SELECT m.id, m.memo_number
+           FROM memo_items mi
+           JOIN memos m ON m.id = mi.memo_id
+          WHERE mi.item_sku = $1
+            AND mi.status = 'out'
+            AND m.id <> $2
+            AND m.status IN ('out','partially_returned','draft')
+          LIMIT 1`,
+        [it.itemSku, id]
+      );
+      if (conflict.rows.length) {
+        return res.status(409).json({
+          error: `${it.itemSku} is already on memo ${conflict.rows[0].memo_number}`,
+        });
+      }
+    }
+
+    const inserted = [];
+    for (const it of items) {
+      const r = await pool.query(
+        `INSERT INTO memo_items
+           (memo_id, item_type, item_sku, item_id, snapshot, memo_price, quantity, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [
+          id, it.itemType || 'stone', it.itemSku, it.itemId || null,
+          JSON.stringify(it.snapshot || {}),
+          it.memoPrice != null ? Number(it.memoPrice) : null,
+          it.quantity || 1, it.notes || null,
+        ]
+      );
+      inserted.push(r.rows[0]);
+    }
+    await recomputeMemoTotals(id);
+    res.status(201).json(inserted);
+  } catch (error) {
+    console.error("Error adding memo items:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put("/api/memos/:id/items/:itemId", async (req, res) => {
+  try {
+    const { id, itemId } = req.params;
+    const allowed = ['memo_price','quantity','notes','status'];
+    const fields = [];
+    const values = [];
+    let idx = 1;
+    for (const f of allowed) {
+      const camel = f.replace(/_([a-z])/g, (_,c) => c.toUpperCase());
+      if (req.body[camel] !== undefined) {
+        fields.push(`${f} = $${idx++}`);
+        values.push(req.body[camel]);
+      }
+    }
+    if (req.body.status === 'returned') {
+      fields.push(`returned_at = NOW()`);
+    } else if (req.body.status === 'sold') {
+      fields.push(`sold_at = NOW()`);
+    }
+    if (!fields.length) return res.status(400).json({ error: 'No updatable fields supplied' });
+    fields.push(`updated_at = NOW()`);
+    values.push(itemId, id);
+
+    const r = await pool.query(
+      `UPDATE memo_items SET ${fields.join(', ')}
+        WHERE id = $${idx++} AND memo_id = $${idx} RETURNING *`,
+      values
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Memo item not found' });
+    await recomputeMemoTotals(id);
+
+    if (req.body.status === 'sold' || req.body.status === 'returned') {
+      const memoRes = await pool.query(`SELECT user_id, memo_number FROM memos WHERE id = $1`, [id]);
+      if (memoRes.rows[0]) {
+        const { actorId, actorName } = getActor(req);
+        logActivity({
+          userId: memoRes.rows[0].user_id, actorId, actorName,
+          entityType: 'memo', entityId: String(id),
+          action: req.body.status === 'sold' ? 'item_sold' : 'item_returned',
+          summary: `${req.body.status === 'sold' ? 'Sold' : 'Returned'} ${r.rows[0].item_sku} from ${memoRes.rows[0].memo_number}`,
+        });
+      }
+    }
+    res.json(r.rows[0]);
+  } catch (error) {
+    console.error("Error updating memo item:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/memos/:id/items/:itemId", async (req, res) => {
+  try {
+    const { id, itemId } = req.params;
+    // Only allow removing items from drafts. Once issued, you must
+    // mark the item as returned/sold instead — that preserves history.
+    const memoRes = await pool.query(`SELECT status FROM memos WHERE id = $1`, [id]);
+    if (memoRes.rows.length === 0) return res.status(404).json({ error: 'Memo not found' });
+    if (memoRes.rows[0].status !== 'draft') {
+      return res.status(409).json({ error: 'Only draft memo items can be removed' });
+    }
+    await pool.query(`DELETE FROM memo_items WHERE id = $1 AND memo_id = $2`, [itemId, id]);
+    await recomputeMemoTotals(id);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error deleting memo item:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/* ----- memo lifecycle transitions ------------------------------- */
+
+app.post("/api/memos/:id/issue", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    const memoRes = await pool.query(`SELECT * FROM memos WHERE id = $1`, [id]);
+    if (memoRes.rows.length === 0) return res.status(404).json({ error: 'Memo not found' });
+    const memo = memoRes.rows[0];
+    if (memo.status !== 'draft') return res.status(409).json({ error: 'Only drafts can be issued' });
+
+    const itemCount = await pool.query(`SELECT COUNT(*)::int AS n FROM memo_items WHERE memo_id = $1`, [id]);
+    if (itemCount.rows[0].n === 0) return res.status(400).json({ error: 'Cannot issue an empty memo' });
+
+    const r = await pool.query(
+      `UPDATE memos SET status = 'out', issued_at = NOW(), updated_at = NOW()
+        WHERE id = $1 RETURNING *`,
+      [id]
+    );
+
+    const { actorId, actorName } = getActor(req);
+    logActivity({
+      userId: memo.user_id,
+      actorId: actorId || ctx.actorUserId, actorName,
+      entityType: 'memo', entityId: String(id), action: 'issued',
+      summary: `Issued memo ${memo.memo_number}`,
+      related: [{ type: 'company', id: memo.company_id }],
+    });
+
+    res.json(r.rows[0]);
+  } catch (error) {
+    console.error("Error issuing memo:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/memos/:id/close", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const memoRes = await pool.query(`SELECT * FROM memos WHERE id = $1`, [id]);
+    if (memoRes.rows.length === 0) return res.status(404).json({ error: 'Memo not found' });
+    const memo = memoRes.rows[0];
+    if (memo.status === 'closed') return res.json(memo);
+    // Force-close: any items still 'out' are flipped to 'returned'
+    // (the user is saying "the customer brought everything back").
+    await pool.query(
+      `UPDATE memo_items SET status = 'returned', returned_at = NOW(), updated_at = NOW()
+        WHERE memo_id = $1 AND status = 'out'`,
+      [id]
+    );
+    const r = await pool.query(
+      `UPDATE memos SET status = 'closed', closed_at = NOW(), updated_at = NOW()
+        WHERE id = $1 RETURNING *`,
+      [id]
+    );
+
+    const { actorId, actorName } = getActor(req);
+    logActivity({
+      userId: memo.user_id, actorId, actorName,
+      entityType: 'memo', entityId: String(id), action: 'closed',
+      summary: `Closed memo ${memo.memo_number}`,
+    });
+
+    res.json(r.rows[0]);
+  } catch (error) {
+    console.error("Error closing memo:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/* Returns SKUs that are currently on an active memo so the FE
+ * inventory page can flag them as "On Memo" without per-row queries.
+ * Shape: { byStoneSku: ['SKU1','SKU2'], byJewelrySku: ['MN1'] }. */
+app.get("/api/memos/active-skus", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    const tenantUserId = ctx.tenantUserId;
+    const r = await pool.query(`
+      SELECT mi.item_type, mi.item_sku, mi.memo_id, m.memo_number, m.company_id, c.name AS company_name
+        FROM memo_items mi
+        JOIN memos m ON m.id = mi.memo_id
+        JOIN crm_companies c ON c.id = m.company_id
+       WHERE mi.status = 'out'
+         AND m.status IN ('out','partially_returned')
+         AND m.user_id = $1
+    `, [tenantUserId]);
+    const byStoneSku = {};
+    const byJewelrySku = {};
+    for (const row of r.rows) {
+      const target = row.item_type === 'jewelry' ? byJewelrySku : byStoneSku;
+      target[row.item_sku] = {
+        memoId: row.memo_id,
+        memoNumber: row.memo_number,
+        companyId: row.company_id,
+        companyName: row.company_name,
+      };
+    }
+    res.json({ byStoneSku, byJewelrySku });
+  } catch (error) {
+    console.error("Error fetching active memo SKUs:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
