@@ -233,13 +233,24 @@ async function resolveTeamContext(req) {
 
 // Whether a team context can read a row that was assigned to `assignedTo`.
 // Owners see everything; reps see their own + unassigned ("up for grabs").
-// Reps can only read items explicitly assigned to them. Unassigned rows
-// (assigned_to IS NULL) stay private to the workspace owner until they
-// hand them over — otherwise pre-existing data from before the team
-// system was introduced would leak to every new rep on day one.
+// Customer-relationship gate (CRM contacts / deals / tasks).
+// Reps can only read rows explicitly assigned to them. Unassigned rows
+// stay private to the workspace owner — otherwise pre-existing data from
+// before the team system was introduced would leak to every new rep on
+// day one, and customer ownership wouldn't be enforceable.
 function canReadAssignment(ctx, assignedTo) {
   if (!ctx || ctx.isOwner) return true;
   if (!assignedTo) return false;
+  return String(assignedTo) === String(ctx.actorUserId);
+}
+
+// Inventory gate (loose stones / jewelry items in the catalog).
+// Reps need to see what's in stock so they can pitch it to customers, so
+// unassigned rows ARE visible to every rep. Once another rep claims a
+// piece (sa.assigned_to = their id), only they (and the owner) see it.
+function canReadInventoryItem(ctx, assignedTo) {
+  if (!ctx || ctx.isOwner) return true;
+  if (!assignedTo) return true;
   return String(assignedTo) === String(ctx.actorUserId);
 }
 
@@ -300,12 +311,15 @@ app.get("/api/soap-stones", async (req, res) => {
     if (ownerId) params.push(ownerId);
     const ownerParamIdx = ownerId ? params.length : null;
 
-    // Visibility scope: admin sees all; rep sees ONLY stones explicitly
-    // assigned to them. Unassigned stones stay owner-only — the admin
-    // hands them over via the assignment chip when ready.
+    // Visibility scope: admin sees all; rep sees their own claimed stones
+    // PLUS every unclaimed stone in the workshop. Stones are inventory the
+    // rep needs to *sell* — keeping them invisible until manually assigned
+    // would mean the rep has nothing to offer customers. CRM data follows
+    // a stricter policy (only explicit assignments) because it's customer
+    // relationships, not stock.
     if (ownerId && !ctx.isOwner) {
       params.push(ctx.actorUserId);
-      whereClauses.push(`sa.assigned_to = $${params.length}`);
+      whereClauses.push(`(sa.assigned_to IS NULL OR sa.assigned_to = $${params.length})`);
     }
 
     // Optional explicit filter from the UI.
@@ -6575,8 +6589,12 @@ app.get('/api/jewelry-items', async (req, res) => {
     let p = 2;
 
     if (!ctx.isOwner) {
-      // Reps see ONLY jewelry items explicitly assigned to them.
-      where.push(`ji.assigned_to = $${p}`);
+      // Same inventory rule as soap-stones: rep sees their own assigned
+      // pieces PLUS every unassigned piece (catalog/templates/ready
+      // stock). Production board is admin-only, so reps only ever hit
+      // this endpoint from the inventory grid where this is what they
+      // need to sell from.
+      where.push(`(ji.assigned_to IS NULL OR ji.assigned_to = $${p})`);
       params.push(ctx.actorUserId);
       p++;
     }
@@ -6642,7 +6660,9 @@ app.get('/api/jewelry-items/:id', async (req, res) => {
       [id, tenantUserId]
     );
     if (!item.rows[0]) return res.status(404).json({ error: 'Item not found' });
-    if (!canReadAssignment(ctx, item.rows[0].assigned_to)) {
+    // Inventory rules: unassigned items are visible to every rep, claimed
+    // items only to the rep that claimed them.
+    if (!canReadInventoryItem(ctx, item.rows[0].assigned_to)) {
       return res.status(404).json({ error: 'Item not found' });
     }
 
