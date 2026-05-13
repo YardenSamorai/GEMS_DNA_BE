@@ -5767,7 +5767,7 @@ app.post("/api/memos", async (req, res) => {
 
     // Pull defaults off the company so reps don't have to retype them.
     const company = await pool.query(
-      `SELECT default_memo_days, currency FROM crm_companies WHERE id = $1 AND user_id = $2`,
+      `SELECT default_memo_days FROM crm_companies WHERE id = $1 AND user_id = $2`,
       [req.body.companyId, tenantUserId]
     );
     if (company.rows.length === 0) return res.status(404).json({ error: "Company not found" });
