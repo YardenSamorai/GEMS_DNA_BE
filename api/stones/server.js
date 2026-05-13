@@ -233,9 +233,13 @@ async function resolveTeamContext(req) {
 
 // Whether a team context can read a row that was assigned to `assignedTo`.
 // Owners see everything; reps see their own + unassigned ("up for grabs").
+// Reps can only read items explicitly assigned to them. Unassigned rows
+// (assigned_to IS NULL) stay private to the workspace owner until they
+// hand them over — otherwise pre-existing data from before the team
+// system was introduced would leak to every new rep on day one.
 function canReadAssignment(ctx, assignedTo) {
   if (!ctx || ctx.isOwner) return true;
-  if (!assignedTo) return true;
+  if (!assignedTo) return false;
   return String(assignedTo) === String(ctx.actorUserId);
 }
 
@@ -296,10 +300,12 @@ app.get("/api/soap-stones", async (req, res) => {
     if (ownerId) params.push(ownerId);
     const ownerParamIdx = ownerId ? params.length : null;
 
-    // Visibility scope: admin sees all; rep sees mine + unassigned.
+    // Visibility scope: admin sees all; rep sees ONLY stones explicitly
+    // assigned to them. Unassigned stones stay owner-only — the admin
+    // hands them over via the assignment chip when ready.
     if (ownerId && !ctx.isOwner) {
       params.push(ctx.actorUserId);
-      whereClauses.push(`(sa.assigned_to IS NULL OR sa.assigned_to = $${params.length})`);
+      whereClauses.push(`sa.assigned_to = $${params.length}`);
     }
 
     // Optional explicit filter from the UI.
@@ -2256,10 +2262,12 @@ app.get("/api/crm/contacts", async (req, res) => {
     const values = [tenantUserId];
     let idx = 2;
 
-    // Sales-rep visibility: reps see records assigned to them OR still
-    // unassigned ("up for grabs"). Owner always sees the whole workspace.
+    // Sales-rep visibility: reps see ONLY records explicitly assigned to
+    // them. Unassigned rows stay private to the workspace owner — owner
+    // hands them over by setting `assigned_to`. Owner always sees the
+    // whole workspace.
     if (!ctx.isOwner) {
-      conditions.push(`(assigned_to IS NULL OR assigned_to = $${idx})`);
+      conditions.push(`assigned_to = $${idx}`);
       values.push(ctx.actorUserId);
       idx++;
     }
@@ -2423,14 +2431,24 @@ app.get("/api/crm/contacts", async (req, res) => {
 app.get("/api/crm/contacts/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { userId } = req.query;
-    if (!userId) return res.status(400).json({ error: "userId is required" });
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    // Filter by the WORKSPACE owner's id (tenantUserId), not the caller —
+    // a rep's own clerk_user_id never appears on crm_contacts.user_id, so
+    // the previous query always returned 404 for reps even when the row
+    // they clicked from the list belonged to their workspace.
+    const tenantUserId = ctx.tenantUserId;
 
     const contact = await pool.query(
       "SELECT * FROM crm_contacts WHERE id = $1 AND (user_id = $2 OR shared = TRUE)",
-      [id, userId]
+      [id, tenantUserId]
     );
     if (contact.rows.length === 0) return res.status(404).json({ error: "Contact not found" });
+    if (!canReadAssignment(ctx, contact.rows[0].assigned_to)) {
+      // Same 404 we'd return for a non-existent contact — never reveal
+      // that the row exists but belongs to a different rep.
+      return res.status(404).json({ error: "Contact not found" });
+    }
 
     const interactions = await pool.query(
       "SELECT * FROM crm_interactions WHERE contact_id = $1 ORDER BY occurred_at DESC LIMIT 100",
@@ -3295,7 +3313,9 @@ app.get("/api/crm/deals", async (req, res) => {
     let idx = 2;
 
     if (!ctx.isOwner) {
-      conditions.push(`(d.assigned_to IS NULL OR d.assigned_to = $${idx})`);
+      // Reps see ONLY deals explicitly assigned to them. Unassigned deals
+      // stay owner-only.
+      conditions.push(`d.assigned_to = $${idx}`);
       values.push(ctx.actorUserId);
       idx++;
     }
@@ -3333,12 +3353,21 @@ app.get("/api/crm/deals", async (req, res) => {
 app.get("/api/crm/deals/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    const tenantUserId = ctx.tenantUserId;
+
     const deal = await pool.query(
       `SELECT d.*, c.name AS contact_name, c.company AS contact_company, c.phone AS contact_phone, c.email AS contact_email
-       FROM crm_deals d LEFT JOIN crm_contacts c ON c.id = d.contact_id WHERE d.id = $1`,
-      [id]
+       FROM crm_deals d
+       LEFT JOIN crm_contacts c ON c.id = d.contact_id
+       WHERE d.id = $1 AND (d.user_id = $2 OR d.shared = TRUE)`,
+      [id, tenantUserId]
     );
     if (deal.rows.length === 0) return res.status(404).json({ error: "Deal not found" });
+    if (!canReadAssignment(ctx, deal.rows[0].assigned_to)) {
+      return res.status(404).json({ error: "Deal not found" });
+    }
     const items = await pool.query("SELECT * FROM crm_deal_items WHERE deal_id = $1 ORDER BY created_at ASC", [id]);
     const interactions = await pool.query("SELECT * FROM crm_interactions WHERE deal_id = $1 ORDER BY occurred_at DESC", [id]);
     // Linked jewelry items: anything pointing at this deal via deal_id or sold_deal_id
@@ -3601,7 +3630,8 @@ app.get("/api/crm/tasks", async (req, res) => {
     const values = [tenantUserId];
     let idx = 2;
     if (!ctx.isOwner) {
-      conditions.push(`(t.assigned_to IS NULL OR t.assigned_to = $${idx})`);
+      // Reps see ONLY tasks explicitly assigned to them.
+      conditions.push(`t.assigned_to = $${idx}`);
       values.push(ctx.actorUserId);
       idx++;
     }
@@ -6545,7 +6575,8 @@ app.get('/api/jewelry-items', async (req, res) => {
     let p = 2;
 
     if (!ctx.isOwner) {
-      where.push(`(ji.assigned_to IS NULL OR ji.assigned_to = $${p})`);
+      // Reps see ONLY jewelry items explicitly assigned to them.
+      where.push(`ji.assigned_to = $${p}`);
       params.push(ctx.actorUserId);
       p++;
     }
@@ -6596,6 +6627,10 @@ app.get('/api/jewelry-items', async (req, res) => {
 app.get('/api/jewelry-items/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
+    const tenantUserId = ctx.tenantUserId;
+
     const item = await pool.query(
       `SELECT ji.*,
               c.name AS contact_name, c.company AS contact_company, c.email AS contact_email,
@@ -6603,10 +6638,13 @@ app.get('/api/jewelry-items/:id', async (req, res) => {
          FROM jewelry_items ji
          LEFT JOIN crm_contacts c ON c.id = ji.contact_id
          LEFT JOIN crm_deals    d ON d.id = ji.deal_id
-        WHERE ji.id = $1`,
-      [id]
+        WHERE ji.id = $1 AND ji.user_id = $2`,
+      [id, tenantUserId]
     );
     if (!item.rows[0]) return res.status(404).json({ error: 'Item not found' });
+    if (!canReadAssignment(ctx, item.rows[0].assigned_to)) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
 
     const [stones, metals, costs, files, history] = await Promise.all([
       pool.query(`SELECT * FROM jewelry_item_stones WHERE item_id = $1 ORDER BY id`, [id]),
