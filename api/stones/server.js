@@ -2295,6 +2295,24 @@ const crmReadyPromise = (async () => {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_companies_assigned_to ON crm_companies(assigned_to) WHERE assigned_to IS NOT NULL`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_companies_email_lower ON crm_companies(LOWER(email))`);
 
+    // Optional richer fields for the dedicated Store Profile page. Each
+    // is added defensively so older databases roll forward without
+    // touching existing rows. The page treats every one as optional.
+    const storeCols = [
+      "ALTER TABLE crm_companies ADD COLUMN IF NOT EXISTS description    TEXT",
+      "ALTER TABLE crm_companies ADD COLUMN IF NOT EXISTS instagram      TEXT",
+      "ALTER TABLE crm_companies ADD COLUMN IF NOT EXISTS facebook       TEXT",
+      "ALTER TABLE crm_companies ADD COLUMN IF NOT EXISTS linkedin       TEXT",
+      "ALTER TABLE crm_companies ADD COLUMN IF NOT EXISTS whatsapp       TEXT",
+      "ALTER TABLE crm_companies ADD COLUMN IF NOT EXISTS business_hours JSONB DEFAULT '{}'",
+      "ALTER TABLE crm_companies ADD COLUMN IF NOT EXISTS cover_image_url TEXT",
+      "ALTER TABLE crm_companies ADD COLUMN IF NOT EXISTS currency       TEXT DEFAULT 'USD'",
+      "ALTER TABLE crm_companies ADD COLUMN IF NOT EXISTS established_year INTEGER",
+    ];
+    for (const sql of storeCols) {
+      try { await pool.query(sql); } catch (e) { console.warn("Store-col migration warn:", e.message); }
+    }
+
     // Link contacts and deals to a company (idempotent — column may
     // already exist from a previous boot). FK is added separately so
     // adding the column never depends on the FK succeeding.
@@ -5403,7 +5421,13 @@ const CO_FIELDS = [
   'country','city','address','tax_id','notes','tags',
   'default_memo_days','payment_terms','credit_limit','status',
   'assigned_to','logo_url',
+  // Sprint 4 — extended profile fields
+  'description','instagram','facebook','linkedin','whatsapp',
+  'business_hours','cover_image_url','currency','established_year',
 ];
+
+// JSON columns must be stringified before going to the DB.
+const CO_JSON_FIELDS = new Set(['tags','business_hours']);
 
 app.get("/api/crm/companies", async (req, res) => {
   try {
@@ -5499,7 +5523,8 @@ app.post("/api/crm/companies", async (req, res) => {
       const camel = f.replace(/_([a-z])/g, (_,c) => c.toUpperCase());
       if (req.body[camel] !== undefined) {
         cols.push(f);
-        vals.push(f === 'tags' ? JSON.stringify(req.body[camel] || []) : req.body[camel]);
+        const v = req.body[camel];
+        vals.push(CO_JSON_FIELDS.has(f) ? JSON.stringify(v ?? (f === 'tags' ? [] : {})) : v);
         placeholders.push(`$${idx++}`);
       }
     }
@@ -5546,7 +5571,8 @@ app.put("/api/crm/companies/:id", async (req, res) => {
           }
         }
         fields.push(`${f} = $${idx++}`);
-        values.push(f === 'tags' ? JSON.stringify(req.body[camel] || []) : req.body[camel]);
+        const v = req.body[camel];
+        values.push(CO_JSON_FIELDS.has(f) ? JSON.stringify(v ?? (f === 'tags' ? [] : {})) : v);
       }
     }
     if (!fields.length) return res.status(400).json({ error: 'No updatable fields supplied' });
