@@ -214,7 +214,12 @@ async function resolveTeamContext(req) {
       role:         m.role,
       memberId:     m.id,
       memberName:   m.name,
+      memberEmail:  m.email,
+      // Sprint 4 — store_users are scoped to a single retail store.
+      // The portal endpoints use this to filter memos.
+      companyId:    m.company_id || null,
       isOwner:      m.role === 'owner',
+      isStoreUser:  m.role === 'store_user',
       actorName:    headerActorName || m.name,
     };
   }
@@ -253,6 +258,51 @@ function canReadInventoryItem(ctx, assignedTo) {
   if (!assignedTo) return true;
   return String(assignedTo) === String(ctx.actorUserId);
 }
+
+/* =========================================================
+   Store-portal isolation middleware.
+   ---------------------------------------------------------
+   When the actor's role is `store_user` we MUST refuse every
+   internal API surface (stones, jewelry, CRM contacts, deals,
+   memos lookup, dashboards, …). They live exclusively under
+   /api/portal/* + a tiny allow-list of self-info endpoints.
+
+   Without this, a curious store user could re-use the bearer
+   userId in their browser DevTools and read the supplier's
+   entire workspace — they share the same `tenantUserId`.
+   ========================================================= */
+const STORE_USER_ALLOWED_PREFIXES = [
+  '/api/portal/',
+  '/api/team/me',
+];
+app.use(async (req, res, next) => {
+  try {
+    // Cheap pre-check: only API requests, only when an actor is sent.
+    if (!req.path.startsWith('/api/')) return next();
+    const looksLikeActor =
+      req.headers?.['x-actor-id'] ||
+      req.query?.userId ||
+      (req.body && req.body.userId);
+    if (!looksLikeActor) return next();
+
+    const ctx = await resolveTeamContext(req);
+    if (ctx?.role !== 'store_user') return next();
+
+    const allowed = STORE_USER_ALLOWED_PREFIXES.some((p) =>
+      req.path === p || req.path.startsWith(p)
+    );
+    if (allowed) return next();
+
+    return res.status(403).json({
+      error: 'Store-portal users can only access /api/portal/* endpoints',
+    });
+  } catch (_) {
+    // If anything in the gate explodes we err on the safe side and let
+    // the request continue — this matches the rest of the codebase's
+    // backwards-compatible "fail open to legacy single-user" stance.
+    return next();
+  }
+});
 
 /* =========================================================
    /api/stones – כל האבנים מטבלת stones (לא selector)
@@ -2105,6 +2155,11 @@ const crmReadyPromise = (async () => {
     await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS invited_at      TIMESTAMP`);
     await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS last_invited_at TIMESTAMP`);
     await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS invite_count    INTEGER DEFAULT 0`);
+    // Sprint 4 — Store-portal users. role = 'store_user' + company_id
+    // pins them to a single retail store; resolveTeamContext exposes
+    // companyId so the portal endpoints can scope queries automatically.
+    await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS company_id      INTEGER`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_team_members_company_id ON team_members(company_id) WHERE company_id IS NOT NULL`);
     await pool.query(`UPDATE team_members SET invited_at = created_at WHERE invited_at IS NULL`);
 
     // Loose-stone assignments. We keep this in a separate table because
@@ -2395,6 +2450,16 @@ const crmReadyPromise = (async () => {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_items_sku         ON memo_items(item_sku)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_items_active      ON memo_items(item_sku, status) WHERE status = 'out'`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_items_status      ON memo_items(status)`);
+
+    // Approval workflow — when a store user (role='store_user') flags
+    // an item as sold or returned, we don't apply it immediately.
+    // Instead pending_status holds 'sold' or 'returned' and shows up
+    // on the owner's MemoDetail with Approve / Decline buttons.
+    await pool.query(`ALTER TABLE memo_items ADD COLUMN IF NOT EXISTS pending_status TEXT`);
+    await pool.query(`ALTER TABLE memo_items ADD COLUMN IF NOT EXISTS pending_at     TIMESTAMP`);
+    await pool.query(`ALTER TABLE memo_items ADD COLUMN IF NOT EXISTS pending_by     TEXT`);
+    await pool.query(`ALTER TABLE memo_items ADD COLUMN IF NOT EXISTS pending_note   TEXT`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_items_pending ON memo_items(pending_status) WHERE pending_status IS NOT NULL`);
 
     crmReady = true;
     console.log("CRM tables ready (incl. companies + memos)");
@@ -6207,6 +6272,369 @@ app.get("/api/memos/active-skus", async (req, res) => {
 });
 
 /* =========================================================
+   Approval workflow — owner side.
+   When a store user marks an item as sold or asks for a return
+   from the portal, we don't apply the change immediately.
+   pending_status sits on the memo_items row and the owner can
+   either approve (turning it into the real status) or decline
+   (clearing the request).
+   ========================================================= */
+
+// POST /api/memos/:id/items/:itemId/approve
+app.post("/api/memos/:id/items/:itemId/approve", async (req, res) => {
+  try {
+    const { id, itemId } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (!ctx.isOwner)     return res.status(403).json({ error: "Only the workspace owner can approve store requests" });
+
+    const tenantUserId = ctx.tenantUserId;
+
+    const cur = await pool.query(
+      `SELECT mi.*, m.user_id AS memo_owner
+         FROM memo_items mi
+         JOIN memos m ON m.id = mi.memo_id
+        WHERE mi.id = $1 AND mi.memo_id = $2 AND m.user_id = $3
+        LIMIT 1`,
+      [itemId, id, tenantUserId]
+    );
+    if (!cur.rows.length)         return res.status(404).json({ error: "Memo item not found" });
+    if (!cur.rows[0].pending_status) return res.status(400).json({ error: "No pending request on this item" });
+
+    const item = cur.rows[0];
+    const newStatus = item.pending_status === 'sold' ? 'sold' : 'returned';
+    const stampCol  = newStatus === 'sold' ? 'sold_at' : 'returned_at';
+
+    await pool.query(
+      `UPDATE memo_items
+          SET status         = $1,
+              ${stampCol}    = COALESCE(${stampCol}, NOW()),
+              pending_status = NULL,
+              pending_at     = NULL,
+              pending_by     = NULL,
+              pending_note   = NULL,
+              updated_at     = NOW()
+        WHERE id = $2`,
+      [newStatus, itemId]
+    );
+
+    await recomputeMemoTotals(Number(id));
+
+    logActivity({
+      userId:     tenantUserId,
+      actorId:    ctx.actorUserId,
+      actorName:  ctx.actorName,
+      entityType: 'memo',
+      entityId:   String(id),
+      action:     newStatus === 'sold' ? 'item_sold' : 'item_returned',
+      summary:    `Approved store request — ${item.item_sku} marked as ${newStatus}`,
+    });
+
+    const refreshed = await pool.query(
+      `SELECT * FROM memo_items WHERE id = $1`,
+      [itemId]
+    );
+    res.json(refreshed.rows[0]);
+  } catch (error) {
+    console.error("Error approving memo item:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/memos/:id/items/:itemId/decline
+app.post("/api/memos/:id/items/:itemId/decline", async (req, res) => {
+  try {
+    const { id, itemId } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (!ctx.isOwner)     return res.status(403).json({ error: "Only the workspace owner can decline store requests" });
+
+    const tenantUserId = ctx.tenantUserId;
+    const reason = (req.body?.reason || '').toString().slice(0, 500);
+
+    const cur = await pool.query(
+      `SELECT mi.*, m.user_id AS memo_owner
+         FROM memo_items mi
+         JOIN memos m ON m.id = mi.memo_id
+        WHERE mi.id = $1 AND mi.memo_id = $2 AND m.user_id = $3
+        LIMIT 1`,
+      [itemId, id, tenantUserId]
+    );
+    if (!cur.rows.length)            return res.status(404).json({ error: "Memo item not found" });
+    if (!cur.rows[0].pending_status) return res.status(400).json({ error: "No pending request on this item" });
+
+    const item = cur.rows[0];
+
+    await pool.query(
+      `UPDATE memo_items
+          SET pending_status = NULL,
+              pending_at     = NULL,
+              pending_by     = NULL,
+              pending_note   = NULL,
+              updated_at     = NOW()
+        WHERE id = $1`,
+      [itemId]
+    );
+
+    logActivity({
+      userId:     tenantUserId,
+      actorId:    ctx.actorUserId,
+      actorName:  ctx.actorName,
+      entityType: 'memo',
+      entityId:   String(id),
+      action:     'request_declined',
+      summary:    `Declined store request to mark ${item.item_sku} as ${item.pending_status}` +
+                  (reason ? ` · ${reason}` : ''),
+    });
+
+    const refreshed = await pool.query(`SELECT * FROM memo_items WHERE id = $1`, [itemId]);
+    res.json(refreshed.rows[0]);
+  } catch (error) {
+    console.error("Error declining memo item:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/* =========================================================
+   Store Portal endpoints
+   ========================================================= */
+
+// Helper: load the active store_user row, or 403 with a clear message.
+async function requireStoreUser(req) {
+  const ctx = await resolveTeamContext(req);
+  if (!ctx.actorUserId)              throw Object.assign(new Error("userId is required"), { status: 400 });
+  if (ctx.role !== 'store_user' || !ctx.companyId) {
+    throw Object.assign(new Error("This account is not a store-portal user"), { status: 403 });
+  }
+  return ctx;
+}
+
+// GET /api/portal/me — returns the store user's profile + linked store + supplier (workspace owner).
+app.get("/api/portal/me", async (req, res) => {
+  try {
+    const ctx = await requireStoreUser(req);
+    const company = await pool.query(
+      `SELECT id, name, type, logo_url, cover_image_url, description,
+              email, phone, address, city, country, website,
+              instagram, facebook, linkedin, whatsapp,
+              business_hours, established_year, currency,
+              tax_id, payment_terms, default_memo_days
+         FROM crm_companies
+        WHERE id = $1 AND user_id = $2
+        LIMIT 1`,
+      [ctx.companyId, ctx.tenantUserId]
+    );
+    if (!company.rows.length) return res.status(404).json({ error: "Linked store not found" });
+
+    const supplier = await pool.query(
+      `SELECT name, email, avatar_color
+         FROM team_members
+        WHERE team_owner_id = $1 AND role = 'owner' AND active = TRUE
+        LIMIT 1`,
+      [ctx.tenantUserId]
+    );
+
+    res.json({
+      user: {
+        id: ctx.memberId,
+        name: ctx.memberName,
+        email: ctx.memberEmail,
+        role: ctx.role,
+      },
+      store: company.rows[0],
+      supplier: supplier.rows[0] || null,
+    });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// GET /api/portal/memos — list memos visible to the store user.
+// Excludes drafts; orders open memos first, then closed/returned.
+app.get("/api/portal/memos", async (req, res) => {
+  try {
+    const ctx = await requireStoreUser(req);
+    const status = (req.query.status || '').toString();
+    const params = [ctx.tenantUserId, ctx.companyId];
+    let where = `m.user_id = $1 AND m.company_id = $2 AND m.status <> 'draft'`;
+    if (status === 'active') {
+      where += ` AND m.status IN ('out','partially_returned')`;
+    } else if (status === 'closed') {
+      where += ` AND m.status IN ('closed','fully_returned')`;
+    }
+
+    const r = await pool.query(`
+      SELECT m.id, m.memo_number, m.status, m.issued_at, m.due_at,
+             m.total_value, m.currency, m.notes,
+             tm_owner.name AS supplier_name,
+             (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id)                                 AS item_count,
+             (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id AND mi.status = 'out')           AS items_out,
+             (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id AND mi.pending_status IS NOT NULL) AS items_pending
+        FROM memos m
+   LEFT JOIN team_members tm_owner
+          ON tm_owner.team_owner_id = m.user_id
+         AND tm_owner.role = 'owner'
+         AND tm_owner.active = TRUE
+       WHERE ${where}
+    ORDER BY CASE WHEN m.status IN ('out','partially_returned') THEN 0 ELSE 1 END,
+             m.issued_at DESC NULLS LAST,
+             m.created_at DESC
+    `, params);
+
+    res.json(r.rows);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// GET /api/portal/memos/:id — single memo + items, scoped to the store.
+app.get("/api/portal/memos/:id", async (req, res) => {
+  try {
+    const ctx = await requireStoreUser(req);
+    const { id } = req.params;
+
+    const memoRes = await pool.query(`
+      SELECT m.id, m.memo_number, m.status, m.issued_at, m.due_at,
+             m.total_value, m.currency, m.notes,
+             m.user_id, m.company_id,
+             c.name AS company_name, c.email AS company_email, c.phone AS company_phone,
+             c.address AS company_address, c.city AS company_city, c.country AS company_country,
+             c.logo_url AS company_logo,
+             tm_owner.name AS supplier_name, tm_owner.email AS supplier_email
+        FROM memos m
+        JOIN crm_companies c ON c.id = m.company_id
+   LEFT JOIN team_members tm_owner
+          ON tm_owner.team_owner_id = m.user_id
+         AND tm_owner.role = 'owner'
+         AND tm_owner.active = TRUE
+       WHERE m.id = $1 AND m.user_id = $2 AND m.company_id = $3 AND m.status <> 'draft'
+       LIMIT 1
+    `, [id, ctx.tenantUserId, ctx.companyId]);
+
+    if (!memoRes.rows.length) return res.status(404).json({ error: "Memo not found" });
+    const memo = memoRes.rows[0];
+
+    // Items — strip cost / internal fields, only expose memo_price.
+    const itemsRes = await pool.query(`
+      SELECT id, memo_id, item_type, item_sku, item_id,
+             snapshot, memo_price, quantity, status,
+             pending_status, pending_at, pending_note,
+             returned_at, sold_at, notes,
+             created_at, updated_at
+        FROM memo_items
+       WHERE memo_id = $1
+    ORDER BY created_at ASC
+    `, [id]);
+
+    res.json({ ...memo, items: itemsRes.rows });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// POST /api/portal/memos/:id/items/:itemId/request
+// Body: { kind: 'sold' | 'returned', note? }
+// Stages a pending request — owner approves/declines from the main app.
+app.post("/api/portal/memos/:id/items/:itemId/request", async (req, res) => {
+  try {
+    const ctx = await requireStoreUser(req);
+    const { id, itemId } = req.params;
+    const { kind, note } = req.body || {};
+    if (!['sold', 'returned'].includes(kind)) {
+      return res.status(400).json({ error: "kind must be 'sold' or 'returned'" });
+    }
+
+    // Confirm the item belongs to a memo this store user can see.
+    const cur = await pool.query(`
+      SELECT mi.*, m.status AS memo_status, m.company_id
+        FROM memo_items mi
+        JOIN memos m ON m.id = mi.memo_id
+       WHERE mi.id = $1 AND mi.memo_id = $2
+         AND m.user_id = $3 AND m.company_id = $4
+       LIMIT 1
+    `, [itemId, id, ctx.tenantUserId, ctx.companyId]);
+    if (!cur.rows.length)             return res.status(404).json({ error: "Memo item not found" });
+    if (cur.rows[0].status !== 'out') return res.status(400).json({ error: "Item is no longer out on memo" });
+
+    const cleanNote = (note || '').toString().slice(0, 500) || null;
+
+    await pool.query(`
+      UPDATE memo_items
+         SET pending_status = $1,
+             pending_at     = NOW(),
+             pending_by     = $2,
+             pending_note   = $3,
+             updated_at     = NOW()
+       WHERE id = $4
+    `, [kind, ctx.actorUserId, cleanNote, itemId]);
+
+    logActivity({
+      userId:     ctx.tenantUserId,
+      actorId:    ctx.actorUserId,
+      actorName:  ctx.actorName || ctx.memberName,
+      entityType: 'memo',
+      entityId:   String(id),
+      action:     kind === 'sold' ? 'request_sold' : 'request_return',
+      summary:    `Store requested ${kind === 'sold' ? 'mark as sold' : 'return'} for ${cur.rows[0].item_sku}` +
+                  (cleanNote ? ` · ${cleanNote}` : ''),
+    });
+
+    const refreshed = await pool.query(`SELECT * FROM memo_items WHERE id = $1`, [itemId]);
+    res.json(refreshed.rows[0]);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// POST /api/portal/memos/:id/items/:itemId/cancel-request
+// Lets the store user retract a pending request before the owner acts.
+app.post("/api/portal/memos/:id/items/:itemId/cancel-request", async (req, res) => {
+  try {
+    const ctx = await requireStoreUser(req);
+    const { id, itemId } = req.params;
+
+    const cur = await pool.query(`
+      SELECT mi.*
+        FROM memo_items mi
+        JOIN memos m ON m.id = mi.memo_id
+       WHERE mi.id = $1 AND mi.memo_id = $2
+         AND m.user_id = $3 AND m.company_id = $4
+       LIMIT 1
+    `, [itemId, id, ctx.tenantUserId, ctx.companyId]);
+    if (!cur.rows.length)                  return res.status(404).json({ error: "Memo item not found" });
+    if (!cur.rows[0].pending_status)       return res.status(400).json({ error: "No pending request to cancel" });
+    if (cur.rows[0].pending_by !== ctx.actorUserId) {
+      return res.status(403).json({ error: "Only the requester can cancel this request" });
+    }
+
+    await pool.query(`
+      UPDATE memo_items
+         SET pending_status = NULL,
+             pending_at     = NULL,
+             pending_by     = NULL,
+             pending_note   = NULL,
+             updated_at     = NOW()
+       WHERE id = $1
+    `, [itemId]);
+
+    logActivity({
+      userId:     ctx.tenantUserId,
+      actorId:    ctx.actorUserId,
+      actorName:  ctx.actorName || ctx.memberName,
+      entityType: 'memo',
+      entityId:   String(id),
+      action:     'request_cancelled',
+      summary:    `Store cancelled request on ${cur.rows[0].item_sku}`,
+    });
+
+    const refreshed = await pool.query(`SELECT * FROM memo_items WHERE id = $1`, [itemId]);
+    res.json(refreshed.rows[0]);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+/* =========================================================
    CRM – Folders (hierarchical)
    ========================================================= */
 
@@ -9127,14 +9555,100 @@ function escHtml(s) {
  * Returns { subject, html, text } so the same template is reused by the
  * initial POST and the "Resend invitation" endpoint.
  */
-function buildInviteEmail({ rep, inviter, workspaceName, signInUrl }) {
+function buildInviteEmail({ rep, inviter, workspaceName, signInUrl, variant = 'rep', companyName = null }) {
   const repName    = escHtml(rep?.name || 'there');
   const inviteName = escHtml(inviter?.name || inviter?.email || 'Your team admin');
   const wsName     = escHtml(workspaceName || 'GEMS DNA workspace');
   const ctaUrl     = signInUrl || 'https://www.gems-dna.com/sign-in';
   const repEmail   = escHtml(rep?.email || '');
+  const storeName  = escHtml(companyName || 'your store');
+  const isStore    = variant === 'store_user';
 
-  const subject = `${inviter?.name || 'Your team admin'} invited you to join ${workspaceName || 'GEMS DNA'}`;
+  const subject = isStore
+    ? `${inviter?.name || 'Your supplier'} invited ${companyName || 'your store'} to the consignment portal`
+    : `${inviter?.name || 'Your team admin'} invited you to join ${workspaceName || 'GEMS DNA'}`;
+
+  if (isStore) {
+    const html = `
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8" /><title>${escHtml(subject)}</title></head>
+<body style="margin:0;padding:0;background:#f5f5f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1c1917;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f5f5f4;padding:32px 16px;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,0.04);">
+        <tr><td style="padding:28px 32px 0 32px;">
+          <div style="display:inline-flex;align-items:center;gap:8px;">
+            <div style="width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#0ea5e9 0%,#2563eb 100%);display:inline-block;line-height:36px;text-align:center;color:white;font-weight:700;font-size:16px;">GD</div>
+            <div style="font-weight:700;color:#1c1917;font-size:18px;letter-spacing:-0.01em;">GEMS DNA</div>
+          </div>
+        </td></tr>
+        <tr><td style="padding:24px 32px 8px 32px;">
+          <h1 style="margin:0 0 8px 0;font-size:22px;font-weight:700;color:#1c1917;line-height:1.3;">
+            <span style="color:#2563eb;">${storeName}</span> has access to the consignment portal
+          </h1>
+          <p style="margin:0 0 16px 0;font-size:15px;line-height:1.6;color:#44403c;">Hey ${repName},</p>
+          <p style="margin:0 0 16px 0;font-size:15px;line-height:1.6;color:#44403c;">
+            <strong>${inviteName}</strong> from <strong>${wsName}</strong> invited you to a private portal where you can
+            see every <strong>memo</strong> you have on consignment, mark items as <strong>sold</strong>,
+            and request <strong>returns</strong> — all in one place.
+          </p>
+          <p style="margin:0 0 24px 0;font-size:15px;line-height:1.6;color:#44403c;">
+            Create your account using this exact email so we can link it to your store account:
+            <strong style="color:#1c1917;">${repEmail}</strong>
+          </p>
+        </td></tr>
+        <tr><td align="center" style="padding:0 32px 8px 32px;">
+          <a href="${ctaUrl}"
+             style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:10px;font-weight:600;font-size:15px;letter-spacing:0.01em;">
+             Open the portal
+          </a>
+        </td></tr>
+        <tr><td style="padding:16px 32px 8px 32px;">
+          <p style="margin:0;font-size:12px;line-height:1.6;color:#78716c;text-align:center;">
+            Or paste this link into your browser:<br/>
+            <a href="${ctaUrl}" style="color:#2563eb;word-break:break-all;">${ctaUrl}</a>
+          </p>
+        </td></tr>
+        <tr><td style="padding:24px 32px;border-top:1px solid #f5f5f4;margin-top:16px;">
+          <p style="margin:0;font-size:12px;line-height:1.5;color:#a8a29e;">In the portal you'll be able to:</p>
+          <ul style="margin:8px 0 0 0;padding:0 0 0 18px;font-size:13px;line-height:1.7;color:#57534e;">
+            <li>See every active memo your store has on consignment</li>
+            <li>View item photos, specs and the agreed memo price</li>
+            <li>Mark items as sold (subject to ${inviteName}'s approval)</li>
+            <li>Request returns directly from the item card</li>
+            <li>Get a full history of past memos for your records</li>
+          </ul>
+        </td></tr>
+        <tr><td style="padding:18px 32px 28px 32px;background:#fafaf9;">
+          <p style="margin:0;font-size:11px;line-height:1.5;color:#a8a29e;text-align:center;">
+            If you weren't expecting this invitation, you can safely ignore this email — your store will not be activated until you create your account.
+          </p>
+        </td></tr>
+      </table>
+      <p style="margin:16px 0 0 0;font-size:11px;color:#a8a29e;">© GEMS DNA · Consignment portal · Sent because ${inviteName} added your store as a portal user.</p>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+    const text = [
+      `Hey ${rep?.name || 'there'},`,
+      ``,
+      `${inviter?.name || 'Your supplier'} from ${workspaceName || 'GEMS DNA'} invited ${companyName || 'your store'} to the GEMS DNA consignment portal.`,
+      ``,
+      `In the portal you'll see every memo on consignment, mark items as sold, and request returns.`,
+      ``,
+      `Create your account using this exact email so we can link it to your store: ${rep?.email || ''}`,
+      `${ctaUrl}`,
+      ``,
+      `If you weren't expecting this invitation, you can safely ignore this email.`,
+      ``,
+      `— GEMS DNA Consignment Portal`,
+    ].join('\n');
+
+    return { subject, html, text };
+  }
 
   const html = `
 <!DOCTYPE html>
@@ -9386,7 +9900,7 @@ async function createClerkInvitation({ email, redirectUrl, metadata, revokeExist
  * invitation ticket URL, it should pass it here; otherwise we fall back to
  * `/sign-up?email=` (which only works if Clerk Sign-up Mode is Public).
  */
-async function sendTeamInviteEmail({ rep, inviter, workspaceName, ctaUrl }) {
+async function sendTeamInviteEmail({ rep, inviter, workspaceName, ctaUrl, variant = 'rep', companyName = null }) {
   if (!process.env.RESEND_API_KEY) {
     return { ok: false, skipped: true, error: 'RESEND_API_KEY not configured' };
   }
@@ -9403,7 +9917,7 @@ async function sendTeamInviteEmail({ rep, inviter, workspaceName, ctaUrl }) {
   // would be blocked by Restricted sign-up mode.
   const signInUrl  = ctaUrl || `${FRONTEND_URL.replace(/\/$/, '')}/sign-up?email=${encodeURIComponent(rep.email)}`;
 
-  const { subject, html, text } = buildInviteEmail({ rep, inviter, workspaceName, signInUrl });
+  const { subject, html, text } = buildInviteEmail({ rep, inviter, workspaceName, signInUrl, variant, companyName });
 
   // Only set reply_to if the inviter has a real email address. Otherwise
   // Resend rejects the whole request with a 422 validation_error.
@@ -9490,6 +10004,7 @@ app.get('/api/team/me', async (req, res) => {
     const all = await pool.query(
       `SELECT id, team_owner_id, clerk_user_id, email, name, role,
               avatar_color, commission_pct, quota_monthly, active,
+              company_id,
               created_at, updated_at,
               invited_at, last_invited_at, invite_count,
               (clerk_user_id IS NULL) AS pending
@@ -9502,13 +10017,23 @@ app.get('/api/team/me', async (req, res) => {
       (r) => r.clerk_user_id === finalCtx.actorUserId
     ) || null;
 
+    const role = me?.role || finalCtx.role || 'owner';
+    const isStoreUser = role === 'store_user';
+
+    // Store users are scoped to the portal — they don't need (and shouldn't
+    // see) the full team roster of the supplier. We send back only their
+    // own row so the FE can render the portal chrome.
+    const members = isStoreUser ? (me ? [me] : []) : all.rows;
+
     res.json({
       me,
-      members: all.rows,
+      members,
       tenantUserId: ownerId,
       actorUserId:  finalCtx.actorUserId,
-      role:         me?.role || finalCtx.role || 'owner',
-      isOwner:      (me?.role || finalCtx.role) === 'owner',
+      role,
+      isOwner:      role === 'owner',
+      isStoreUser,
+      companyId:    me?.company_id || null,
     });
   } catch (e) {
     console.error('GET /api/team/me error:', e);
@@ -9550,12 +10075,25 @@ app.post('/api/team/members', async (req, res) => {
     await ensureOwnerRow(ctx);
     if (!ctx.isOwner) return res.status(403).json({ error: 'Only the workspace owner can invite members' });
 
-    const { email, name, role = 'rep', commissionPct, quotaMonthly, avatarColor } = req.body || {};
+    const { email, name, role = 'rep', commissionPct, quotaMonthly, avatarColor, companyId } = req.body || {};
     if (!email || !String(email).trim()) return res.status(400).json({ error: 'email is required' });
     if (!name || !String(name).trim())  return res.status(400).json({ error: 'name is required' });
-    if (!['rep', 'owner'].includes(role)) return res.status(400).json({ error: 'invalid role' });
+    if (!['rep', 'owner', 'store_user'].includes(role)) return res.status(400).json({ error: 'invalid role' });
 
     const ownerId = ctx.tenantUserId || ctx.actorUserId;
+
+    // store_user must be tied to a single retail store. We look it up to
+    // confirm it exists in this workspace before the row is created.
+    let companyRow = null;
+    if (role === 'store_user') {
+      if (!companyId) return res.status(400).json({ error: 'companyId is required for store users' });
+      const cr = await pool.query(
+        `SELECT id, name, type FROM crm_companies WHERE id = $1 AND user_id = $2 LIMIT 1`,
+        [companyId, ownerId]
+      );
+      if (!cr.rows.length) return res.status(404).json({ error: 'Store not found in your workspace' });
+      companyRow = cr.rows[0];
+    }
 
     // Cap free-tier teams at 10 members so we don't accidentally invite the
     // whole world. Owner counts as 1.
@@ -9594,6 +10132,7 @@ app.post('/api/team/members', async (req, res) => {
                   avatar_color    = COALESCE($3, avatar_color),
                   commission_pct  = $4,
                   quota_monthly   = $5,
+                  company_id      = $6,
                   invited_at      = NOW(),
                   last_invited_at = NOW(),
                   invite_count    = COALESCE(invite_count, 0) + 1,
@@ -9601,7 +10140,7 @@ app.post('/api/team/members', async (req, res) => {
                   -- the new rep gets re-linked cleanly on their first sign-in.
                   clerk_user_id   = NULL,
                   updated_at      = NOW()
-            WHERE id = $6
+            WHERE id = $7
             RETURNING *`,
           [
             String(name).trim(),
@@ -9609,6 +10148,7 @@ app.post('/api/team/members', async (req, res) => {
             avatarColor || pickAvatarColor(email),
             Number(commissionPct) || 0,
             Number(quotaMonthly)  || 0,
+            role === 'store_user' ? Number(companyId) : null,
             prior.id,
           ]
         );
@@ -9616,8 +10156,8 @@ app.post('/api/team/members', async (req, res) => {
       } else {
         const ins = await pool.query(
           `INSERT INTO team_members
-             (team_owner_id, email, name, role, avatar_color, commission_pct, quota_monthly, active, invited_at, last_invited_at, invite_count)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, NOW(), NOW(), 1)
+             (team_owner_id, email, name, role, avatar_color, commission_pct, quota_monthly, company_id, active, invited_at, last_invited_at, invite_count)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, NOW(), NOW(), 1)
            RETURNING *`,
           [
             ownerId,
@@ -9627,6 +10167,7 @@ app.post('/api/team/members', async (req, res) => {
             avatarColor || pickAvatarColor(email),
             Number(commissionPct) || 0,
             Number(quotaMonthly)  || 0,
+            role === 'store_user' ? Number(companyId) : null,
           ]
         );
         member = ins.rows[0];
@@ -9650,16 +10191,24 @@ app.post('/api/team/members', async (req, res) => {
       // Skip email for owner role — that's the admin themselves.
       let emailResult = { ok: false, skipped: true };
       let inviteResult = { ok: false, skipped: true };
-      if (role === 'rep') {
-        // Mint a Clerk invitation ticket so the rep can sign up even when
-        // Sign-up Mode is set to Restricted in the Clerk dashboard.
+      if (role === 'rep' || role === 'store_user') {
+        // Where do we send them after they finish signing up?
+        // Reps land in the dashboard; store users land directly in the portal.
+        const postSignUpRedirect =
+          role === 'store_user'
+            ? `${FRONTEND_URL.replace(/\/$/, '')}/store-portal`
+            : `${FRONTEND_URL.replace(/\/$/, '')}/dashboard`;
+
+        // Mint a Clerk invitation ticket so the invitee can sign up even
+        // when Sign-up Mode is set to Restricted in the Clerk dashboard.
         inviteResult = await createClerkInvitation({
           email: member.email,
-          redirectUrl: `${FRONTEND_URL.replace(/\/$/, '')}/dashboard`,
+          redirectUrl: postSignUpRedirect,
           metadata: {
-            team_owner_id: ownerId,
+            team_owner_id:  ownerId,
             team_member_id: member.id,
-            role: 'rep',
+            role,
+            company_id:     role === 'store_user' ? Number(companyId) : null,
           },
           // First invite: don't bother revoking — there shouldn't be one.
           revokeExisting: false,
@@ -9678,7 +10227,14 @@ app.post('/api/team/members', async (req, res) => {
           console.warn(`[clerk invite] ${member.email}:`, inviteResult.error);
         }
 
-        emailResult = await sendTeamInviteEmail({ rep: member, inviter, workspaceName, ctaUrl });
+        emailResult = await sendTeamInviteEmail({
+          rep: member,
+          inviter,
+          workspaceName,
+          ctaUrl,
+          variant: role === 'store_user' ? 'store_user' : 'rep',
+          companyName: companyRow?.name || null,
+        });
         if (!emailResult.ok && !emailResult.skipped) {
           console.warn(`[team invite] failed to email ${member.email}:`, emailResult.error);
         }
