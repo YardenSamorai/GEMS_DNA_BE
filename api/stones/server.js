@@ -2461,8 +2461,46 @@ const crmReadyPromise = (async () => {
     await pool.query(`ALTER TABLE memo_items ADD COLUMN IF NOT EXISTS pending_note   TEXT`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_items_pending ON memo_items(pending_status) WHERE pending_status IS NOT NULL`);
 
+    // Memo requests — store users browse the available catalog and
+    // submit a wishlist of items + an optional free-text message.
+    // The supplier reviews these from their inbox and either converts
+    // the request into a real memo (one click) or declines it.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS memo_requests (
+        id                SERIAL PRIMARY KEY,
+        user_id           TEXT NOT NULL,
+        company_id        INTEGER NOT NULL,
+        requested_by      TEXT NOT NULL,
+        status            TEXT NOT NULL DEFAULT 'pending',
+        message           TEXT,
+        preferred_due_at  TIMESTAMP,
+        converted_memo_id INTEGER,
+        decline_reason    TEXT,
+        responded_at      TIMESTAMP,
+        responded_by      TEXT,
+        created_at        TIMESTAMP DEFAULT NOW(),
+        updated_at        TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_requests_tenant   ON memo_requests(user_id, status)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_requests_company  ON memo_requests(company_id)`);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS memo_request_items (
+        id          SERIAL PRIMARY KEY,
+        request_id  INTEGER NOT NULL REFERENCES memo_requests(id) ON DELETE CASCADE,
+        item_type   TEXT NOT NULL,
+        item_sku    TEXT,
+        item_id     TEXT,
+        snapshot    JSONB DEFAULT '{}',
+        notes       TEXT,
+        created_at  TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_request_items_req ON memo_request_items(request_id)`);
+
     crmReady = true;
-    console.log("CRM tables ready (incl. companies + memos)");
+    console.log("CRM tables ready (incl. companies + memos + memo_requests)");
   } catch (err) {
     console.error("❌ CRM table creation error:", err);
   }
@@ -6649,6 +6687,440 @@ app.post("/api/portal/memos/:id/items/:itemId/cancel-request", async (req, res) 
     const refreshed = await pool.query(`SELECT * FROM memo_items WHERE id = $1`, [itemId]);
     res.json(refreshed.rows[0]);
   } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+/* =========================================================
+   Portal — Catalog
+   GET /api/portal/catalog?type=stones|jewelry|all&search=&shape=&category=
+   Returns the supplier's available inventory (anything not currently
+   out on a memo) without exposing cost / internal pricing fields.
+   The store user uses this to pick items to request a memo for.
+   ========================================================= */
+app.get("/api/portal/catalog", async (req, res) => {
+  try {
+    const ctx = await requireStoreUser(req);
+    const type   = String(req.query.type   || 'all').toLowerCase();
+    const search = String(req.query.search || '').trim().toLowerCase();
+    const shape  = String(req.query.shape  || '').trim().toLowerCase();
+    const cat    = String(req.query.category || '').trim().toLowerCase();
+    const limit  = Math.min(Number(req.query.limit) || 60, 200);
+
+    // Build the set of SKUs already out on a memo (any company) so we
+    // don't tease the store with items they can't actually have.
+    const busy = await pool.query(`
+      SELECT DISTINCT mi.item_type, mi.item_sku
+        FROM memo_items mi
+        JOIN memos m ON m.id = mi.memo_id
+       WHERE mi.status = 'out'
+         AND m.status IN ('out','partially_returned')
+         AND m.user_id = $1
+    `, [ctx.tenantUserId]);
+    const busyStones  = new Set(busy.rows.filter(r => r.item_type !== 'jewelry').map(r => r.item_sku));
+    const busyJewelry = new Set(busy.rows.filter(r => r.item_type === 'jewelry').map(r => r.item_sku));
+
+    const out = { stones: [], jewelry: [] };
+
+    // Stones — pull from soap_stones (the canonical "for sale" pile).
+    if (type === 'all' || type === 'stones') {
+      const r = await pool.query(`SELECT * FROM soap_stones WHERE sku IS NOT NULL ORDER BY updated_at DESC LIMIT 500`);
+      out.stones = r.rows
+        .filter(row => !busyStones.has(row.sku))
+        .filter(row => {
+          if (shape && String(row.shape || '').toLowerCase() !== shape) return false;
+          if (cat   && String(row.category || '').toLowerCase() !== cat) return false;
+          if (!search) return true;
+          const hay = [row.sku, row.shape, row.category, row.color, row.clarity, row.origin, row.lab]
+            .filter(Boolean).join(' ').toLowerCase();
+          return hay.includes(search);
+        })
+        .slice(0, limit)
+        .map(row => {
+          let imageUrl = row.image;
+          if (!imageUrl && row.additional_pictures) {
+            const first = row.additional_pictures.split(';')[0];
+            imageUrl = first ? first.trim() : null;
+          }
+          return {
+            kind:        'stone',
+            sku:         row.sku,
+            shape:       row.shape || '',
+            category:    row.category || '',
+            type:        row.type || '',
+            weightCt:    row.weight ? Number(row.weight) : null,
+            color:       row.color || '',
+            clarity:     row.clarity || '',
+            origin:      row.origin || '',
+            lab:         row.lab || '',
+            measurements: row.measurements || '',
+            imageUrl,
+            videoUrl:    row.video || null,
+            certificateNumber: row.certificate_number || '',
+            // Pricing intentionally omitted — store sees price only on
+            // the issued memo. Discreet by design.
+          };
+        });
+    }
+
+    // Jewelry — pull from jewelry_items, only the ones marked "active"
+    // (anything not archived / not draft / not sold).
+    if (type === 'all' || type === 'jewelry') {
+      const r = await pool.query(`
+        SELECT id, sku, name, category, type, status, cover_image_url,
+               metal_summary, weight_grams, size, sold_at, updated_at
+          FROM jewelry_items
+         WHERE user_id = $1
+           AND COALESCE(status,'') NOT IN ('archived','draft')
+           AND sold_at IS NULL
+         ORDER BY updated_at DESC
+         LIMIT 500
+      `, [ctx.tenantUserId]);
+      out.jewelry = r.rows
+        .filter(row => !busyJewelry.has(row.sku))
+        .filter(row => {
+          if (cat && String(row.category || '').toLowerCase() !== cat) return false;
+          if (!search) return true;
+          const hay = [row.sku, row.name, row.category, row.type, row.metal_summary]
+            .filter(Boolean).join(' ').toLowerCase();
+          return hay.includes(search);
+        })
+        .slice(0, limit)
+        .map(row => ({
+          kind:        'jewelry',
+          id:          row.id,
+          sku:         row.sku,
+          name:        row.name || row.sku,
+          category:    row.category || '',
+          type:        row.type || '',
+          metalType:   row.metal_summary || '',
+          metalColor:  '',
+          totalWeight: row.weight_grams != null ? Number(row.weight_grams) : null,
+          size:        row.size || '',
+          imageUrl:    row.cover_image_url || null,
+        }));
+    }
+
+    res.json(out);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+/* =========================================================
+   Portal — Memo Requests
+   ========================================================= */
+
+// POST /api/portal/memo-requests
+// Body: { items: [{kind:'stone'|'jewelry', sku, snapshot, notes}], message, preferredDueAt }
+app.post("/api/portal/memo-requests", async (req, res) => {
+  try {
+    const ctx = await requireStoreUser(req);
+    const { items = [], message, preferredDueAt } = req.body || {};
+    const cleanItems = Array.isArray(items) ? items.filter(i => i && (i.sku || i.kind)) : [];
+    const cleanMsg   = (message || '').toString().slice(0, 2000) || null;
+    if (!cleanItems.length && !cleanMsg) {
+      return res.status(400).json({ error: "Request must include at least one item or a message" });
+    }
+
+    const dueAt = preferredDueAt ? new Date(preferredDueAt) : null;
+    const ins = await pool.query(`
+      INSERT INTO memo_requests (user_id, company_id, requested_by, status, message, preferred_due_at)
+      VALUES ($1, $2, $3, 'pending', $4, $5)
+      RETURNING *
+    `, [ctx.tenantUserId, ctx.companyId, ctx.actorUserId, cleanMsg, dueAt && !isNaN(dueAt) ? dueAt : null]);
+    const reqRow = ins.rows[0];
+
+    for (const it of cleanItems) {
+      const itemType = it.kind === 'jewelry' ? 'jewelry' : 'stone';
+      await pool.query(`
+        INSERT INTO memo_request_items (request_id, item_type, item_sku, item_id, snapshot, notes)
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+      `, [
+        reqRow.id,
+        itemType,
+        it.sku || null,
+        it.id != null ? String(it.id) : null,
+        JSON.stringify(it.snapshot || it || {}),
+        (it.notes || '').toString().slice(0, 500) || null,
+      ]);
+    }
+
+    logActivity({
+      userId:     ctx.tenantUserId,
+      actorId:    ctx.actorUserId,
+      actorName:  ctx.actorName || ctx.memberName,
+      entityType: 'memo_request',
+      entityId:   String(reqRow.id),
+      action:     'created',
+      summary:    `Memo request from store · ${cleanItems.length} item(s)` + (cleanMsg ? ` · "${cleanMsg.slice(0, 80)}"` : ''),
+    });
+
+    res.status(201).json(reqRow);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// GET /api/portal/memo-requests — store sees their own request history.
+app.get("/api/portal/memo-requests", async (req, res) => {
+  try {
+    const ctx = await requireStoreUser(req);
+    const r = await pool.query(`
+      SELECT r.*,
+             (SELECT COUNT(*)::int FROM memo_request_items i WHERE i.request_id = r.id) AS item_count
+        FROM memo_requests r
+       WHERE r.user_id = $1 AND r.company_id = $2
+    ORDER BY r.created_at DESC
+       LIMIT 200
+    `, [ctx.tenantUserId, ctx.companyId]);
+    res.json(r.rows);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// GET /api/portal/memo-requests/:id — single request with items.
+app.get("/api/portal/memo-requests/:id", async (req, res) => {
+  try {
+    const ctx = await requireStoreUser(req);
+    const { id } = req.params;
+    const r = await pool.query(`
+      SELECT * FROM memo_requests
+       WHERE id = $1 AND user_id = $2 AND company_id = $3
+       LIMIT 1
+    `, [id, ctx.tenantUserId, ctx.companyId]);
+    if (!r.rows.length) return res.status(404).json({ error: "Request not found" });
+    const items = await pool.query(`SELECT * FROM memo_request_items WHERE request_id = $1 ORDER BY id`, [id]);
+    res.json({ ...r.rows[0], items: items.rows });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// POST /api/portal/memo-requests/:id/cancel — store can cancel a pending request.
+app.post("/api/portal/memo-requests/:id/cancel", async (req, res) => {
+  try {
+    const ctx = await requireStoreUser(req);
+    const { id } = req.params;
+    const cur = await pool.query(`
+      SELECT * FROM memo_requests
+       WHERE id = $1 AND user_id = $2 AND company_id = $3
+       LIMIT 1
+    `, [id, ctx.tenantUserId, ctx.companyId]);
+    if (!cur.rows.length)              return res.status(404).json({ error: "Request not found" });
+    if (cur.rows[0].status !== 'pending') return res.status(400).json({ error: "Only pending requests can be cancelled" });
+
+    const upd = await pool.query(`
+      UPDATE memo_requests
+         SET status = 'cancelled', updated_at = NOW()
+       WHERE id = $1
+       RETURNING *
+    `, [id]);
+    res.json(upd.rows[0]);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+/* =========================================================
+   Owner-side Memo Requests (inbox + actions)
+   ========================================================= */
+
+// GET /api/memo-requests — owner inbox (optionally filter by status / company).
+app.get("/api/memo-requests", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    const tenantUserId = ctx.tenantUserId;
+    const status    = String(req.query.status    || '').toLowerCase();
+    const companyId = req.query.companyId ? Number(req.query.companyId) : null;
+
+    const params = [tenantUserId];
+    let where = `r.user_id = $1`;
+    if (status === 'pending' || status === 'converted' || status === 'declined' || status === 'cancelled') {
+      params.push(status);
+      where += ` AND r.status = $${params.length}`;
+    }
+    if (companyId) {
+      params.push(companyId);
+      where += ` AND r.company_id = $${params.length}`;
+    }
+
+    const r = await pool.query(`
+      SELECT r.*,
+             c.name AS company_name, c.logo_url AS company_logo,
+             tm.name AS requester_name, tm.email AS requester_email,
+             (SELECT COUNT(*)::int FROM memo_request_items i WHERE i.request_id = r.id) AS item_count
+        FROM memo_requests r
+        JOIN crm_companies c ON c.id = r.company_id
+   LEFT JOIN team_members tm ON tm.team_owner_id = r.user_id
+                            AND tm.clerk_user_id = r.requested_by
+                            AND tm.active = TRUE
+       WHERE ${where}
+    ORDER BY CASE WHEN r.status = 'pending' THEN 0 ELSE 1 END,
+             r.created_at DESC
+       LIMIT 200
+    `, params);
+    res.json(r.rows);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// GET /api/memo-requests/:id — owner: full detail incl. items.
+app.get("/api/memo-requests/:id", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    const { id } = req.params;
+    const r = await pool.query(`
+      SELECT r.*,
+             c.name AS company_name, c.email AS company_email, c.logo_url AS company_logo,
+             tm.name AS requester_name, tm.email AS requester_email
+        FROM memo_requests r
+        JOIN crm_companies c ON c.id = r.company_id
+   LEFT JOIN team_members tm ON tm.team_owner_id = r.user_id
+                            AND tm.clerk_user_id = r.requested_by
+                            AND tm.active = TRUE
+       WHERE r.id = $1 AND r.user_id = $2
+       LIMIT 1
+    `, [id, ctx.tenantUserId]);
+    if (!r.rows.length) return res.status(404).json({ error: "Request not found" });
+    const items = await pool.query(`SELECT * FROM memo_request_items WHERE request_id = $1 ORDER BY id`, [id]);
+    res.json({ ...r.rows[0], items: items.rows });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// POST /api/memo-requests/:id/decline — owner declines the request.
+app.post("/api/memo-requests/:id/decline", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (!ctx.isOwner)     return res.status(403).json({ error: "Only owners can act on memo requests" });
+    const { id } = req.params;
+    const reason = (req.body?.reason || '').toString().slice(0, 500) || null;
+
+    const cur = await pool.query(`SELECT * FROM memo_requests WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
+    if (!cur.rows.length)                    return res.status(404).json({ error: "Request not found" });
+    if (cur.rows[0].status !== 'pending')    return res.status(400).json({ error: "Only pending requests can be declined" });
+
+    const upd = await pool.query(`
+      UPDATE memo_requests
+         SET status         = 'declined',
+             decline_reason = $1,
+             responded_at   = NOW(),
+             responded_by   = $2,
+             updated_at     = NOW()
+       WHERE id = $3
+       RETURNING *
+    `, [reason, ctx.actorUserId, id]);
+
+    logActivity({
+      userId:     ctx.tenantUserId,
+      actorId:    ctx.actorUserId,
+      actorName:  ctx.actorName || ctx.memberName,
+      entityType: 'memo_request',
+      entityId:   String(id),
+      action:     'declined',
+      summary:    `Memo request declined` + (reason ? ` · ${reason}` : ''),
+    });
+
+    res.json(upd.rows[0]);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// POST /api/memo-requests/:id/convert — owner turns the request into
+// a real draft memo. Items are pre-staged on the new memo so the
+// owner just has to set prices and click "Issue".
+app.post("/api/memo-requests/:id/convert", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (!ctx.isOwner)     return res.status(403).json({ error: "Only owners can act on memo requests" });
+    const { id } = req.params;
+
+    const cur = await pool.query(`SELECT * FROM memo_requests WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
+    if (!cur.rows.length)                    return res.status(404).json({ error: "Request not found" });
+    if (cur.rows[0].status !== 'pending')    return res.status(400).json({ error: "Only pending requests can be converted" });
+    const reqRow = cur.rows[0];
+
+    // Generate a memo number using the same pattern POST /api/memos uses.
+    const ymd = new Date();
+    const yearStr = String(ymd.getFullYear());
+    const last = await pool.query(
+      `SELECT memo_number FROM memos WHERE user_id = $1 AND memo_number LIKE $2 ORDER BY id DESC LIMIT 1`,
+      [ctx.tenantUserId, `MEMO-${yearStr}-%`]
+    );
+    let nextSeq = 1;
+    if (last.rows[0]?.memo_number) {
+      const m = String(last.rows[0].memo_number).match(/-(\d+)$/);
+      if (m) nextSeq = Number(m[1]) + 1;
+    }
+    const memoNumber = `MEMO-${yearStr}-${String(nextSeq).padStart(4, '0')}`;
+
+    const memoIns = await pool.query(`
+      INSERT INTO memos (user_id, company_id, memo_number, status, currency, notes, due_at, created_by)
+      VALUES ($1, $2, $3, 'draft', 'USD', $4, $5, $6)
+      RETURNING *
+    `, [
+      ctx.tenantUserId,
+      reqRow.company_id,
+      memoNumber,
+      reqRow.message ? `From request: ${reqRow.message}` : null,
+      reqRow.preferred_due_at,
+      ctx.actorUserId,
+    ]);
+    const memo = memoIns.rows[0];
+
+    // Pre-load the request items as draft memo items. memo_items.item_sku
+    // is NOT NULL, so we drop free-text items (those without a sku) — the
+    // owner can read the original request message in memo.notes and add
+    // them manually if needed.
+    const reqItems = await pool.query(`SELECT * FROM memo_request_items WHERE request_id = $1`, [id]);
+    for (const it of reqItems.rows) {
+      if (!it.item_sku) continue;
+      const snap = it.snapshot || {};
+      await pool.query(`
+        INSERT INTO memo_items (memo_id, item_type, item_sku, item_id, snapshot, memo_price, quantity)
+        VALUES ($1, $2, $3, $4, $5::jsonb, NULL, 1)
+      `, [
+        memo.id,
+        it.item_type === 'jewelry' ? 'jewelry' : 'stone',
+        it.item_sku,
+        it.item_id,
+        JSON.stringify(snap),
+      ]);
+    }
+
+    const upd = await pool.query(`
+      UPDATE memo_requests
+         SET status            = 'converted',
+             converted_memo_id = $1,
+             responded_at      = NOW(),
+             responded_by      = $2,
+             updated_at        = NOW()
+       WHERE id = $3
+       RETURNING *
+    `, [memo.id, ctx.actorUserId, id]);
+
+    logActivity({
+      userId:     ctx.tenantUserId,
+      actorId:    ctx.actorUserId,
+      actorName:  ctx.actorName || ctx.memberName,
+      entityType: 'memo_request',
+      entityId:   String(id),
+      action:     'converted',
+      summary:    `Memo request converted to ${memoNumber}`,
+    });
+
+    res.json({ request: upd.rows[0], memo });
+  } catch (e) {
+    console.error('Convert memo request error:', e);
     res.status(e.status || 500).json({ error: e.message });
   }
 });
