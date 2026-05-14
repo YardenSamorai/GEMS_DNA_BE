@@ -5572,7 +5572,11 @@ app.get("/api/crm/companies", async (req, res) => {
         (SELECT COUNT(*)::int FROM team_members tm
             WHERE tm.company_id = c.id AND tm.role = 'store_user' AND tm.active = TRUE) AS portal_user_count,
         (SELECT COUNT(*)::int FROM team_members tm
-            WHERE tm.company_id = c.id AND tm.role = 'store_user' AND tm.active = TRUE AND tm.clerk_user_id IS NOT NULL) AS portal_user_active
+            WHERE tm.company_id = c.id AND tm.role = 'store_user' AND tm.active = TRUE AND tm.clerk_user_id IS NOT NULL) AS portal_user_active,
+        -- Pending memo requests waiting for the supplier's review.
+        -- Surfaced on the store card so the supplier can spot them at a glance.
+        (SELECT COUNT(*)::int FROM memo_requests mr
+            WHERE mr.company_id = c.id AND mr.user_id = c.user_id AND mr.status = 'pending') AS pending_requests_count
       FROM crm_companies c
       WHERE ${where.join(' AND ')}
       ORDER BY c.updated_at DESC
@@ -5602,7 +5606,7 @@ app.get("/api/crm/companies/:id", async (req, res) => {
       return res.status(404).json({ error: "Company not found" });
     }
 
-    const [contacts, memos, portalUsers] = await Promise.all([
+    const [contacts, memos, portalUsers, memoRequests] = await Promise.all([
       pool.query(`SELECT id, name, title, email, phone, type FROM crm_contacts WHERE company_id = $1 ORDER BY name`, [id]),
       pool.query(`SELECT id, memo_number, status, issued_at, due_at, total_value, currency,
                          (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id) AS item_count
@@ -5615,12 +5619,30 @@ app.get("/api/crm/companies/:id", async (req, res) => {
                     FROM team_members
                    WHERE company_id = $1 AND role = 'store_user' AND active = TRUE
                    ORDER BY (clerk_user_id IS NOT NULL) DESC, created_at DESC`, [id]),
+      // Memo requests originating from this store's portal users.
+      // The most recent first, with a count of items each contains.
+      pool.query(`SELECT r.id, r.status, r.message, r.preferred_due_at,
+                         r.converted_memo_id, r.decline_reason,
+                         r.created_at, r.responded_at,
+                         tm.name AS requester_name, tm.email AS requester_email,
+                         (SELECT COUNT(*)::int FROM memo_request_items mi WHERE mi.request_id = r.id) AS item_count
+                    FROM memo_requests r
+               LEFT JOIN team_members tm ON tm.team_owner_id = r.user_id
+                                         AND tm.clerk_user_id = r.requested_by
+                                         AND tm.active = TRUE
+                   WHERE r.company_id = $1 AND r.user_id = $2
+                ORDER BY CASE WHEN r.status = 'pending' THEN 0 ELSE 1 END,
+                         r.created_at DESC
+                   LIMIT 50`, [id, tenantUserId]),
     ]);
+    const pendingCount = memoRequests.rows.filter((r) => r.status === 'pending').length;
     res.json({
       ...company,
       contacts: contacts.rows,
       memos: memos.rows,
       portal_users: portalUsers.rows,
+      memo_requests: memoRequests.rows,
+      pending_requests_count: pendingCount,
     });
   } catch (error) {
     console.error("Error fetching company:", error);
