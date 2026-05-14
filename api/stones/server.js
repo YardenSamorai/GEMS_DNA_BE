@@ -2499,8 +2499,135 @@ const crmReadyPromise = (async () => {
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_request_items_req ON memo_request_items(request_id)`);
 
+    /* =========================================================
+       Catalog Tiers — per-supplier curated buckets of inventory
+       that decide which items each store sees in the portal.
+
+       Model:
+       - catalog_tiers           : a named collection ("Public",
+                                   "VIP Bridal", "Israel Exclusive"…)
+                                   owned by one supplier (user_id).
+       - catalog_tier_items      : SKUs (stones or jewelry) inside
+                                   the tier. An item can live in many
+                                   tiers, or in zero tiers (which means
+                                   no store will ever see it — that is
+                                   the deliberate default for new items).
+       - catalog_tier_companies  : which stores see the tier. A store
+                                   sees the union of items across the
+                                   tiers it's subscribed to.
+       ========================================================= */
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS catalog_tiers (
+        id            SERIAL PRIMARY KEY,
+        user_id       TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        description   TEXT,
+        color         TEXT,
+        sort_order    INTEGER DEFAULT 0,
+        is_default    BOOLEAN DEFAULT FALSE,
+        created_at    TIMESTAMP DEFAULT NOW(),
+        updated_at    TIMESTAMP DEFAULT NOW(),
+        UNIQUE (user_id, name)
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_catalog_tiers_user ON catalog_tiers(user_id)`);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS catalog_tier_items (
+        tier_id     INTEGER NOT NULL REFERENCES catalog_tiers(id) ON DELETE CASCADE,
+        item_type   TEXT NOT NULL,
+        item_sku    TEXT NOT NULL,
+        added_at    TIMESTAMP DEFAULT NOW(),
+        added_by    TEXT,
+        PRIMARY KEY (tier_id, item_type, item_sku)
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cti_item ON catalog_tier_items(item_type, item_sku)`);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS catalog_tier_companies (
+        tier_id     INTEGER NOT NULL REFERENCES catalog_tiers(id) ON DELETE CASCADE,
+        company_id  INTEGER NOT NULL,
+        added_at    TIMESTAMP DEFAULT NOW(),
+        PRIMARY KEY (tier_id, company_id)
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ctc_company ON catalog_tier_companies(company_id)`);
+
+    /* One-time seed.
+       Until today every store-portal user could see every active
+       stone and every active jewelry item belonging to the supplier.
+       To preserve that behaviour the FIRST time the new tables exist,
+       for each supplier that has at least one store user we:
+         1. Create a "Public" tier (is_default = TRUE).
+         2. Add every active SKU we currently expose in the catalog.
+         3. Subscribe every CRM company that owns a store_user.
+       Subsequent server boots are a no-op because we check whether
+       the supplier already has any tier. */
+    try {
+      const suppliersWithStoreUsers = await pool.query(`
+        SELECT DISTINCT tm.team_owner_id AS user_id
+          FROM team_members tm
+         WHERE tm.role = 'store_user'
+           AND tm.active = TRUE
+      `);
+      for (const sup of suppliersWithStoreUsers.rows) {
+        const uid = sup.user_id;
+        const existing = await pool.query(`SELECT 1 FROM catalog_tiers WHERE user_id = $1 LIMIT 1`, [uid]);
+        if (existing.rows.length) continue;
+
+        const inserted = await pool.query(
+          `INSERT INTO catalog_tiers (user_id, name, description, color, is_default, sort_order)
+           VALUES ($1, 'Public', 'Default catalog visible to all linked stores', '#0ea5e9', TRUE, 0)
+           RETURNING id`,
+          [uid]
+        );
+        const tierId = inserted.rows[0].id;
+
+        // Seed stones — every soap_stone with a SKU.
+        await pool.query(
+          `INSERT INTO catalog_tier_items (tier_id, item_type, item_sku, added_by)
+             SELECT $1, 'stone', sku, 'system-seed'
+               FROM soap_stones
+              WHERE sku IS NOT NULL
+           ON CONFLICT DO NOTHING`,
+          [tierId]
+        );
+
+        // Seed jewelry — active, not archived/draft, not sold.
+        await pool.query(
+          `INSERT INTO catalog_tier_items (tier_id, item_type, item_sku, added_by)
+             SELECT $1, 'jewelry', sku, 'system-seed'
+               FROM jewelry_items
+              WHERE user_id = $2
+                AND sku IS NOT NULL
+                AND COALESCE(status,'') NOT IN ('archived','draft')
+                AND sold_at IS NULL
+           ON CONFLICT DO NOTHING`,
+          [tierId, uid]
+        );
+
+        // Subscribe every company that already has a store_user.
+        await pool.query(
+          `INSERT INTO catalog_tier_companies (tier_id, company_id)
+             SELECT DISTINCT $1, tm.company_id
+               FROM team_members tm
+              WHERE tm.team_owner_id = $2
+                AND tm.role = 'store_user'
+                AND tm.active = TRUE
+                AND tm.company_id IS NOT NULL
+           ON CONFLICT DO NOTHING`,
+          [tierId, uid]
+        );
+
+        console.log(`Catalog tiers seeded for supplier ${uid} → "Public"`);
+      }
+    } catch (seedErr) {
+      console.error("⚠️ Catalog tier seed skipped:", seedErr.message);
+    }
+
     crmReady = true;
-    console.log("CRM tables ready (incl. companies + memos + memo_requests)");
+    console.log("CRM tables ready (incl. companies + memos + memo_requests + catalog_tiers)");
   } catch (err) {
     console.error("❌ CRM table creation error:", err);
   }
@@ -5895,6 +6022,47 @@ app.get("/api/memos", async (req, res) => {
   }
 });
 
+/* Returns SKUs that are currently on an active memo so the FE
+ * inventory page can flag them as "On Memo" without per-row queries.
+ * Shape: { byStoneSku: ['SKU1','SKU2'], byJewelrySku: ['MN1'] }.
+ *
+ * IMPORTANT: this static path MUST be registered BEFORE the
+ * /api/memos/:id wildcard below, otherwise Express matches
+ * "active-skus" as a memo id and the SQL fails with
+ * "invalid input syntax for type integer".
+ */
+app.get("/api/memos/active-skus", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    const tenantUserId = ctx.tenantUserId;
+    const r = await pool.query(`
+      SELECT mi.item_type, mi.item_sku, mi.memo_id, m.memo_number, m.company_id, c.name AS company_name
+        FROM memo_items mi
+        JOIN memos m ON m.id = mi.memo_id
+        JOIN crm_companies c ON c.id = m.company_id
+       WHERE mi.status = 'out'
+         AND m.status IN ('out','partially_returned')
+         AND m.user_id = $1
+    `, [tenantUserId]);
+    const byStoneSku = {};
+    const byJewelrySku = {};
+    for (const row of r.rows) {
+      const target = row.item_type === 'jewelry' ? byJewelrySku : byStoneSku;
+      target[row.item_sku] = {
+        memoId: row.memo_id,
+        memoNumber: row.memo_number,
+        companyId: row.company_id,
+        companyName: row.company_name,
+      };
+    }
+    res.json({ byStoneSku, byJewelrySku });
+  } catch (error) {
+    console.error("Error fetching active memo SKUs:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/api/memos/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -6317,41 +6485,6 @@ app.post("/api/memos/:id/close", async (req, res) => {
   }
 });
 
-/* Returns SKUs that are currently on an active memo so the FE
- * inventory page can flag them as "On Memo" without per-row queries.
- * Shape: { byStoneSku: ['SKU1','SKU2'], byJewelrySku: ['MN1'] }. */
-app.get("/api/memos/active-skus", async (req, res) => {
-  try {
-    const ctx = await resolveTeamContext(req);
-    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
-    const tenantUserId = ctx.tenantUserId;
-    const r = await pool.query(`
-      SELECT mi.item_type, mi.item_sku, mi.memo_id, m.memo_number, m.company_id, c.name AS company_name
-        FROM memo_items mi
-        JOIN memos m ON m.id = mi.memo_id
-        JOIN crm_companies c ON c.id = m.company_id
-       WHERE mi.status = 'out'
-         AND m.status IN ('out','partially_returned')
-         AND m.user_id = $1
-    `, [tenantUserId]);
-    const byStoneSku = {};
-    const byJewelrySku = {};
-    for (const row of r.rows) {
-      const target = row.item_type === 'jewelry' ? byJewelrySku : byStoneSku;
-      target[row.item_sku] = {
-        memoId: row.memo_id,
-        memoNumber: row.memo_number,
-        companyId: row.company_id,
-        companyName: row.company_name,
-      };
-    }
-    res.json({ byStoneSku, byJewelrySku });
-  } catch (error) {
-    console.error("Error fetching active memo SKUs:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 /* =========================================================
    Approval workflow — owner side.
    When a store user marks an item as sold or asks for a return
@@ -6473,6 +6606,531 @@ app.post("/api/memos/:id/items/:itemId/decline", async (req, res) => {
   } catch (error) {
     console.error("Error declining memo item:", error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+/* =========================================================
+   Catalog Tiers — owner-side admin
+   The supplier curates "tiers" (Public, VIP Bridal, etc.) and
+   assigns inventory + stores to them. The store portal then only
+   exposes the union of items across the tiers each store is in.
+   Default-hidden: a brand-new SKU lives in zero tiers, so no store
+   sees it until the supplier explicitly approves it.
+   ========================================================= */
+
+// Build a single tier row enriched with item / company counts.
+async function loadTierWithCounts(tierId, tenantUserId) {
+  const r = await pool.query(
+    `SELECT t.*,
+            (SELECT COUNT(*) FROM catalog_tier_items     WHERE tier_id = t.id) AS item_count,
+            (SELECT COUNT(*) FROM catalog_tier_items     WHERE tier_id = t.id AND item_type = 'stone')   AS stone_count,
+            (SELECT COUNT(*) FROM catalog_tier_items     WHERE tier_id = t.id AND item_type = 'jewelry') AS jewelry_count,
+            (SELECT COUNT(*) FROM catalog_tier_companies WHERE tier_id = t.id) AS company_count
+       FROM catalog_tiers t
+      WHERE t.id = $1 AND t.user_id = $2
+      LIMIT 1`,
+    [tierId, tenantUserId]
+  );
+  return r.rows[0] || null;
+}
+
+// GET /api/catalog-tiers — list all tiers for the current supplier.
+app.get("/api/catalog-tiers", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (ctx.role === 'store_user') return res.status(403).json({ error: "Owners only" });
+
+    const r = await pool.query(
+      `SELECT t.*,
+              (SELECT COUNT(*) FROM catalog_tier_items     WHERE tier_id = t.id) AS item_count,
+              (SELECT COUNT(*) FROM catalog_tier_items     WHERE tier_id = t.id AND item_type = 'stone')   AS stone_count,
+              (SELECT COUNT(*) FROM catalog_tier_items     WHERE tier_id = t.id AND item_type = 'jewelry') AS jewelry_count,
+              (SELECT COUNT(*) FROM catalog_tier_companies WHERE tier_id = t.id) AS company_count
+         FROM catalog_tiers t
+        WHERE t.user_id = $1
+        ORDER BY t.sort_order ASC, t.created_at ASC`,
+      [ctx.tenantUserId]
+    );
+    res.json(r.rows);
+  } catch (e) {
+    console.error("Error listing catalog tiers:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/catalog-tiers
+app.post("/api/catalog-tiers", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (ctx.role === 'store_user') return res.status(403).json({ error: "Owners only" });
+
+    const name = String(req.body?.name || '').trim();
+    if (!name) return res.status(400).json({ error: "Name is required" });
+    const description = req.body?.description || null;
+    const color       = req.body?.color || null;
+    const isDefault   = !!req.body?.is_default;
+    const sortOrder   = Number.isFinite(Number(req.body?.sort_order)) ? Number(req.body.sort_order) : 0;
+
+    const r = await pool.query(
+      `INSERT INTO catalog_tiers (user_id, name, description, color, is_default, sort_order)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [ctx.tenantUserId, name, description, color, isDefault, sortOrder]
+    );
+    res.json(await loadTierWithCounts(r.rows[0].id, ctx.tenantUserId));
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: "A tier with that name already exists" });
+    console.error("Error creating catalog tier:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/catalog-tiers/:id
+app.put("/api/catalog-tiers/:id", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (ctx.role === 'store_user') return res.status(403).json({ error: "Owners only" });
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid tier id" });
+
+    const fields = [];
+    const values = [];
+    let idx = 1;
+    const allow = ['name','description','color','is_default','sort_order'];
+    for (const k of allow) {
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, k)) {
+        fields.push(`${k} = $${idx++}`);
+        values.push(req.body[k]);
+      }
+    }
+    if (!fields.length) return res.json(await loadTierWithCounts(id, ctx.tenantUserId));
+    fields.push(`updated_at = NOW()`);
+    values.push(id, ctx.tenantUserId);
+
+    const r = await pool.query(
+      `UPDATE catalog_tiers
+          SET ${fields.join(', ')}
+        WHERE id = $${idx++} AND user_id = $${idx}
+        RETURNING id`,
+      values
+    );
+    if (!r.rows.length) return res.status(404).json({ error: "Tier not found" });
+    res.json(await loadTierWithCounts(id, ctx.tenantUserId));
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: "A tier with that name already exists" });
+    console.error("Error updating catalog tier:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/catalog-tiers/:id
+app.delete("/api/catalog-tiers/:id", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (ctx.role === 'store_user') return res.status(403).json({ error: "Owners only" });
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid tier id" });
+
+    const r = await pool.query(
+      `DELETE FROM catalog_tiers WHERE id = $1 AND user_id = $2 RETURNING id`,
+      [id, ctx.tenantUserId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: "Tier not found" });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Error deleting catalog tier:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/catalog-tiers/:id — detail with items + companies + counts.
+app.get("/api/catalog-tiers/:id", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (ctx.role === 'store_user') return res.status(403).json({ error: "Owners only" });
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid tier id" });
+
+    const tier = await loadTierWithCounts(id, ctx.tenantUserId);
+    if (!tier) return res.status(404).json({ error: "Tier not found" });
+
+    // Items in tier — enrich with display fields for each kind.
+    const itemsRes = await pool.query(
+      `SELECT cti.item_type, cti.item_sku, cti.added_at,
+              CASE WHEN cti.item_type = 'stone'   THEN s.shape       ELSE j.name        END AS title,
+              CASE WHEN cti.item_type = 'stone'   THEN s.image       ELSE j.cover_image_url END AS image_url,
+              CASE WHEN cti.item_type = 'stone'   THEN s.weight::TEXT      ELSE j.weight_grams::TEXT END AS weight,
+              CASE WHEN cti.item_type = 'stone'   THEN s.color       ELSE j.metal_summary END AS subtitle,
+              CASE WHEN cti.item_type = 'stone'   THEN s.category    ELSE j.category    END AS category
+         FROM catalog_tier_items cti
+    LEFT JOIN soap_stones s ON cti.item_type = 'stone' AND s.sku = cti.item_sku
+    LEFT JOIN jewelry_items j ON cti.item_type = 'jewelry' AND j.sku = cti.item_sku AND j.user_id = $2
+        WHERE cti.tier_id = $1
+        ORDER BY cti.added_at DESC`,
+      [id, ctx.tenantUserId]
+    );
+
+    // Companies subscribed.
+    const companiesRes = await pool.query(
+      `SELECT c.id, c.name, c.logo_url, c.city, c.country, ctc.added_at
+         FROM catalog_tier_companies ctc
+         JOIN crm_companies c ON c.id = ctc.company_id
+        WHERE ctc.tier_id = $1 AND c.user_id = $2
+        ORDER BY c.name ASC`,
+      [id, ctx.tenantUserId]
+    );
+
+    res.json({
+      ...tier,
+      items: itemsRes.rows,
+      companies: companiesRes.rows,
+    });
+  } catch (e) {
+    console.error("Error loading catalog tier detail:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/catalog-tiers/:id/items   body: { items: [{type, sku}, ...] }
+app.post("/api/catalog-tiers/:id/items", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (ctx.role === 'store_user') return res.status(403).json({ error: "Owners only" });
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid tier id" });
+
+    const own = await pool.query(`SELECT 1 FROM catalog_tiers WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
+    if (!own.rows.length) return res.status(404).json({ error: "Tier not found" });
+
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) return res.json({ ok: true, added: 0 });
+
+    let added = 0;
+    for (const it of items) {
+      const type = it?.type || it?.item_type;
+      const sku  = it?.sku  || it?.item_sku;
+      if (!sku || !['stone','jewelry'].includes(type)) continue;
+      const ins = await pool.query(
+        `INSERT INTO catalog_tier_items (tier_id, item_type, item_sku, added_by)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT DO NOTHING
+         RETURNING tier_id`,
+        [id, type, sku, ctx.actorUserId]
+      );
+      if (ins.rows.length) added++;
+    }
+    res.json({ ok: true, added });
+  } catch (e) {
+    console.error("Error adding items to catalog tier:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/catalog-tiers/:id/items   body: { items: [{type, sku}, ...] }
+app.delete("/api/catalog-tiers/:id/items", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (ctx.role === 'store_user') return res.status(403).json({ error: "Owners only" });
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid tier id" });
+
+    const own = await pool.query(`SELECT 1 FROM catalog_tiers WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
+    if (!own.rows.length) return res.status(404).json({ error: "Tier not found" });
+
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) return res.json({ ok: true, removed: 0 });
+
+    let removed = 0;
+    for (const it of items) {
+      const type = it?.type || it?.item_type;
+      const sku  = it?.sku  || it?.item_sku;
+      if (!sku || !['stone','jewelry'].includes(type)) continue;
+      const del = await pool.query(
+        `DELETE FROM catalog_tier_items WHERE tier_id = $1 AND item_type = $2 AND item_sku = $3 RETURNING tier_id`,
+        [id, type, sku]
+      );
+      if (del.rows.length) removed++;
+    }
+    res.json({ ok: true, removed });
+  } catch (e) {
+    console.error("Error removing items from catalog tier:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/catalog-tiers/:id/companies   body: { company_ids: [...] }
+app.post("/api/catalog-tiers/:id/companies", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (ctx.role === 'store_user') return res.status(403).json({ error: "Owners only" });
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid tier id" });
+
+    const own = await pool.query(`SELECT 1 FROM catalog_tiers WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
+    if (!own.rows.length) return res.status(404).json({ error: "Tier not found" });
+
+    const ids = Array.isArray(req.body?.company_ids) ? req.body.company_ids.map(Number).filter(Number.isFinite) : [];
+    if (!ids.length) return res.json({ ok: true, added: 0 });
+
+    // Defensive: only allow companies that belong to the current tenant.
+    const valid = await pool.query(
+      `SELECT id FROM crm_companies WHERE user_id = $1 AND id = ANY($2::int[])`,
+      [ctx.tenantUserId, ids]
+    );
+    let added = 0;
+    for (const row of valid.rows) {
+      const ins = await pool.query(
+        `INSERT INTO catalog_tier_companies (tier_id, company_id)
+         VALUES ($1, $2)
+         ON CONFLICT DO NOTHING
+         RETURNING tier_id`,
+        [id, row.id]
+      );
+      if (ins.rows.length) added++;
+    }
+    res.json({ ok: true, added });
+  } catch (e) {
+    console.error("Error adding companies to catalog tier:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/catalog-tiers/:id/companies   body: { company_ids: [...] }
+app.delete("/api/catalog-tiers/:id/companies", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (ctx.role === 'store_user') return res.status(403).json({ error: "Owners only" });
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid tier id" });
+
+    const own = await pool.query(`SELECT 1 FROM catalog_tiers WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
+    if (!own.rows.length) return res.status(404).json({ error: "Tier not found" });
+
+    const ids = Array.isArray(req.body?.company_ids) ? req.body.company_ids.map(Number).filter(Number.isFinite) : [];
+    if (!ids.length) return res.json({ ok: true, removed: 0 });
+
+    const r = await pool.query(
+      `DELETE FROM catalog_tier_companies WHERE tier_id = $1 AND company_id = ANY($2::int[]) RETURNING tier_id`,
+      [id, ids]
+    );
+    res.json({ ok: true, removed: r.rows.length });
+  } catch (e) {
+    console.error("Error removing companies from catalog tier:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/items/:type/:sku/tiers — which tiers include this single item.
+// Used by the inventory / jewelry edit screens to show membership.
+app.get("/api/items/:type/:sku/tiers", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (ctx.role === 'store_user') return res.status(403).json({ error: "Owners only" });
+
+    const type = String(req.params.type || '').toLowerCase();
+    const sku  = req.params.sku;
+    if (!['stone','jewelry'].includes(type) || !sku) return res.status(400).json({ error: "Invalid item" });
+
+    const r = await pool.query(
+      `SELECT t.id, t.name, t.color
+         FROM catalog_tier_items cti
+         JOIN catalog_tiers t ON t.id = cti.tier_id
+        WHERE t.user_id = $1
+          AND cti.item_type = $2
+          AND cti.item_sku  = $3
+        ORDER BY t.sort_order ASC, t.name ASC`,
+      [ctx.tenantUserId, type, sku]
+    );
+    res.json(r.rows);
+  } catch (e) {
+    console.error("Error fetching item tiers:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/items/:type/:sku/tiers   body: { tier_ids: [...] }
+// Replaces the full set of tiers for a single item.
+app.put("/api/items/:type/:sku/tiers", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) {
+      client.release();
+      return res.status(400).json({ error: "userId is required" });
+    }
+    if (ctx.role === 'store_user') {
+      client.release();
+      return res.status(403).json({ error: "Owners only" });
+    }
+
+    const type = String(req.params.type || '').toLowerCase();
+    const sku  = req.params.sku;
+    if (!['stone','jewelry'].includes(type) || !sku) {
+      client.release();
+      return res.status(400).json({ error: "Invalid item" });
+    }
+
+    const requested = Array.isArray(req.body?.tier_ids) ? req.body.tier_ids.map(Number).filter(Number.isFinite) : [];
+
+    await client.query('BEGIN');
+    // Resolve which of the requested tier ids actually belong to this tenant.
+    const validTiers = requested.length
+      ? (await client.query(
+          `SELECT id FROM catalog_tiers WHERE user_id = $1 AND id = ANY($2::int[])`,
+          [ctx.tenantUserId, requested]
+        )).rows.map(r => r.id)
+      : [];
+
+    // Wipe current memberships for this SKU across this tenant's tiers,
+    // then re-insert. Cleaner than computing add/remove diffs.
+    await client.query(
+      `DELETE FROM catalog_tier_items
+        WHERE item_type = $1 AND item_sku = $2
+          AND tier_id IN (SELECT id FROM catalog_tiers WHERE user_id = $3)`,
+      [type, sku, ctx.tenantUserId]
+    );
+    for (const tierId of validTiers) {
+      await client.query(
+        `INSERT INTO catalog_tier_items (tier_id, item_type, item_sku, added_by)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT DO NOTHING`,
+        [tierId, type, sku, ctx.actorUserId]
+      );
+    }
+    await client.query('COMMIT');
+
+    const r = await pool.query(
+      `SELECT t.id, t.name, t.color
+         FROM catalog_tier_items cti
+         JOIN catalog_tiers t ON t.id = cti.tier_id
+        WHERE t.user_id = $1
+          AND cti.item_type = $2
+          AND cti.item_sku  = $3
+        ORDER BY t.sort_order ASC, t.name ASC`,
+      [ctx.tenantUserId, type, sku]
+    );
+    res.json(r.rows);
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error("Error setting item tiers:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/companies/:id/tiers — which tiers a single store is subscribed to.
+app.get("/api/companies/:id/tiers", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (ctx.role === 'store_user') return res.status(403).json({ error: "Owners only" });
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid company id" });
+
+    const own = await pool.query(`SELECT 1 FROM crm_companies WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
+    if (!own.rows.length) return res.status(404).json({ error: "Company not found" });
+
+    const r = await pool.query(
+      `SELECT t.id, t.name, t.color, t.is_default,
+              (SELECT COUNT(*) FROM catalog_tier_items WHERE tier_id = t.id) AS item_count
+         FROM catalog_tier_companies ctc
+         JOIN catalog_tiers t ON t.id = ctc.tier_id
+        WHERE ctc.company_id = $1 AND t.user_id = $2
+        ORDER BY t.sort_order ASC, t.name ASC`,
+      [id, ctx.tenantUserId]
+    );
+    res.json(r.rows);
+  } catch (e) {
+    console.error("Error fetching company tiers:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/companies/:id/tiers   body: { tier_ids: [...] }
+app.put("/api/companies/:id/tiers", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) {
+      client.release();
+      return res.status(400).json({ error: "userId is required" });
+    }
+    if (ctx.role === 'store_user') {
+      client.release();
+      return res.status(403).json({ error: "Owners only" });
+    }
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      client.release();
+      return res.status(400).json({ error: "Invalid company id" });
+    }
+
+    const own = await pool.query(`SELECT 1 FROM crm_companies WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
+    if (!own.rows.length) {
+      client.release();
+      return res.status(404).json({ error: "Company not found" });
+    }
+
+    const requested = Array.isArray(req.body?.tier_ids) ? req.body.tier_ids.map(Number).filter(Number.isFinite) : [];
+
+    await client.query('BEGIN');
+    const validTiers = requested.length
+      ? (await client.query(
+          `SELECT id FROM catalog_tiers WHERE user_id = $1 AND id = ANY($2::int[])`,
+          [ctx.tenantUserId, requested]
+        )).rows.map(r => r.id)
+      : [];
+
+    await client.query(
+      `DELETE FROM catalog_tier_companies
+        WHERE company_id = $1
+          AND tier_id IN (SELECT id FROM catalog_tiers WHERE user_id = $2)`,
+      [id, ctx.tenantUserId]
+    );
+    for (const tierId of validTiers) {
+      await client.query(
+        `INSERT INTO catalog_tier_companies (tier_id, company_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [tierId, id]
+      );
+    }
+    await client.query('COMMIT');
+
+    const r = await pool.query(
+      `SELECT t.id, t.name, t.color, t.is_default,
+              (SELECT COUNT(*) FROM catalog_tier_items WHERE tier_id = t.id) AS item_count
+         FROM catalog_tier_companies ctc
+         JOIN catalog_tiers t ON t.id = ctc.tier_id
+        WHERE ctc.company_id = $1 AND t.user_id = $2
+        ORDER BY t.sort_order ASC, t.name ASC`,
+      [id, ctx.tenantUserId]
+    );
+    res.json(r.rows);
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error("Error setting company tiers:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -6744,12 +7402,30 @@ app.get("/api/portal/catalog", async (req, res) => {
     const busyStones  = new Set(busy.rows.filter(r => r.item_type !== 'jewelry').map(r => r.item_sku));
     const busyJewelry = new Set(busy.rows.filter(r => r.item_type === 'jewelry').map(r => r.item_sku));
 
+    // Visibility gate: a store only sees SKUs that live in at least one
+    // catalog tier the store is subscribed to. Anything not in any of
+    // those tiers stays hidden — that's the curated default.
+    const visibleStones  = new Set();
+    const visibleJewelry = new Set();
+    const visRes = await pool.query(`
+      SELECT cti.item_type, cti.item_sku
+        FROM catalog_tier_items cti
+        JOIN catalog_tiers t           ON t.id  = cti.tier_id
+        JOIN catalog_tier_companies ctc ON ctc.tier_id = t.id
+       WHERE t.user_id = $1
+         AND ctc.company_id = $2
+    `, [ctx.tenantUserId, ctx.companyId]);
+    for (const row of visRes.rows) {
+      (row.item_type === 'jewelry' ? visibleJewelry : visibleStones).add(row.item_sku);
+    }
+
     const out = { stones: [], jewelry: [] };
 
     // Stones — pull from soap_stones (the canonical "for sale" pile).
     if (type === 'all' || type === 'stones') {
       const r = await pool.query(`SELECT * FROM soap_stones WHERE sku IS NOT NULL ORDER BY updated_at DESC LIMIT 500`);
       out.stones = r.rows
+        .filter(row => visibleStones.has(row.sku))
         .filter(row => !busyStones.has(row.sku))
         .filter(row => {
           if (shape && String(row.shape || '').toLowerCase() !== shape) return false;
@@ -6801,6 +7477,7 @@ app.get("/api/portal/catalog", async (req, res) => {
          LIMIT 500
       `, [ctx.tenantUserId]);
       out.jewelry = r.rows
+        .filter(row => visibleJewelry.has(row.sku))
         .filter(row => !busyJewelry.has(row.sku))
         .filter(row => {
           if (cat && String(row.category || '').toLowerCase() !== cat) return false;
@@ -6839,10 +7516,31 @@ app.get("/api/portal/catalog", async (req, res) => {
    every spec the supplier has on file before adding it to a memo
    request — but with all cost / pricing fields stripped.
    ========================================================= */
+// Helper: confirm the requesting store has at least one tier that
+// contains this SKU before we hand back full inventory details.
+async function ensureSkuVisibleToStore(ctx, type, sku) {
+  const v = await pool.query(
+    `SELECT 1
+       FROM catalog_tier_items cti
+       JOIN catalog_tiers t           ON t.id  = cti.tier_id
+       JOIN catalog_tier_companies ctc ON ctc.tier_id = t.id
+      WHERE t.user_id    = $1
+        AND ctc.company_id = $2
+        AND cti.item_type  = $3
+        AND cti.item_sku   = $4
+      LIMIT 1`,
+    [ctx.tenantUserId, ctx.companyId, type, sku]
+  );
+  return v.rows.length > 0;
+}
+
 app.get("/api/portal/items/stone/:sku", async (req, res) => {
   try {
     const ctx = await requireStoreUser(req);
     const { sku } = req.params;
+    if (!(await ensureSkuVisibleToStore(ctx, 'stone', sku))) {
+      return res.status(404).json({ error: "Stone not found" });
+    }
     const r = await pool.query(`SELECT * FROM soap_stones WHERE sku = $1 LIMIT 1`, [sku]);
     if (!r.rows.length) return res.status(404).json({ error: "Stone not found" });
     const row = r.rows[0];
@@ -6923,6 +7621,11 @@ app.get("/api/portal/items/jewelry/:idOrSku", async (req, res) => {
     );
     if (!itemRes.rows.length) return res.status(404).json({ error: "Jewelry item not found" });
     const item = itemRes.rows[0];
+
+    // Must live in at least one tier the store is subscribed to.
+    if (!(await ensureSkuVisibleToStore(ctx, 'jewelry', item.sku))) {
+      return res.status(404).json({ error: "Jewelry item not found" });
+    }
 
     const [stones, metals, files] = await Promise.all([
       pool.query(`SELECT id, role, quantity, snapshot, notes, stone_sku FROM jewelry_item_stones WHERE item_id = $1 ORDER BY id`, [item.id]),
