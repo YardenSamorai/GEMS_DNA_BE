@@ -6830,6 +6830,146 @@ app.get("/api/portal/catalog", async (req, res) => {
 });
 
 /* =========================================================
+   Portal — Item detail (stone or jewelry)
+   GET /api/portal/items/stone/:sku
+   GET /api/portal/items/jewelry/:idOrSku
+   Returns the full inventory record so the store user can review
+   every spec the supplier has on file before adding it to a memo
+   request — but with all cost / pricing fields stripped.
+   ========================================================= */
+app.get("/api/portal/items/stone/:sku", async (req, res) => {
+  try {
+    const ctx = await requireStoreUser(req);
+    const { sku } = req.params;
+    const r = await pool.query(`SELECT * FROM soap_stones WHERE sku = $1 LIMIT 1`, [sku]);
+    if (!r.rows.length) return res.status(404).json({ error: "Stone not found" });
+    const row = r.rows[0];
+
+    // Build the full image gallery (image + additional_pictures CSV).
+    const gallery = [];
+    if (row.image) gallery.push(row.image);
+    if (row.additional_pictures) {
+      for (const p of String(row.additional_pictures).split(';').map((s) => s.trim()).filter(Boolean)) {
+        if (!gallery.includes(p)) gallery.push(p);
+      }
+    }
+    const videos = [];
+    if (row.video) videos.push(row.video);
+    if (row.additional_videos) {
+      for (const v of String(row.additional_videos).split(';').map((s) => s.trim()).filter(Boolean)) {
+        if (!videos.includes(v)) videos.push(v);
+      }
+    }
+
+    // Anti-leak: never echo any column whose name hints at money.
+    // Do NOT include: total_price, price_per_carat, rap_list_price,
+    // rap_price, comment (often has supplier-internal pricing notes).
+    const detail = {
+      kind: 'stone',
+      sku: row.sku,
+      shape: row.shape || '',
+      category: row.category || '',
+      type: row.type || '',
+      weightCt: row.weight ? Number(row.weight) : null,
+      color: row.color || '',
+      clarity: row.clarity || '',
+      cut: row.cut || '',
+      polish: row.polish || '',
+      symmetry: row.symmetry || '',
+      tablePercent: row.table_percent != null ? Number(row.table_percent) : null,
+      depthPercent: row.depth_percent != null ? Number(row.depth_percent) : null,
+      ratio: row.ratio != null ? Number(row.ratio) : null,
+      measurements: row.measurements || '',
+      lab: row.lab || '',
+      origin: row.origin || '',
+      treatment: row.comment || '',
+      certComments: row.cert_comments || '',
+      certificateNumber: row.certificate_number || '',
+      certificateUrl: row.certificate_image || row.certificate_url || null,
+      certificateImageJpg: row.certificate_image_jpg || null,
+      luster: row.luster || '',
+      fluorescence: row.fluorescence || '',
+      fancyIntensity: row.fancy_intensity || '',
+      fancyColor: row.fancy_color || '',
+      fancyOvertone: row.fancy_overtone || '',
+      fancyColor2: row.fancy_color_2 || '',
+      fancyOvertone2: row.fancy_overtone_2 || '',
+      pairSku: row.pair_stone || null,
+      groupingType: row.grouping_type || '',
+      stones: row.stones != null ? Number(row.stones) : null,
+      images: gallery,
+      videos,
+      updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+    };
+    res.json(detail);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.get("/api/portal/items/jewelry/:idOrSku", async (req, res) => {
+  try {
+    const ctx = await requireStoreUser(req);
+    const { idOrSku } = req.params;
+    const isNumeric = /^\d+$/.test(idOrSku);
+
+    const itemRes = await pool.query(
+      isNumeric
+        ? `SELECT * FROM jewelry_items WHERE id = $1 AND user_id = $2 LIMIT 1`
+        : `SELECT * FROM jewelry_items WHERE sku = $1 AND user_id = $2 LIMIT 1`,
+      [isNumeric ? Number(idOrSku) : idOrSku, ctx.tenantUserId]
+    );
+    if (!itemRes.rows.length) return res.status(404).json({ error: "Jewelry item not found" });
+    const item = itemRes.rows[0];
+
+    const [stones, metals, files] = await Promise.all([
+      pool.query(`SELECT id, role, quantity, snapshot, notes, stone_sku FROM jewelry_item_stones WHERE item_id = $1 ORDER BY id`, [item.id]),
+      pool.query(`SELECT id, metal_type, purity, color, weight_grams FROM jewelry_item_metals WHERE item_id = $1 ORDER BY id`, [item.id]),
+      pool.query(`SELECT id, file_url, file_kind, label FROM jewelry_item_files WHERE item_id = $1 ORDER BY uploaded_at DESC, id DESC`, [item.id]),
+    ]);
+
+    // Strip cost / margin fields. Anything price-related is owner-only.
+    res.json({
+      kind: 'jewelry',
+      id: item.id,
+      sku: item.sku,
+      name: item.name,
+      type: item.type,
+      category: item.category || '',
+      metalSummary: item.metal_summary || '',
+      weightGrams: item.weight_grams != null ? Number(item.weight_grams) : null,
+      size: item.size || '',
+      description: item.description || '',
+      coverImageUrl: item.cover_image_url || null,
+      stones: stones.rows.map((s) => ({
+        id: s.id,
+        role: s.role || '',
+        quantity: s.quantity || 1,
+        sku: s.stone_sku,
+        snapshot: s.snapshot || {},
+        notes: s.notes || '',
+      })),
+      metals: metals.rows.map((m) => ({
+        id: m.id,
+        metalType: m.metal_type || '',
+        purity: m.purity || '',
+        color: m.color || '',
+        weightGrams: m.weight_grams != null ? Number(m.weight_grams) : null,
+      })),
+      files: files.rows.map((f) => ({
+        id: f.id,
+        url: f.file_url,
+        kind: f.file_kind || 'image',
+        label: f.label || '',
+      })),
+      updatedAt: item.updated_at ? new Date(item.updated_at).toISOString() : null,
+    });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+/* =========================================================
    Portal — Memo Requests
    ========================================================= */
 
