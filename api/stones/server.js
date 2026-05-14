@@ -5756,15 +5756,34 @@ app.get("/api/memos/:id", async (req, res) => {
     if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
     const tenantUserId = ctx.tenantUserId;
 
+    // Joining team_members twice — once for the issuer (created_by) and
+    // once for the assignee (assigned_to) — so the FE can show real
+    // names instead of opaque clerk_user_id strings.
     const memoRes = await pool.query(`
       SELECT m.*, c.name AS company_name, c.email AS company_email,
              c.phone AS company_phone, c.address AS company_address,
              c.city AS company_city, c.country AS company_country,
-             c.logo_url AS company_logo,
-             ct.name AS contact_name, ct.email AS contact_email, ct.phone AS contact_phone
+             c.logo_url AS company_logo, c.website AS company_website,
+             c.tax_id AS company_tax_id, c.payment_terms AS company_payment_terms,
+             ct.name  AS contact_name, ct.email AS contact_email, ct.phone AS contact_phone,
+             tm_creator.name  AS created_by_name,  tm_creator.email  AS created_by_email,
+             tm_assignee.name AS assigned_to_name, tm_assignee.email AS assigned_to_email,
+             tm_owner.name    AS owner_name,       tm_owner.email    AS owner_email
         FROM memos m
         JOIN crm_companies c ON c.id = m.company_id
    LEFT JOIN crm_contacts ct ON ct.id = m.contact_id
+   LEFT JOIN team_members tm_creator
+          ON tm_creator.team_owner_id = m.user_id
+         AND tm_creator.clerk_user_id = m.created_by
+         AND tm_creator.active = TRUE
+   LEFT JOIN team_members tm_assignee
+          ON tm_assignee.team_owner_id = m.user_id
+         AND tm_assignee.clerk_user_id = m.assigned_to
+         AND tm_assignee.active = TRUE
+   LEFT JOIN team_members tm_owner
+          ON tm_owner.team_owner_id = m.user_id
+         AND tm_owner.role = 'owner'
+         AND tm_owner.active = TRUE
        WHERE m.id = $1 AND m.user_id = $2
     `, [id, tenantUserId]);
     if (memoRes.rows.length === 0) return res.status(404).json({ error: "Memo not found" });
@@ -5780,6 +5799,47 @@ app.get("/api/memos/:id", async (req, res) => {
     res.json({ ...memo, items: items.rows });
   } catch (error) {
     console.error("Error fetching memo:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/* Activity feed for a single memo. Powers the timeline card on the
+ * detail page. Limited to a sensible window so the feed renders fast
+ * even on memos with hundreds of item-level transitions. */
+app.get("/api/memos/:id/activity", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    const tenantUserId = ctx.tenantUserId;
+
+    // Confirm the caller may even see this memo before exposing its
+    // activity feed (otherwise reps could probe other people's memos).
+    const memoRes = await pool.query(
+      `SELECT id, assigned_to FROM memos WHERE id = $1 AND user_id = $2`,
+      [id, tenantUserId]
+    );
+    if (memoRes.rows.length === 0) return res.status(404).json({ error: "Memo not found" });
+    if (!ctx.isOwner && memoRes.rows[0].assigned_to && memoRes.rows[0].assigned_to !== ctx.actorUserId) {
+      return res.status(404).json({ error: "Memo not found" });
+    }
+
+    const r = await pool.query(`
+      SELECT a.*, COALESCE(NULLIF(tm.name, ''), a.actor_name) AS resolved_actor_name
+        FROM activity_log a
+   LEFT JOIN team_members tm
+          ON tm.team_owner_id = a.user_id
+         AND tm.clerk_user_id = a.actor_id
+         AND tm.active = TRUE
+       WHERE a.user_id = $1
+         AND a.entity_type = 'memo'
+         AND a.entity_id = $2
+    ORDER BY a.occurred_at DESC
+       LIMIT 200
+    `, [tenantUserId, String(id)]);
+    res.json(r.rows);
+  } catch (error) {
+    console.error("Error fetching memo activity:", error);
     res.status(500).json({ error: error.message });
   }
 });
