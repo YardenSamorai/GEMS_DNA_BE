@@ -2755,6 +2755,7 @@ app.post("/api/crm/contacts", async (req, res) => {
       folderId, linkedContactIds, cardBackNotes,
       cardImageFront, cardImageBack, cardImageThumb,
       assignedTo, // optional; defaults to the actor (auto-assign on create)
+      companyId,  // optional: link this contact to a CRM company / store
     } = req.body;
     const ctx = await resolveTeamContext(req);
     if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
@@ -2770,10 +2771,10 @@ app.post("/api/crm/contacts", async (req, res) => {
          user_id, name, type, title, company, phone, phone_alt, email, website,
          country, city, address, source, status, tags, preferences, notes, avatar_url,
          folder_id, linked_contact_ids, card_back_notes,
-         card_image_front, card_image_back, card_image_thumb, assigned_to
+         card_image_front, card_image_back, card_image_thumb, assigned_to, company_id
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
-       RETURNING id, user_id, name, type, title, company, phone, phone_alt, email, website,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+       RETURNING id, user_id, name, type, title, company, company_id, phone, phone_alt, email, website,
                  country, city, address, source, status, tags, preferences, notes, avatar_url,
                  folder_id, linked_contact_ids, card_back_notes, card_image_thumb,
                  assigned_to,
@@ -2789,6 +2790,7 @@ app.post("/api/crm/contacts", async (req, res) => {
         folderId || null, JSON.stringify(linkedContactIds || []), cardBackNotes || null,
         cardImageFront || null, cardImageBack || null, cardImageThumb || null,
         finalAssignee,
+        companyId != null && companyId !== '' ? Number(companyId) : null,
       ]
     );
     res.status(201).json(result.rows[0]);
@@ -2820,7 +2822,7 @@ app.put("/api/crm/contacts/:id", async (req, res) => {
       'country','city','address','source','status','tags','preferences','notes','avatar_url','last_contact_at',
       'folder_id','linked_contact_ids','card_back_notes',
       'card_image_front','card_image_back','card_image_thumb',
-      'assigned_to',
+      'assigned_to','company_id',
     ];
     const fields = [];
     const values = [];
