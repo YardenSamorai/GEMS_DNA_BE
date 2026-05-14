@@ -5528,7 +5528,13 @@ app.get("/api/crm/companies", async (req, res) => {
       SELECT c.*,
         (SELECT COUNT(*)::int FROM memos m WHERE m.company_id = c.id AND m.status IN ('out','partially_returned')) AS active_memos,
         (SELECT COUNT(*)::int FROM memos m WHERE m.company_id = c.id) AS total_memos,
-        (SELECT COUNT(*)::int FROM crm_contacts ct WHERE ct.company_id = c.id) AS contact_count
+        (SELECT COUNT(*)::int FROM crm_contacts ct WHERE ct.company_id = c.id) AS contact_count,
+        -- Portal access summary used by the FE Hero / store card to show
+        -- "No portal access" / "Portal active" pills without an extra request.
+        (SELECT COUNT(*)::int FROM team_members tm
+            WHERE tm.company_id = c.id AND tm.role = 'store_user' AND tm.active = TRUE) AS portal_user_count,
+        (SELECT COUNT(*)::int FROM team_members tm
+            WHERE tm.company_id = c.id AND tm.role = 'store_user' AND tm.active = TRUE AND tm.clerk_user_id IS NOT NULL) AS portal_user_active
       FROM crm_companies c
       WHERE ${where.join(' AND ')}
       ORDER BY c.updated_at DESC
@@ -5558,13 +5564,26 @@ app.get("/api/crm/companies/:id", async (req, res) => {
       return res.status(404).json({ error: "Company not found" });
     }
 
-    const [contacts, memos] = await Promise.all([
+    const [contacts, memos, portalUsers] = await Promise.all([
       pool.query(`SELECT id, name, title, email, phone, type FROM crm_contacts WHERE company_id = $1 ORDER BY name`, [id]),
       pool.query(`SELECT id, memo_number, status, issued_at, due_at, total_value, currency,
                          (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id) AS item_count
                   FROM memos m WHERE company_id = $1 ORDER BY created_at DESC LIMIT 50`, [id]),
+      // Portal users for THIS store. The FE Hero shows the primary one
+      // (the most recent active row) directly on the banner.
+      pool.query(`SELECT id, name, email, avatar_color,
+                         (clerk_user_id IS NULL) AS pending,
+                         created_at, last_invited_at
+                    FROM team_members
+                   WHERE company_id = $1 AND role = 'store_user' AND active = TRUE
+                   ORDER BY (clerk_user_id IS NOT NULL) DESC, created_at DESC`, [id]),
     ]);
-    res.json({ ...company, contacts: contacts.rows, memos: memos.rows });
+    res.json({
+      ...company,
+      contacts: contacts.rows,
+      memos: memos.rows,
+      portal_users: portalUsers.rows,
+    });
   } catch (error) {
     console.error("Error fetching company:", error);
     res.status(500).json({ error: error.message });
