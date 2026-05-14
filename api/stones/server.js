@@ -6925,7 +6925,7 @@ app.get("/api/portal/items/jewelry/:idOrSku", async (req, res) => {
     const [stones, metals, files] = await Promise.all([
       pool.query(`SELECT id, role, quantity, snapshot, notes, stone_sku FROM jewelry_item_stones WHERE item_id = $1 ORDER BY id`, [item.id]),
       pool.query(`SELECT id, metal_type, purity, color, weight_grams FROM jewelry_item_metals WHERE item_id = $1 ORDER BY id`, [item.id]),
-      pool.query(`SELECT id, file_url, file_kind, label FROM jewelry_item_files WHERE item_id = $1 ORDER BY uploaded_at DESC, id DESC`, [item.id]),
+      pool.query(`SELECT id, url, kind, stage, filename FROM jewelry_item_files WHERE item_id = $1 ORDER BY uploaded_at DESC, id DESC`, [item.id]),
     ]);
 
     // Strip cost / margin fields. Anything price-related is owner-only.
@@ -6958,9 +6958,10 @@ app.get("/api/portal/items/jewelry/:idOrSku", async (req, res) => {
       })),
       files: files.rows.map((f) => ({
         id: f.id,
-        url: f.file_url,
-        kind: f.file_kind || 'image',
-        label: f.label || '',
+        url: f.url,
+        kind: f.kind || 'image',
+        stage: f.stage || '',
+        label: f.filename || '',
       })),
       updatedAt: item.updated_at ? new Date(item.updated_at).toISOString() : null,
     });
