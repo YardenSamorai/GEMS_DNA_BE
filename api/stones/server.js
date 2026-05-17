@@ -6429,6 +6429,17 @@ app.post("/api/memos/:id/items", async (req, res) => {
 app.put("/api/memos/:id/items/:itemId", async (req, res) => {
   try {
     const { id, itemId } = req.params;
+
+    // Operational gate for status flips (sold / returned). Price /
+    // quantity / notes edits remain allowed without a signature so the
+    // supplier can still tweak fields on a draft or correct typos on
+    // an issued memo — only marking items as sold/returned is gated,
+    // because that is what materially changes the memo's audit trail.
+    if (req.body.status === 'sold' || req.body.status === 'returned') {
+      try { await requireSupplierIssuanceSignature(id); }
+      catch (e) { return sendSignatureError(res, e, 'item status gate:'); }
+    }
+
     const allowed = ['memo_price','quantity','notes','status'];
     const fields = [];
     const values = [];
@@ -6556,6 +6567,13 @@ app.post("/api/memos/:id/close", async (req, res) => {
     if (memoRes.rows.length === 0) return res.status(404).json({ error: 'Memo not found' });
     const memo = memoRes.rows[0];
     if (memo.status === 'closed') return res.json(memo);
+
+    // Operational hard-gate. A memo without supplier issuance signature
+    // can't be closed because legally it was never properly issued —
+    // closing it would create an audit-trail gap.
+    try { await requireSupplierIssuanceSignature(id); }
+    catch (e) { return sendSignatureError(res, e, 'close gate:'); }
+
     // Force-close: any items still 'out' are flipped to 'returned'
     // (the user is saying "the customer brought everything back").
     await pool.query(
@@ -6715,6 +6733,33 @@ function sendSignatureError(res, e, contextMsg) {
   }
   console.error(contextMsg || 'Signature error:', e);
   return res.status(500).json({ error: e?.message || 'Internal error' });
+}
+
+/* Global hard-gate. Throws a 409 if the supplier hasn't signed the
+ * issuance for this memo yet. We use this to block downstream
+ * mutations (close, approve store request, decline store request,
+ * portal store request) because all of them are operational actions
+ * on a memo that legally hasn't been issued.
+ *
+ * The frontend mirrors this check to disable buttons and show a banner,
+ * but the BE remains the source of truth — any client that bypasses
+ * the UI still hits this gate. */
+async function requireSupplierIssuanceSignature(memoId) {
+  const r = await pool.query(
+    `SELECT id FROM memo_signatures
+      WHERE memo_id = $1 AND event = 'issue' AND signer_role = 'supplier'
+      LIMIT 1`,
+    [memoId]
+  );
+  if (r.rows.length === 0) {
+    const e = new Error(
+      'Supplier issuance signature is required before this action can be performed.'
+    );
+    e.status = 409;
+    e.code = 'signature_required';
+    e.missing = { event: 'issue', signerRole: 'supplier' };
+    throw e;
+  }
 }
 
 app.post("/api/memos/:id/signatures", async (req, res) => {
@@ -7039,6 +7084,9 @@ app.post("/api/memos/:id/items/:itemId/approve", async (req, res) => {
     if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
     if (!ctx.isOwner)     return res.status(403).json({ error: "Only the workspace owner can approve store requests" });
 
+    try { await requireSupplierIssuanceSignature(id); }
+    catch (e) { return sendSignatureError(res, e, 'approve gate:'); }
+
     const tenantUserId = ctx.tenantUserId;
 
     const cur = await pool.query(
@@ -7099,6 +7147,9 @@ app.post("/api/memos/:id/items/:itemId/decline", async (req, res) => {
     const ctx = await resolveTeamContext(req);
     if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
     if (!ctx.isOwner)     return res.status(403).json({ error: "Only the workspace owner can decline store requests" });
+
+    try { await requireSupplierIssuanceSignature(id); }
+    catch (e) { return sendSignatureError(res, e, 'decline gate:'); }
 
     const tenantUserId = ctx.tenantUserId;
     const reason = (req.body?.reason || '').toString().slice(0, 500);
@@ -7830,6 +7881,9 @@ app.post("/api/portal/memos/:id/items/:itemId/request", async (req, res) => {
     if (!['sold', 'returned'].includes(kind)) {
       return res.status(400).json({ error: "kind must be 'sold' or 'returned'" });
     }
+
+    try { await requireSupplierIssuanceSignature(id); }
+    catch (e) { return sendSignatureError(res, e, 'portal request gate:'); }
 
     // Confirm the item belongs to a memo this store user can see.
     const cur = await pool.query(`
