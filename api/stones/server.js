@@ -6075,7 +6075,16 @@ app.get("/api/memos", async (req, res) => {
       SELECT m.*, c.name AS company_name, c.logo_url AS company_logo,
              ct.name AS contact_name,
              (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id) AS item_count,
-             (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id AND mi.status = 'out') AS items_out
+             (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id AND mi.status = 'out') AS items_out,
+             -- Signature presence flags powering the Documents Hub
+             -- without paying for a full signatures join per row. Each
+             -- flag is a cheap EXISTS lookup against the unique slot
+             -- index on (memo_id, event, signer_role).
+             EXISTS(SELECT 1 FROM memo_signatures s WHERE s.memo_id = m.id AND s.event='issue' AND s.signer_role='supplier') AS has_sig_issue_supplier,
+             EXISTS(SELECT 1 FROM memo_signatures s WHERE s.memo_id = m.id AND s.event='issue' AND s.signer_role='store')    AS has_sig_issue_store,
+             EXISTS(SELECT 1 FROM memo_signatures s WHERE s.memo_id = m.id AND s.event='close' AND s.signer_role='supplier') AS has_sig_close_supplier,
+             EXISTS(SELECT 1 FROM memo_signatures s WHERE s.memo_id = m.id AND s.event='close' AND s.signer_role='store')    AS has_sig_close_store,
+             (SELECT COUNT(*)::int FROM memo_signatures s WHERE s.memo_id = m.id) AS signature_count
         FROM memos m
         JOIN crm_companies c ON c.id = m.company_id
    LEFT JOIN crm_contacts ct ON ct.id = m.contact_id
@@ -6568,11 +6577,31 @@ app.post("/api/memos/:id/close", async (req, res) => {
     const memo = memoRes.rows[0];
     if (memo.status === 'closed') return res.json(memo);
 
-    // Operational hard-gate. A memo without supplier issuance signature
-    // can't be closed because legally it was never properly issued —
-    // closing it would create an audit-trail gap.
+    // Operational hard-gate #1. A memo without supplier issuance
+    // signature can't be closed because legally it was never properly
+    // issued — closing it would create an audit-trail gap.
     try { await requireSupplierIssuanceSignature(id); }
-    catch (e) { return sendSignatureError(res, e, 'close gate:'); }
+    catch (e) { return sendSignatureError(res, e, 'close gate (issuance):'); }
+
+    // Operational hard-gate #2. Closing a memo is itself a legally
+    // significant transition (it freezes the accounting), so we
+    // require a supplier `event='close'` signature too. The FE flow
+    // is "Sign & Close": POST /signatures with role=supplier event=close,
+    // then POST /close. On retry, the existing signature satisfies
+    // this gate without re-signing.
+    const closeSig = await pool.query(
+      `SELECT id FROM memo_signatures
+        WHERE memo_id = $1 AND event = 'close' AND signer_role = 'supplier'
+        LIMIT 1`,
+      [id]
+    );
+    if (closeSig.rows.length === 0) {
+      return res.status(409).json({
+        error: 'Supplier signature required to close this memo',
+        code: 'signature_required',
+        missing: { event: 'close', signerRole: 'supplier' },
+      });
+    }
 
     // Force-close: any items still 'out' are flipped to 'returned'
     // (the user is saying "the customer brought everything back").
@@ -6723,8 +6752,152 @@ async function createMemoSignatureRow({
     signedAt,
   ]);
 
-  return ins.rows[0];
+  const row = ins.rows[0];
+
+  // Fire-and-forget audit notification to both parties. We do NOT
+  // await this on purpose — the signature has already been persisted
+  // above and we don't want a transient Resend / SMTP problem to
+  // hold up the HTTP response or roll the row back.
+  sendMemoSignatureEmail({ memoId: memo.id, signature: row })
+    .catch((e) => console.warn('sendMemoSignatureEmail (fire-forget):', e.message));
+
+  return row;
 }
+
+/* Fire-and-forget signature notification email. Sends a separate
+ * message to the supplier and to the store so each side gets a
+ * "View memo" link pointing into their own UI. Reads recipient
+ * addresses by joining the memo row against team_members (supplier
+ * side) and crm_companies (store side). All failures are logged but
+ * NEVER thrown — the signature itself has already been persisted at
+ * this point and we don't want a Resend outage to roll it back.
+ *
+ * Honors RESEND_API_KEY / RESEND_FROM_EMAIL like other mailers in
+ * this file. Silently no-ops if Resend isn't configured. */
+async function sendMemoSignatureEmail({ memoId, signature }) {
+  try {
+    if (!process.env.RESEND_API_KEY) return;
+
+    // Resolve both sides' email addresses + display name.
+    const r = await pool.query(
+      `SELECT m.id, m.memo_number, m.user_id, m.company_id,
+              m.issued_at, m.due_at, m.closed_at, m.status,
+              c.name AS company_name, c.email AS company_email,
+              tm_owner.name AS owner_name, tm_owner.email AS owner_email
+         FROM memos m
+         JOIN crm_companies c ON c.id = m.company_id
+    LEFT JOIN team_members tm_owner
+           ON tm_owner.team_owner_id = m.user_id
+          AND tm_owner.clerk_user_id  = m.user_id
+          AND tm_owner.active = TRUE
+        WHERE m.id = $1
+        LIMIT 1`,
+      [memoId]
+    );
+    if (!r.rows.length) return;
+    const memo = r.rows[0];
+
+    const fromEmail  = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
+    const senderName = (memo.owner_name || 'GEMS DNA').replace(/[\r\n<>]/g, '');
+    const fromHeader = `${senderName} <${fromEmail}>`;
+
+    const eventLabel = signature.event === 'issue' ? 'issued' : 'closed';
+    const roleLabel  = signature.signer_role === 'supplier' ? 'Supplier' : 'Store';
+    const subject    = `Memo ${memo.memo_number} · ${eventLabel} · signed by ${roleLabel.toLowerCase()} (${signature.signer_name})`;
+    const baseUrl    = FRONTEND_URL.replace(/\/$/, '');
+    const supplierLink = `${baseUrl}/crm/memos/${memo.id}`;
+    const portalLink   = `${baseUrl}/store-portal/memos/${memo.id}`;
+
+    // Render once with a placeholder for the "View memo" CTA so we
+    // can swap the link per-recipient without duplicating the whole
+    // template.
+    const renderHtml = (ctaUrl, recipientLabel) => `<!doctype html>
+<html><body style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f5f5f4;margin:0;padding:24px;color:#1c1917">
+  <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #e7e5e4;border-radius:12px;overflow:hidden">
+    <div style="padding:24px;border-bottom:1px solid #f5f5f4">
+      <div style="font-size:10px;letter-spacing:2px;color:#a8a29e;text-transform:uppercase;font-weight:700">Electronic signature recorded</div>
+      <div style="font-size:22px;font-weight:700;margin-top:6px">Memo ${escapeHtml(memo.memo_number)}</div>
+      <div style="font-size:13px;color:#57534e;margin-top:2px">
+        ${escapeHtml(memo.owner_name || 'Supplier')} &mdash; ${escapeHtml(memo.company_name || 'Store')}
+      </div>
+    </div>
+    <div style="padding:24px">
+      <p style="margin:0 0 12px;font-size:14px;color:#292524">
+        <strong>${escapeHtml(signature.signer_name)}</strong>
+        signed the <strong>${eventLabel}</strong> of this memo as the <strong>${roleLabel.toLowerCase()}</strong>.
+      </p>
+      ${signature.signature_url ? `
+        <div style="margin:18px 0;border:1px solid #e7e5e4;border-radius:8px;padding:8px;background:#fafaf9;text-align:center">
+          <img src="${escapeAttr(signature.signature_url)}" alt="signature" style="max-width:320px;max-height:120px"/>
+        </div>` : ''}
+      <table style="font-size:12px;color:#57534e;line-height:1.6;border-collapse:collapse">
+        <tr><td style="padding-right:12px;color:#a8a29e">Signed&nbsp;at</td><td>${escapeHtml(new Date(signature.signed_at).toLocaleString('en-GB'))}</td></tr>
+        ${signature.signer_email ? `<tr><td style="padding-right:12px;color:#a8a29e">Email</td><td>${escapeHtml(signature.signer_email)}</td></tr>` : ''}
+        ${signature.ip_address ? `<tr><td style="padding-right:12px;color:#a8a29e">IP</td><td>${escapeHtml(signature.ip_address)}</td></tr>` : ''}
+        ${signature.integrity_hash ? `<tr><td style="padding-right:12px;color:#a8a29e">Hash</td><td style="font-family:ui-monospace,Menlo,monospace;font-size:11px">${escapeHtml(String(signature.integrity_hash).slice(0,16))}&hellip;${escapeHtml(String(signature.integrity_hash).slice(-6))}</td></tr>` : ''}
+      </table>
+      <div style="margin:24px 0 8px">
+        <a href="${escapeAttr(ctaUrl)}" style="display:inline-block;background:#1c1917;color:#ffffff;text-decoration:none;padding:10px 18px;border-radius:8px;font-size:13px;font-weight:600">
+          View memo &amp; download PDF
+        </a>
+      </div>
+      <p style="font-size:11px;color:#a8a29e;margin:18px 0 0;line-height:1.5">
+        This is an automated audit notification. The signature above is bound to the memo's contents at signing time via a SHA-256 integrity hash. You are receiving this as the ${escapeHtml(recipientLabel)} of memo ${escapeHtml(memo.memo_number)}.
+      </p>
+    </div>
+  </div>
+</body></html>`;
+
+    const textVersion = `${signature.signer_name} signed the ${eventLabel} of memo ${memo.memo_number} as the ${roleLabel.toLowerCase()}. Signed at ${new Date(signature.signed_at).toLocaleString('en-GB')}. View: `;
+
+    const recipients = [];
+    if (isDeliverableEmail(memo.owner_email))   recipients.push({ to: memo.owner_email,   label: 'supplier', link: supplierLink });
+    if (isDeliverableEmail(memo.company_email)) recipients.push({ to: memo.company_email, label: 'recipient store', link: portalLink });
+
+    await Promise.all(recipients.map(async (rcpt) => {
+      try {
+        const html = renderHtml(rcpt.link, rcpt.label);
+        const text = textVersion + rcpt.link;
+        const resp = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+          },
+          body: JSON.stringify({
+            from: fromHeader,
+            to: [rcpt.to],
+            subject,
+            html,
+            text,
+          }),
+        });
+        if (!resp.ok) {
+          const t = await resp.text().catch(() => '');
+          console.warn(`[memo signature email -> ${rcpt.to}]`, t.slice(0, 200) || resp.status);
+        }
+      } catch (e) {
+        console.warn(`[memo signature email -> ${rcpt.to}]`, e.message);
+      }
+    }));
+  } catch (e) {
+    console.warn('sendMemoSignatureEmail outer:', e.message);
+  }
+}
+
+/* Tiny HTML escaper used by signature notification emails. We render
+ * the template with literal user data (signer name, memo number, etc)
+ * and need to keep it injection-safe without pulling in a full
+ * sanitizer dep. */
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+function escapeAttr(s) { return escapeHtml(s); }
 
 /* Map a thrown status/code error back onto an HTTP response. */
 function sendSignatureError(res, e, contextMsg) {
@@ -7796,7 +7969,12 @@ app.get("/api/portal/memos", async (req, res) => {
              tm_owner.name AS supplier_name,
              (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id)                                 AS item_count,
              (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id AND mi.status = 'out')           AS items_out,
-             (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id AND mi.pending_status IS NOT NULL) AS items_pending
+             (SELECT COUNT(*)::int FROM memo_items mi WHERE mi.memo_id = m.id AND mi.pending_status IS NOT NULL) AS items_pending,
+             EXISTS(SELECT 1 FROM memo_signatures s WHERE s.memo_id = m.id AND s.event='issue' AND s.signer_role='supplier') AS has_sig_issue_supplier,
+             EXISTS(SELECT 1 FROM memo_signatures s WHERE s.memo_id = m.id AND s.event='issue' AND s.signer_role='store')    AS has_sig_issue_store,
+             EXISTS(SELECT 1 FROM memo_signatures s WHERE s.memo_id = m.id AND s.event='close' AND s.signer_role='supplier') AS has_sig_close_supplier,
+             EXISTS(SELECT 1 FROM memo_signatures s WHERE s.memo_id = m.id AND s.event='close' AND s.signer_role='store')    AS has_sig_close_store,
+             (SELECT COUNT(*)::int FROM memo_signatures s WHERE s.memo_id = m.id) AS signature_count
         FROM memos m
    LEFT JOIN team_members tm_owner
           ON tm_owner.team_owner_id = m.user_id
