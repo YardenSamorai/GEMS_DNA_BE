@@ -7921,6 +7921,81 @@ app.post("/api/portal/memos/:id/items/:itemId/cancel-request", async (req, res) 
   }
 });
 
+/* POST /api/portal/memos/:id/signatures
+ * Store-portal counterpart of the supplier-facing
+ * POST /api/memos/:id/signatures. The store-user gate up top blocks
+ * `store_user` from touching anything outside /api/portal/*, so this
+ * mirror endpoint is what the StorePortalMemoDetail page actually
+ * calls. The body matches the supplier endpoint minus signerRole
+ * (locked to 'store' here because store users can only sign as 'store').
+ * Both paths feed the same `memo_signatures` table through the shared
+ * createMemoSignatureRow helper. */
+app.post("/api/portal/memos/:id/signatures", async (req, res) => {
+  try {
+    const ctx = await requireStoreUser(req);
+    const { id } = req.params;
+
+    // The memo must belong to this store and be past draft (you can't
+    // acknowledge a memo that the supplier hasn't issued yet).
+    const memoRes = await pool.query(
+      `SELECT * FROM memos
+        WHERE id = $1 AND user_id = $2 AND company_id = $3
+          AND status <> 'draft'
+        LIMIT 1`,
+      [id, ctx.tenantUserId, ctx.companyId]
+    );
+    if (!memoRes.rows.length) return res.status(404).json({ error: 'Memo not found' });
+    const memo = memoRes.rows[0];
+
+    const { event, signerName, signatureDataUrl, consentText } = req.body || {};
+
+    // Best-effort email so the row displays nicely on both sides.
+    let resolvedEmail = null;
+    try {
+      const memberRes = await pool.query(
+        `SELECT email FROM team_members WHERE clerk_user_id = $1 LIMIT 1`,
+        [ctx.actorUserId]
+      );
+      resolvedEmail = memberRes.rows[0]?.email || null;
+    } catch (_) { /* non-fatal */ }
+
+    const ipAddress = (
+      req.headers['x-forwarded-for'] ||
+      req.socket?.remoteAddress ||
+      ''
+    ).toString().split(',')[0].trim() || null;
+    const userAgent = req.headers['user-agent'] || null;
+
+    const row = await createMemoSignatureRow({
+      memo,
+      event,
+      signerRole: 'store', // locked — store users cannot sign as supplier
+      signerName,
+      signerEmail: resolvedEmail,
+      signerClerkId: ctx.actorUserId,
+      signatureDataUrl,
+      consentText,
+      ipAddress,
+      userAgent,
+    });
+
+    logActivity({
+      userId: memo.user_id,
+      actorId: ctx.actorUserId,
+      actorName: ctx.actorName || ctx.memberName || row.signer_name,
+      entityType: 'memo',
+      entityId: String(memo.id),
+      action: `signed_${event}_store`,
+      summary: `Store signed ${event === 'issue' ? 'memo issuance' : 'memo close'} (${row.signer_name})`,
+      related: [{ type: 'company', id: memo.company_id }],
+    });
+
+    res.json(row);
+  } catch (e) {
+    sendSignatureError(res, e, 'Portal memo signature error:');
+  }
+});
+
 /* =========================================================
    Portal — Catalog
    GET /api/portal/catalog?type=stones|jewelry|all&search=&shape=&category=
