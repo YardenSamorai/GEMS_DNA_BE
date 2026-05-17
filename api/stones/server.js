@@ -2500,6 +2500,48 @@ const crmReadyPromise = (async () => {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_memo_request_items_req ON memo_request_items(request_id)`);
 
     /* =========================================================
+       Memo signatures (Sprint: digital signature workflow)
+       ---------------------------------------------------------
+       Two-way electronic signature on the memo lifecycle.
+       Supplier signs on `event='issue'` (hard-gated — required
+       before status flips draft→out). Store signs on `event='issue'`
+       to acknowledge receipt and on `event='close'` to acknowledge
+       return. A UNIQUE(memo_id, event, signer_role) ensures one
+       signature per (event, role) combo — i.e. exactly one supplier
+       issue-signature and one store issue-signature per memo.
+
+       `memo_snapshot` freezes the memo + its items at signing time
+       so we can prove exactly what was signed even if the memo is
+       later amended. `integrity_hash` is SHA-256 over the snapshot
+       + signature URL + signer + timestamp — any tamper attempt is
+       detectable by recomputing and comparing.
+       ========================================================= */
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS memo_signatures (
+        id              SERIAL PRIMARY KEY,
+        memo_id         INTEGER NOT NULL REFERENCES memos(id) ON DELETE CASCADE,
+        user_id         TEXT NOT NULL,
+        event           TEXT NOT NULL,
+        signer_role     TEXT NOT NULL,
+        signer_clerk_id TEXT,
+        signer_name     TEXT NOT NULL,
+        signer_email    TEXT,
+        signature_url   TEXT NOT NULL,
+        consent_text    TEXT NOT NULL,
+        memo_snapshot   JSONB NOT NULL,
+        pdf_url         TEXT,
+        integrity_hash  TEXT NOT NULL,
+        ip_address      TEXT,
+        user_agent      TEXT,
+        token_id        INTEGER,
+        signed_at       TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_memo_sig_unique  ON memo_signatures(memo_id, event, signer_role)`);
+    await pool.query(`CREATE INDEX        IF NOT EXISTS idx_memo_sig_memo    ON memo_signatures(memo_id)`);
+    await pool.query(`CREATE INDEX        IF NOT EXISTS idx_memo_sig_tenant  ON memo_signatures(user_id)`);
+
+    /* =========================================================
        Catalog Tiers — per-supplier curated buckets of inventory
        that decide which items each store sees in the portal.
 
@@ -6110,7 +6152,16 @@ app.get("/api/memos/:id", async (req, res) => {
       `SELECT * FROM memo_items WHERE memo_id = $1 ORDER BY created_at ASC`,
       [id]
     );
-    res.json({ ...memo, items: items.rows });
+    const sigs = await pool.query(
+      `SELECT id, event, signer_role, signer_clerk_id, signer_name, signer_email,
+              signature_url, consent_text, integrity_hash, ip_address, user_agent,
+              pdf_url, token_id, signed_at
+         FROM memo_signatures
+        WHERE memo_id = $1
+     ORDER BY signed_at ASC, id ASC`,
+      [id]
+    );
+    res.json({ ...memo, items: items.rows, signatures: sigs.rows });
   } catch (error) {
     console.error("Error fetching memo:", error);
     res.status(500).json({ error: error.message });
@@ -6429,6 +6480,24 @@ app.post("/api/memos/:id/issue", async (req, res) => {
     const itemCount = await pool.query(`SELECT COUNT(*)::int AS n FROM memo_items WHERE memo_id = $1`, [id]);
     if (itemCount.rows[0].n === 0) return res.status(400).json({ error: 'Cannot issue an empty memo' });
 
+    // Hard gate: a memo cannot transition draft→out until the supplier
+    // side has signed event='issue'. The FE flow is "Sign & Issue"
+    // (POST /signatures with role=supplier, then POST /issue); on retry,
+    // the existing signature satisfies this gate without re-signing.
+    const sigCheck = await pool.query(
+      `SELECT id FROM memo_signatures
+        WHERE memo_id = $1 AND event = 'issue' AND signer_role = 'supplier'
+        LIMIT 1`,
+      [id]
+    );
+    if (sigCheck.rows.length === 0) {
+      return res.status(409).json({
+        error: 'Supplier signature required to issue this memo',
+        code: 'signature_required',
+        missing: { event: 'issue', signerRole: 'supplier' },
+      });
+    }
+
     const r = await pool.query(
       `UPDATE memos SET status = 'out', issued_at = NOW(), updated_at = NOW()
         WHERE id = $1 RETURNING *`,
@@ -6482,6 +6551,178 @@ app.post("/api/memos/:id/close", async (req, res) => {
   } catch (error) {
     console.error("Error closing memo:", error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+/* =========================================================
+   Memo signatures (Sprint: digital signature workflow)
+   ---------------------------------------------------------
+   POST /api/memos/:id/signatures
+     Body: {
+       event:             'issue' | 'close',
+       signerRole:        'supplier' | 'store',
+       signerName:        string  (typed full legal name),
+       signatureDataUrl:  string  (PNG data URL from canvas),
+       consentText:       string  (exact wording user agreed to),
+     }
+   Auth: header-based via resolveTeamContext. Store-role signatures
+   require role='store_user' on the memo's company. Supplier-role
+   signatures require tenant ownership (plus assignee match for reps).
+   On success: PNG uploaded to Vercel Blob, snapshot frozen,
+   integrity hash computed, activity_log entry. UNIQUE(memo_id, event,
+   signer_role) prevents duplicate signatures.
+   ========================================================= */
+app.post("/api/memos/:id/signatures", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
+
+    const { event, signerRole, signerName, signatureDataUrl, consentText } = req.body || {};
+
+    if (!event || (event !== 'issue' && event !== 'close')) {
+      return res.status(400).json({ error: "event must be 'issue' or 'close'" });
+    }
+    if (!signerRole || (signerRole !== 'supplier' && signerRole !== 'store')) {
+      return res.status(400).json({ error: "signerRole must be 'supplier' or 'store'" });
+    }
+    const trimmedName = (signerName || '').trim();
+    if (!trimmedName) return res.status(400).json({ error: 'signerName is required' });
+    if (!signatureDataUrl || !/^data:image\/png;base64,/.test(signatureDataUrl)) {
+      return res.status(400).json({ error: 'signatureDataUrl must be a PNG data URL' });
+    }
+    const trimmedConsent = (consentText || '').trim();
+    if (!trimmedConsent) return res.status(400).json({ error: 'consentText is required' });
+
+    // Verify the memo and check authorization for the chosen role.
+    const memoRes = await pool.query(`SELECT * FROM memos WHERE id = $1`, [id]);
+    if (memoRes.rows.length === 0) return res.status(404).json({ error: 'Memo not found' });
+    const memo = memoRes.rows[0];
+
+    if (signerRole === 'store') {
+      if (ctx.role !== 'store_user') {
+        return res.status(403).json({ error: "Only store users can sign as 'store'" });
+      }
+      if (Number(ctx.companyId) !== Number(memo.company_id)) {
+        return res.status(403).json({ error: 'Not authorized for this memo' });
+      }
+    } else {
+      // supplier
+      if (memo.user_id !== ctx.tenantUserId) {
+        return res.status(403).json({ error: 'Not authorized for this memo' });
+      }
+      if (!ctx.isOwner && memo.assigned_to && memo.assigned_to !== ctx.actorUserId) {
+        return res.status(403).json({ error: 'Not authorized for this memo' });
+      }
+    }
+
+    // Reject duplicates with a clean error before hitting the unique index.
+    const dupe = await pool.query(
+      `SELECT id FROM memo_signatures
+        WHERE memo_id = $1 AND event = $2 AND signer_role = $3
+        LIMIT 1`,
+      [id, event, signerRole]
+    );
+    if (dupe.rows.length) {
+      return res.status(409).json({
+        error: 'Signature already exists for this event and role',
+        code: 'signature_exists',
+      });
+    }
+
+    // Blob upload prerequisites.
+    if (!blobPut) {
+      return res.status(503).json({ error: '@vercel/blob not installed on backend' });
+    }
+    if (!process.env.BLOB_READ_WRITE_TOKEN) {
+      return res.status(503).json({ error: 'BLOB_READ_WRITE_TOKEN is not set' });
+    }
+
+    // Freeze the memo + items at signing time.
+    const itemsRes = await pool.query(
+      `SELECT * FROM memo_items WHERE memo_id = $1 ORDER BY created_at ASC`,
+      [id]
+    );
+    const snapshot = {
+      memo,
+      items: itemsRes.rows,
+      capturedAt: new Date().toISOString(),
+    };
+
+    // Decode base64 and push to Blob.
+    const base64 = signatureDataUrl.replace(/^data:image\/png;base64,/, '');
+    const buffer = Buffer.from(base64, 'base64');
+    const pathname = `memo-signatures/memo-${id}-${event}-${signerRole}-${Date.now()}.png`;
+    const blob = await blobPut(pathname, buffer, {
+      access: 'public',
+      contentType: 'image/png',
+      addRandomSuffix: true,
+    });
+
+    // Best-effort email resolution from team_members for nicer display.
+    let resolvedEmail = null;
+    try {
+      const memberRes = await pool.query(
+        `SELECT email FROM team_members WHERE clerk_user_id = $1 LIMIT 1`,
+        [ctx.actorUserId]
+      );
+      resolvedEmail = memberRes.rows[0]?.email || null;
+    } catch (_) { /* non-fatal */ }
+
+    const signedAt = new Date();
+    const integrityHash = crypto
+      .createHash('sha256')
+      .update(JSON.stringify({
+        snapshot,
+        signatureUrl: blob.url,
+        signerName: trimmedName,
+        signerRole,
+        event,
+        signedAt: signedAt.toISOString(),
+      }))
+      .digest('hex');
+
+    const ipAddress = (
+      req.headers['x-forwarded-for'] ||
+      req.socket?.remoteAddress ||
+      ''
+    ).toString().split(',')[0].trim() || null;
+    const userAgent = req.headers['user-agent'] || null;
+
+    const ins = await pool.query(`
+      INSERT INTO memo_signatures
+        (memo_id, user_id, event, signer_role, signer_clerk_id,
+         signer_name, signer_email, signature_url, consent_text,
+         memo_snapshot, integrity_hash, ip_address, user_agent, signed_at)
+      VALUES
+        ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14)
+      RETURNING id, memo_id, event, signer_role, signer_clerk_id,
+                signer_name, signer_email, signature_url, consent_text,
+                integrity_hash, ip_address, user_agent, pdf_url, token_id, signed_at
+    `, [
+      id, memo.user_id, event, signerRole,
+      ctx.actorUserId, trimmedName, resolvedEmail,
+      blob.url, trimmedConsent,
+      JSON.stringify(snapshot), integrityHash, ipAddress, userAgent,
+      signedAt,
+    ]);
+
+    const { actorId, actorName } = getActor(req);
+    logActivity({
+      userId: memo.user_id,
+      actorId: actorId || ctx.actorUserId,
+      actorName: actorName || trimmedName,
+      entityType: 'memo',
+      entityId: String(id),
+      action: `signed_${event}_${signerRole}`,
+      summary: `${signerRole === 'supplier' ? 'Supplier' : 'Store'} signed ${event === 'issue' ? 'memo issuance' : 'memo close'} (${trimmedName})`,
+      related: [{ type: 'company', id: memo.company_id }],
+    });
+
+    res.json(ins.rows[0]);
+  } catch (e) {
+    console.error('Memo signature error:', e);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -7265,7 +7506,18 @@ app.get("/api/portal/memos/:id", async (req, res) => {
     ORDER BY created_at ASC
     `, [id]);
 
-    res.json({ ...memo, items: itemsRes.rows });
+    // Signatures — same shape the supplier sees so both parties can
+    // verify each other's signature blocks.
+    const sigsRes = await pool.query(`
+      SELECT id, event, signer_role, signer_clerk_id, signer_name, signer_email,
+             signature_url, consent_text, integrity_hash, ip_address, user_agent,
+             pdf_url, token_id, signed_at
+        FROM memo_signatures
+       WHERE memo_id = $1
+    ORDER BY signed_at ASC, id ASC
+    `, [id]);
+
+    res.json({ ...memo, items: itemsRes.rows, signatures: sigsRes.rows });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
   }
