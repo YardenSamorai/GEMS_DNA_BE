@@ -7502,6 +7502,41 @@ app.get("/api/portal/catalog", async (req, res) => {
         }));
     }
 
+    // Diagnostic block — only shown when the resulting catalog is empty.
+    // Helps the supplier (or store user) understand WHY: not subscribed
+    // to any tier? subscribed but the tier has no items? everything in
+    // the tier currently out on memo? Without this the empty catalog is
+    // a black box and the supplier ends up wondering whether something
+    // is broken.
+    if (out.stones.length === 0 && out.jewelry.length === 0) {
+      const tiersRes = await pool.query(`
+        SELECT t.id, t.name, t.color,
+               (SELECT COUNT(*) FROM catalog_tier_items WHERE tier_id = t.id) AS item_count
+          FROM catalog_tier_companies ctc
+          JOIN catalog_tiers t ON t.id = ctc.tier_id
+         WHERE ctc.company_id = $1
+           AND t.user_id = $2
+         ORDER BY t.sort_order ASC, t.name ASC
+      `, [ctx.companyId, ctx.tenantUserId]);
+      const visibleSkuCount = visibleStones.size + visibleJewelry.size;
+      out._diagnostic = {
+        subscribedTiers: tiersRes.rows.map(r => ({
+          id: r.id,
+          name: r.name,
+          color: r.color,
+          itemCount: Number(r.item_count) || 0,
+        })),
+        visibleSkuCount,
+        busySkuCount: busyStones.size + busyJewelry.size,
+        reason:
+          tiersRes.rows.length === 0
+            ? 'no_tier_subscriptions'
+            : visibleSkuCount === 0
+              ? 'tiers_empty'
+              : 'all_items_busy',
+      };
+    }
+
     res.json(out);
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
