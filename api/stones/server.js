@@ -3062,21 +3062,28 @@ app.put("/api/crm/contacts/:id", async (req, res) => {
     const after = result.rows[0];
     const changes = diffRows(before, after, allowed);
     if (changes && before) {
-      const { actorId, actorName } = getActor(req);
       const changedKeys = Object.keys(changes);
-      const summary =
-        changedKeys.length === 1
-          ? `Updated ${changedKeys[0]} on ${after.name}`
-          : `Updated ${after.name} (${changedKeys.length} fields)`;
-      logActivity({
-        userId:     after.user_id,
-        actorId, actorName,
-        entityType: 'contact',
-        entityId:   after.id,
-        action:     'updated',
-        summary,
-        changes,
-      });
+      // Suppress activity noise for the silent thumbnail backfill flow
+      // (FE regenerates a small thumb from a legacy card_image_front and
+      // writes it back). Real user-driven edits still log normally.
+      const isSilentThumbBackfill =
+        changedKeys.length === 1 && changedKeys[0] === 'card_image_thumb';
+      if (!isSilentThumbBackfill) {
+        const { actorId, actorName } = getActor(req);
+        const summary =
+          changedKeys.length === 1
+            ? `Updated ${changedKeys[0]} on ${after.name}`
+            : `Updated ${after.name} (${changedKeys.length} fields)`;
+        logActivity({
+          userId:     after.user_id,
+          actorId, actorName,
+          entityType: 'contact',
+          entityId:   after.id,
+          action:     'updated',
+          summary,
+          changes,
+        });
+      }
     }
   } catch (error) {
     console.error("Error updating contact:", error);
@@ -3212,11 +3219,17 @@ app.get("/api/crm/contacts/thumbs", async (req, res) => {
     if (ids.length === 0) return res.json([]);
     // Cap to keep payloads sane
     const capped = ids.slice(0, 200);
+    // Falls back to card_image_front when a row never had a thumbnail
+    // generated (legacy contacts created before the thumb pipeline existed).
+    // The FE is expected to downscale `thumb` locally when `needs_backfill`
+    // is true and POST a real thumb back, so subsequent loads are small.
     const r = await pool.query(
-      `SELECT id, card_image_thumb AS thumb
+      `SELECT id,
+              COALESCE(card_image_thumb, card_image_front) AS thumb,
+              (card_image_thumb IS NULL AND card_image_front IS NOT NULL) AS needs_backfill
          FROM crm_contacts
         WHERE id = ANY($1::int[])
-          AND card_image_thumb IS NOT NULL`,
+          AND (card_image_thumb IS NOT NULL OR card_image_front IS NOT NULL)`,
       [capped]
     );
     // Cache hint: thumbs change rarely
