@@ -5677,10 +5677,15 @@ Rules:
       }
     }
 
-    // Find matches per contact
+    // Find matches per contact, with a confidence rating so the FE can
+    // distinguish a *certain* dup (same email, or same full phone) from
+    // a fuzzier "looks similar" hit (matching last 9 digits / partial).
+    // The FE shows a hard red banner for exact matches and the existing
+    // soft amber for partial ones.
     const enriched = [];
     for (const c of contacts) {
       let matches = [];
+      let matchConfidence = "none"; // "exact" | "partial" | "none"
       const phoneDigits = normPhone(c.phone);
       const email = (c.email || "").toLowerCase().trim();
       if (phoneDigits || email) {
@@ -5704,9 +5709,29 @@ Rules:
             values
           );
           matches = r.rows;
+          // Decide confidence by re-checking *exact* equality on the
+          // candidate rows. Phone equality compares the full normalised
+          // digits string; email equality is case-insensitive.
+          for (const row of matches) {
+            const rowPhoneDigits = normPhone(row.phone || "");
+            const rowEmail = (row.email || "").toLowerCase().trim();
+            const exactPhone =
+              !!phoneDigits && phoneDigits.length >= 7 && rowPhoneDigits === phoneDigits;
+            const exactEmail = !!email && rowEmail === email;
+            if (exactPhone || exactEmail) {
+              matchConfidence = "exact";
+              // Annotate why we matched so the FE can show "Same email"
+              // / "Same phone" badges in the alert.
+              row._matchReason = exactEmail ? "email" : "phone";
+              break;
+            }
+          }
+          if (matchConfidence === "none" && matches.length > 0) {
+            matchConfidence = "partial";
+          }
         }
       }
-      enriched.push({ extracted: c, matches });
+      enriched.push({ extracted: c, matches, matchConfidence });
     }
 
     res.json({
@@ -5716,6 +5741,7 @@ Rules:
       // Backward-compat for old client
       extracted: enriched[0]?.extracted || null,
       matches: enriched[0]?.matches || [],
+      matchConfidence: enriched[0]?.matchConfidence || "none",
     });
   } catch (error) {
     console.error("Error scanning card:", error);
