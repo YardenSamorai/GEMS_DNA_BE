@@ -7731,19 +7731,48 @@ app.post("/api/catalog-tiers/:id/items", async (req, res) => {
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
     if (!items.length) return res.json({ ok: true, added: 0 });
 
-    let added = 0;
+    // Normalise + dedupe within the same payload so we don't emit
+    // VALUES that hit the ON CONFLICT clause for self-conflicts.
+    const seen = new Set();
+    const valid = [];
     for (const it of items) {
       const type = it?.type || it?.item_type;
       const sku  = it?.sku  || it?.item_sku;
       if (!sku || !['stone','jewelry'].includes(type)) continue;
+      const key = `${type}::${sku}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      valid.push({ type, sku });
+    }
+    if (!valid.length) return res.json({ ok: true, added: 0 });
+
+    // Single batched INSERT — the supplier may be syncing 5,000+ SKUs
+    // from inventory in one click, so a per-row roundtrip would take
+    // tens of seconds. We chunk to 500 rows per statement to keep each
+    // query under PG's parameter limit (65,535) and the network frame
+    // size reasonable. ON CONFLICT DO NOTHING swallows duplicates
+    // against rows already in the tier (the supplier may have added
+    // some items manually before clicking Sync).
+    const CHUNK = 500;
+    let added = 0;
+    for (let i = 0; i < valid.length; i += CHUNK) {
+      const slice = valid.slice(i, i + CHUNK);
+      const placeholders = slice.map((_, j) => {
+        const k = j * 4;
+        return `($${k + 1}, $${k + 2}, $${k + 3}, $${k + 4})`;
+      }).join(",");
+      const params = [];
+      for (const v of slice) {
+        params.push(id, v.type, v.sku, ctx.actorUserId);
+      }
       const ins = await pool.query(
         `INSERT INTO catalog_tier_items (tier_id, item_type, item_sku, added_by)
-         VALUES ($1, $2, $3, $4)
+         VALUES ${placeholders}
          ON CONFLICT DO NOTHING
          RETURNING tier_id`,
-        [id, type, sku, ctx.actorUserId]
+        params
       );
-      if (ins.rows.length) added++;
+      added += ins.rows.length;
     }
     res.json({ ok: true, added });
   } catch (e) {
