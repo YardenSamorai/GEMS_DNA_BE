@@ -7605,6 +7605,13 @@ app.get("/api/catalog-tiers/:id", async (req, res) => {
     // orphan SKUs with no title or image. We now fall back to
     // jewelry_products via COALESCE so the curator sees every kind of
     // jewelry SKU rendered the same way in the tier grid.
+    //
+    // In addition to the display fields we expose the underlying
+    // structured columns (color, clarity, lab, total_price,
+    // price_per_carat for stones; metal_type, category source for
+    // jewelry) so the items tab on the FE can filter the in-tier list
+    // by the same dimensions the picker offers, without having to
+    // re-fetch the full inventory.
     const itemsRes = await pool.query(
       `SELECT cti.item_type, cti.item_sku, cti.added_at,
               CASE WHEN cti.item_type = 'stone' THEN s.shape
@@ -7628,7 +7635,19 @@ app.get("/api/catalog-tiers/:id", async (req, res) => {
               CASE WHEN cti.item_type = 'jewelry' AND j.id IS NOT NULL THEN 'workshop'
                    WHEN cti.item_type = 'jewelry' AND jp.model_number IS NOT NULL THEN 'catalog'
                    ELSE NULL
-              END AS jewelry_source
+              END AS jewelry_source,
+              -- Stone-only structured fields (NULL when item is jewelry):
+              CASE WHEN cti.item_type = 'stone' THEN s.shape   END AS stone_shape,
+              CASE WHEN cti.item_type = 'stone' THEN s.color   END AS stone_color,
+              CASE WHEN cti.item_type = 'stone' THEN s.clarity END AS stone_clarity,
+              CASE WHEN cti.item_type = 'stone' THEN s.lab     END AS stone_lab,
+              CASE WHEN cti.item_type = 'stone' THEN s.origin  END AS stone_origin,
+              CASE WHEN cti.item_type = 'stone' THEN s.weight  END AS stone_weight,
+              CASE WHEN cti.item_type = 'stone' THEN s.total_price     END AS stone_total_price,
+              CASE WHEN cti.item_type = 'stone' THEN s.price_per_carat END AS stone_price_per_carat,
+              -- Jewelry-only structured fields (NULL when item is stone):
+              CASE WHEN cti.item_type = 'jewelry' THEN COALESCE(j.metal_summary, jp.metal_type) END AS jewelry_metal,
+              CASE WHEN cti.item_type = 'jewelry' THEN COALESCE(j.category, jp.jewelry_type, jp.category) END AS jewelry_category
          FROM catalog_tier_items cti
     LEFT JOIN soap_stones s ON cti.item_type = 'stone' AND s.sku = cti.item_sku
     LEFT JOIN jewelry_items j ON cti.item_type = 'jewelry' AND j.sku = cti.item_sku AND j.user_id = $2
