@@ -7582,6 +7582,43 @@ app.delete("/api/catalog-tiers/:id", async (req, res) => {
   }
 });
 
+// GET /api/catalog-tiers/inventory-summary — total counts in every
+// inventory source the picker can pull from, so the FE can show the
+// supplier "your inventory contains X stones · Y workshop jewelry ·
+// Z catalog jewelry" before they curate. Crucial for diagnosing the
+// "I only see 1 jewelry" confusion: if the catalog count is zero it
+// means the WooCommerce CSV has never been imported on this tenant,
+// not that the system is broken.
+app.get("/api/catalog-tiers/inventory-summary", async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.actorUserId) return res.status(400).json({ error: "userId is required" });
+    if (ctx.role === "store_user") return res.status(403).json({ error: "Owners only" });
+
+    const [stonesRes, workshopRes, catalogRes] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS n FROM soap_stones WHERE sku IS NOT NULL`),
+      // Match the exact filter the picker's fetchJewelryItems(userId) uses
+      // (user_id-scoped, excludes archived) so the snapshot lines up with
+      // what the supplier can actually add.
+      pool.query(
+        `SELECT COUNT(*)::int AS n FROM jewelry_items
+          WHERE user_id = $1 AND COALESCE(status,'') <> 'archived'`,
+        [ctx.tenantUserId]
+      ),
+      pool.query(`SELECT COUNT(*)::int AS n FROM jewelry_products`),
+    ]);
+
+    res.json({
+      stones:           stonesRes.rows[0]?.n   || 0,
+      workshopJewelry:  workshopRes.rows[0]?.n || 0,
+      catalogJewelry:   catalogRes.rows[0]?.n  || 0,
+    });
+  } catch (e) {
+    console.error("inventory-summary error", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/catalog-tiers/:id — detail with items + companies + counts.
 app.get("/api/catalog-tiers/:id", async (req, res) => {
   try {
