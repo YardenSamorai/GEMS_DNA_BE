@@ -4297,13 +4297,46 @@ app.get("/api/crm/interactions", async (req, res) => {
   try {
     const { userId, contactId, type, dealId, limit } = req.query;
     if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const lim = Math.min(Number(limit) || 200, 500);
+
+    // When the caller scopes by contactId we can't blindly filter the
+    // interactions table by user_id. DNA-lead inquiries are persisted
+    // under the synthetic tenant 'dna_public' (so all workspace members
+    // share them), so a user_id=$workspaceUser filter silently hides
+    // every "I'm interested" event from the Activity timeline. Instead,
+    // verify the caller can SEE the contact (own or shared), then return
+    // *all* interactions linked to it regardless of which tenant wrote
+    // the row.
+    if (contactId) {
+      const access = await pool.query(
+        "SELECT 1 FROM crm_contacts WHERE id = $1 AND (user_id = $2 OR shared = TRUE) LIMIT 1",
+        [contactId, userId]
+      );
+      if (access.rowCount === 0) return res.json([]);
+
+      const conditions = ["contact_id = $1"];
+      const values = [contactId];
+      let idx = 2;
+      if (dealId) { conditions.push(`deal_id = $${idx++}`); values.push(dealId); }
+      if (type)   { conditions.push(`type = $${idx++}`);    values.push(type); }
+      const result = await pool.query(
+        `SELECT * FROM crm_interactions
+         WHERE ${conditions.join(" AND ")}
+         ORDER BY occurred_at DESC NULLS LAST, created_at DESC
+         LIMIT ${lim}`,
+        values
+      );
+      return res.json(result.rows);
+    }
+
+    // No contactId → workspace-wide list. Keep the strict user_id scope so
+    // tenants never see each other's private interactions.
     const conditions = ["user_id = $1"];
     const values = [userId];
     let idx = 2;
-    if (contactId) { conditions.push(`contact_id = $${idx++}`); values.push(contactId); }
-    if (dealId)    { conditions.push(`deal_id = $${idx++}`);    values.push(dealId); }
-    if (type)      { conditions.push(`type = $${idx++}`);       values.push(type); }
-    const lim = Math.min(Number(limit) || 200, 500);
+    if (dealId) { conditions.push(`deal_id = $${idx++}`); values.push(dealId); }
+    if (type)   { conditions.push(`type = $${idx++}`);    values.push(type); }
     const result = await pool.query(
       `SELECT * FROM crm_interactions
        WHERE ${conditions.join(" AND ")}
