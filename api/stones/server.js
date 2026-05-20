@@ -7596,16 +7596,43 @@ app.get("/api/catalog-tiers/:id", async (req, res) => {
     if (!tier) return res.status(404).json({ error: "Tier not found" });
 
     // Items in tier — enrich with display fields for each kind.
+    //
+    // Jewelry lives in two tables: workshop pieces in `jewelry_items`
+    // (tenant-scoped, custom orders / stock the user manages) and the
+    // shared WooCommerce catalog in `jewelry_products` (model_number
+    // keyed, no user scope). Until now we only enriched from the
+    // workshop table, which made WooCommerce model numbers look like
+    // orphan SKUs with no title or image. We now fall back to
+    // jewelry_products via COALESCE so the curator sees every kind of
+    // jewelry SKU rendered the same way in the tier grid.
     const itemsRes = await pool.query(
       `SELECT cti.item_type, cti.item_sku, cti.added_at,
-              CASE WHEN cti.item_type = 'stone'   THEN s.shape       ELSE j.name        END AS title,
-              CASE WHEN cti.item_type = 'stone'   THEN s.image       ELSE j.cover_image_url END AS image_url,
-              CASE WHEN cti.item_type = 'stone'   THEN s.weight::TEXT      ELSE j.weight_grams::TEXT END AS weight,
-              CASE WHEN cti.item_type = 'stone'   THEN s.color       ELSE j.metal_summary END AS subtitle,
-              CASE WHEN cti.item_type = 'stone'   THEN s.category    ELSE j.category    END AS category
+              CASE WHEN cti.item_type = 'stone' THEN s.shape
+                   ELSE COALESCE(j.name, jp.title)
+              END AS title,
+              CASE WHEN cti.item_type = 'stone' THEN s.image
+                   ELSE COALESCE(
+                          j.cover_image_url,
+                          NULLIF(TRIM(SPLIT_PART(jp.all_pictures_link, ';', 1)), '')
+                        )
+              END AS image_url,
+              CASE WHEN cti.item_type = 'stone' THEN s.weight::TEXT
+                   ELSE COALESCE(j.weight_grams::TEXT, jp.jewelry_weight::TEXT)
+              END AS weight,
+              CASE WHEN cti.item_type = 'stone' THEN s.color
+                   ELSE COALESCE(j.metal_summary, jp.metal_type)
+              END AS subtitle,
+              CASE WHEN cti.item_type = 'stone' THEN s.category
+                   ELSE COALESCE(j.category, jp.jewelry_type, jp.category)
+              END AS category,
+              CASE WHEN cti.item_type = 'jewelry' AND j.id IS NOT NULL THEN 'workshop'
+                   WHEN cti.item_type = 'jewelry' AND jp.model_number IS NOT NULL THEN 'catalog'
+                   ELSE NULL
+              END AS jewelry_source
          FROM catalog_tier_items cti
     LEFT JOIN soap_stones s ON cti.item_type = 'stone' AND s.sku = cti.item_sku
     LEFT JOIN jewelry_items j ON cti.item_type = 'jewelry' AND j.sku = cti.item_sku AND j.user_id = $2
+    LEFT JOIN jewelry_products jp ON cti.item_type = 'jewelry' AND jp.model_number = cti.item_sku
         WHERE cti.tier_id = $1
         ORDER BY cti.added_at DESC`,
       [id, ctx.tenantUserId]
@@ -8390,10 +8417,16 @@ app.get("/api/portal/catalog", async (req, res) => {
         });
     }
 
-    // Jewelry — pull from jewelry_items, only the ones marked "active"
-    // (anything not archived / not draft / not sold).
+    // Jewelry — two sources: workshop pieces in `jewelry_items`
+    // (active / not sold / not archived) AND the shared WooCommerce
+    // catalog in `jewelry_products`. Both are gated by the tier
+    // visibility set built above, so the store only sees SKUs the
+    // supplier explicitly curated.
     if (type === 'all' || type === 'jewelry') {
-      const r = await pool.query(`
+      const merged = [];
+
+      // 1) Workshop jewelry — tenant-owned, with statuses / lifecycle.
+      const workshopRes = await pool.query(`
         SELECT id, sku, name, category, type, status, cover_image_url,
                metal_summary, weight_grams, size, sold_at, updated_at
           FROM jewelry_items
@@ -8403,19 +8436,12 @@ app.get("/api/portal/catalog", async (req, res) => {
          ORDER BY updated_at DESC
          LIMIT 500
       `, [ctx.tenantUserId]);
-      out.jewelry = r.rows
-        .filter(row => visibleJewelry.has(row.sku))
-        .filter(row => !busyJewelry.has(row.sku))
-        .filter(row => {
-          if (cat && String(row.category || '').toLowerCase() !== cat) return false;
-          if (!search) return true;
-          const hay = [row.sku, row.name, row.category, row.type, row.metal_summary]
-            .filter(Boolean).join(' ').toLowerCase();
-          return hay.includes(search);
-        })
-        .slice(0, limit)
-        .map(row => ({
+      for (const row of workshopRes.rows) {
+        if (!visibleJewelry.has(row.sku)) continue;
+        if (busyJewelry.has(row.sku)) continue;
+        merged.push({
           kind:        'jewelry',
+          source:      'workshop',
           id:          row.id,
           sku:         row.sku,
           name:        row.name || row.sku,
@@ -8426,7 +8452,65 @@ app.get("/api/portal/catalog", async (req, res) => {
           totalWeight: row.weight_grams != null ? Number(row.weight_grams) : null,
           size:        row.size || '',
           imageUrl:    row.cover_image_url || null,
-        }));
+          updatedAt:   row.updated_at,
+        });
+      }
+
+      // 2) WooCommerce-imported catalog jewelry — global, identified by
+      //    model_number. Only pull rows the supplier curated; the
+      //    in-DB pile can be huge so we filter by SKU set early.
+      const visibleJewArr = Array.from(visibleJewelry);
+      const workshopSkuSet = new Set(workshopRes.rows.map(r => r.sku));
+      const catalogTargetSkus = visibleJewArr.filter(sku => !workshopSkuSet.has(sku));
+      if (catalogTargetSkus.length > 0) {
+        const catalogRes = await pool.query(`
+          SELECT model_number, title, jewelry_type, category, metal_type,
+                 jewelry_weight, jewelry_size, all_pictures_link,
+                 stone_type, total_carat, center_stone_shape, center_stone_color,
+                 center_stone_clarity, center_stone_carat
+            FROM jewelry_products
+           WHERE model_number = ANY($1::text[])
+        `, [catalogTargetSkus]);
+        for (const row of catalogRes.rows) {
+          if (busyJewelry.has(row.model_number)) continue;
+          const firstImage = (row.all_pictures_link || '')
+            .split(';')
+            .map(s => s.trim())
+            .filter(Boolean)[0] || null;
+          merged.push({
+            kind:        'jewelry',
+            source:      'catalog',
+            id:          null,
+            sku:         row.model_number,
+            name:        row.title || row.model_number,
+            category:    row.jewelry_type || row.category || '',
+            type:        '',
+            metalType:   row.metal_type || '',
+            metalColor:  '',
+            totalWeight: row.jewelry_weight != null ? Number(row.jewelry_weight) : null,
+            size:        row.jewelry_size || '',
+            imageUrl:    firstImage,
+            centerStone: {
+              shape:   row.center_stone_shape || '',
+              color:   row.center_stone_color || '',
+              clarity: row.center_stone_clarity || '',
+              carat:   row.center_stone_carat != null ? Number(row.center_stone_carat) : null,
+            },
+            totalCarat:  row.total_carat != null ? Number(row.total_carat) : null,
+            updatedAt:   null,
+          });
+        }
+      }
+
+      out.jewelry = merged
+        .filter(row => {
+          if (cat && String(row.category || '').toLowerCase() !== cat) return false;
+          if (!search) return true;
+          const hay = [row.sku, row.name, row.category, row.type, row.metalType]
+            .filter(Boolean).join(' ').toLowerCase();
+          return hay.includes(search);
+        })
+        .slice(0, limit);
     }
 
     // Diagnostic block — only shown when the resulting catalog is empty.
@@ -8581,7 +8665,57 @@ app.get("/api/portal/items/jewelry/:idOrSku", async (req, res) => {
         : `SELECT * FROM jewelry_items WHERE sku = $1 AND user_id = $2 LIMIT 1`,
       [isNumeric ? Number(idOrSku) : idOrSku, ctx.tenantUserId]
     );
-    if (!itemRes.rows.length) return res.status(404).json({ error: "Jewelry item not found" });
+
+    // Workshop miss → try the WooCommerce catalog. Stores can have
+    // catalog SKUs in a tier just as easily as workshop SKUs, and we
+    // want both to open into a real detail page rather than 404.
+    if (!itemRes.rows.length) {
+      if (isNumeric) {
+        // Catalog rows are keyed by string model_number, not numeric ids.
+        return res.status(404).json({ error: "Jewelry item not found" });
+      }
+      if (!(await ensureSkuVisibleToStore(ctx, 'jewelry', idOrSku))) {
+        return res.status(404).json({ error: "Jewelry item not found" });
+      }
+      const cat = await pool.query(
+        `SELECT * FROM jewelry_products WHERE model_number = $1 LIMIT 1`,
+        [idOrSku]
+      );
+      if (!cat.rows.length) return res.status(404).json({ error: "Jewelry item not found" });
+      const row = cat.rows[0];
+      const images = (row.all_pictures_link || '')
+        .split(';').map(s => s.trim()).filter(Boolean);
+      return res.json({
+        kind: 'jewelry',
+        source: 'catalog',
+        id: null,
+        sku: row.model_number,
+        name: row.title || row.model_number,
+        type: '',
+        category: row.jewelry_type || row.category || '',
+        metalSummary: row.metal_type || '',
+        weightGrams: row.jewelry_weight != null ? Number(row.jewelry_weight) : null,
+        size: row.jewelry_size || '',
+        description: row.full_description || row.description || '',
+        coverImageUrl: images[0] || null,
+        images,
+        videoUrl: row.video_link || null,
+        certificateNumber: row.certificate_number || '',
+        certificateUrl: row.certificate_link || null,
+        centerStone: {
+          shape: row.center_stone_shape || '',
+          color: row.center_stone_color || '',
+          clarity: row.center_stone_clarity || '',
+          carat: row.center_stone_carat != null ? Number(row.center_stone_carat) : null,
+        },
+        totalCarat: row.total_carat != null ? Number(row.total_carat) : null,
+        stones: [],
+        metals: [],
+        files: [],
+        updatedAt: null,
+      });
+    }
+
     const item = itemRes.rows[0];
 
     // Must live in at least one tier the store is subscribed to.
