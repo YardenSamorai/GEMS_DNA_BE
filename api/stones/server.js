@@ -13104,6 +13104,516 @@ app.get('/api/team/leaderboard', async (req, res) => {
 });
 
 /* =========================================================
+   Stone Offers — anonymous, salesperson-curated selections
+   ---------------------------------------------------------
+   A salesperson picks stones from inventory and generates ONE
+   opaque link to send a buyer. The public page is unbranded:
+   no company name, no website, no inventory source — only the
+   salesperson's alias + a WhatsApp CTA. The whole point is to
+   share stone details professionally without "burning" us.
+
+   Tables:
+     stone_offers           - one row per generated link (token,
+                              alias, toggles, expiry, revoke)
+     stone_offer_items      - SNAPSHOT of each stone at creation
+                              time (never a live FK to inventory,
+                              so nothing leaks beyond what was
+                              curated, and editing stock later
+                              can't change a sent offer)
+     stone_offer_responses  - buyer feedback (interested / reserve
+                              / question), per-item or whole-offer
+     stone_offer_events     - lightweight view analytics
+
+   The only public window is GET /api/public/offer/:token, which
+   hand-picks exactly which fields ship out (cert hidden unless the
+   offer opted in; internal SKU swapped for a temp ref when
+   hide_sku is on; price suppressed unless price_mode = 'show').
+   ========================================================= */
+let offersReady = false;
+const offersReadyPromise = (async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS stone_offers (
+        id SERIAL PRIMARY KEY,
+        token TEXT UNIQUE NOT NULL,
+        owner_user_id TEXT,
+        created_by TEXT,
+        alias TEXT,
+        contact_phone TEXT,
+        buyer_label TEXT,
+        title TEXT,
+        show_certificate BOOLEAN DEFAULT FALSE,
+        hide_sku BOOLEAN DEFAULT FALSE,
+        status TEXT DEFAULT 'active',
+        expires_at TIMESTAMP,
+        revoked_at TIMESTAMP,
+        last_viewed_at TIMESTAMP,
+        view_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS stone_offer_items (
+        id SERIAL PRIMARY KEY,
+        offer_id INTEGER NOT NULL REFERENCES stone_offers(id) ON DELETE CASCADE,
+        source_sku TEXT,
+        temp_ref TEXT,
+        position INTEGER DEFAULT 0,
+        shape TEXT,
+        carat NUMERIC,
+        color TEXT,
+        clarity TEXT,
+        lab TEXT,
+        cert_number TEXT,
+        measurements TEXT,
+        treatment TEXT,
+        origin TEXT,
+        category TEXT,
+        image_urls JSONB DEFAULT '[]'::jsonb,
+        video_url TEXT,
+        price NUMERIC,
+        price_mode TEXT DEFAULT 'on_request',
+        availability TEXT DEFAULT 'available',
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS stone_offer_responses (
+        id SERIAL PRIMARY KEY,
+        offer_id INTEGER NOT NULL REFERENCES stone_offers(id) ON DELETE CASCADE,
+        offer_item_id INTEGER REFERENCES stone_offer_items(id) ON DELETE CASCADE,
+        action TEXT NOT NULL,
+        buyer_name TEXT,
+        message TEXT,
+        ip TEXT,
+        user_agent TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS stone_offer_events (
+        id SERIAL PRIMARY KEY,
+        offer_id INTEGER NOT NULL REFERENCES stone_offers(id) ON DELETE CASCADE,
+        offer_item_id INTEGER REFERENCES stone_offer_items(id) ON DELETE CASCADE,
+        type TEXT NOT NULL,
+        ip TEXT,
+        user_agent TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_stone_offers_token ON stone_offers(token)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_stone_offers_owner ON stone_offers(owner_user_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_stone_offer_items_offer ON stone_offer_items(offer_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_stone_offer_responses_offer ON stone_offer_responses(offer_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_stone_offer_events_offer ON stone_offer_events(offer_id)`);
+    offersReady = true;
+    console.log('Stone offers tables ready');
+  } catch (err) {
+    console.error('Stone offers table creation error:', err);
+  }
+})();
+
+const ensureOffers = async (req, res, next) => {
+  if (!offersReady) { try { await offersReadyPromise; } catch (_) {} }
+  if (!offersReady) return res.status(503).json({ error: 'Offers tables not ready' });
+  next();
+};
+
+const VALID_OFFER_RESPONSE_ACTIONS = new Set(['interested', 'reserve_request', 'question', 'viewed']);
+const VALID_OFFER_EVENT_TYPES = new Set(['view', 'item_view', 'media_open']);
+
+// REF-1A2B3C — short, opaque, anonymous reference shown to buyers when the
+// offer hides the real SKU.
+function makeTempRef() {
+  return 'REF-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+}
+
+function isOfferUsable(offer) {
+  if (!offer) return false;
+  if (offer.revoked_at) return false;
+  if (offer.status && offer.status !== 'active') return false;
+  if (offer.expires_at && new Date(offer.expires_at).getTime() < Date.now()) return false;
+  return true;
+}
+
+// Normalise a soap_stones row into the curated public snapshot. This is the
+// ONLY place inventory columns are read for an offer — everything else lives
+// off the snapshot, so no field leaks unless it's listed here.
+function buildOfferItemSnapshot(stoneRow) {
+  if (!stoneRow) return {};
+  const images = [];
+  if (stoneRow.image) images.push(String(stoneRow.image).trim());
+  if (stoneRow.additional_pictures) {
+    for (const p of String(stoneRow.additional_pictures).split(';')) {
+      const t = p.trim();
+      if (t) images.push(t);
+    }
+  }
+  return {
+    shape: stoneRow.shape || null,
+    carat: stoneRow.weight != null && stoneRow.weight !== '' ? Number(stoneRow.weight) : null,
+    color: stoneRow.color || null,
+    clarity: stoneRow.clarity || null,
+    lab: stoneRow.lab || null,
+    certNumber: stoneRow.certificate_number || null,
+    measurements: stoneRow.measurements || null,
+    treatment: stoneRow.comment || null,
+    origin: stoneRow.origin || null,
+    category: stoneRow.category || null,
+    imageUrls: [...new Set(images.filter(Boolean))],
+    videoUrl: stoneRow.video || null,
+  };
+}
+
+// Shape a stored item row for the buyer, applying the offer's privacy toggles.
+function publicOfferItem(row, offer) {
+  const showCert = !!offer.show_certificate;
+  const showPrice = row.price_mode === 'show' && row.price != null;
+  return {
+    id: row.id,
+    reference: offer.hide_sku ? row.temp_ref : (row.source_sku || row.temp_ref),
+    shape: row.shape,
+    carat: row.carat != null ? Number(row.carat) : null,
+    color: row.color,
+    clarity: row.clarity,
+    lab: row.lab,
+    certNumber: showCert ? row.cert_number : null,
+    measurements: row.measurements,
+    treatment: row.treatment,
+    origin: row.origin,
+    category: row.category,
+    imageUrls: Array.isArray(row.image_urls) ? row.image_urls : [],
+    videoUrl: row.video_url,
+    price: showPrice ? Number(row.price) : null,
+    priceMode: showPrice ? 'show' : 'on_request',
+    availability: row.availability || 'available',
+  };
+}
+
+/* ---------- Offers: create / list / detail / patch / revoke (private) ---------- */
+app.post('/api/offers', ensureOffers, async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    const ownerId = ctx.tenantUserId || ctx.actorUserId || null;
+    const {
+      alias, contactPhone, buyerLabel, title,
+      showCertificate = false, hideSku = false,
+      expiresAt = null, items = [],
+    } = req.body || {};
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'At least one stone is required' });
+    }
+
+    const token = makeShareToken();
+    const offerRes = await pool.query(
+      `INSERT INTO stone_offers
+         (token, owner_user_id, created_by, alias, contact_phone, buyer_label, title,
+          show_certificate, hide_sku, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING *`,
+      [token, ownerId, ctx.actorUserId || null,
+       alias || ctx.actorName || ctx.memberName || null,
+       contactPhone || null, buyerLabel || null, title || null,
+       !!showCertificate, !!hideSku, expiresAt || null]
+    );
+    const offer = offerRes.rows[0];
+
+    let position = 0;
+    for (const it of items) {
+      const sku = it && it.sku ? String(it.sku) : null;
+      if (!sku) continue;
+      const sRes = await pool.query(`SELECT * FROM soap_stones WHERE sku = $1 LIMIT 1`, [sku]);
+      const snap = buildOfferItemSnapshot(sRes.rows[0]);
+      const priceMode = it.priceMode === 'show' ? 'show' : 'on_request';
+      const price = (priceMode === 'show' && it.price != null && it.price !== '')
+        ? Number(it.price) : null;
+      await pool.query(
+        `INSERT INTO stone_offer_items
+           (offer_id, source_sku, temp_ref, position,
+            shape, carat, color, clarity, lab, cert_number,
+            measurements, treatment, origin, category,
+            image_urls, video_url, price, price_mode, availability)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+        [offer.id, sku, makeTempRef(), position++,
+         snap.shape, snap.carat ?? null, snap.color, snap.clarity,
+         snap.lab, snap.certNumber,
+         snap.measurements, snap.treatment, snap.origin, snap.category,
+         JSON.stringify(snap.imageUrls || []), snap.videoUrl,
+         price, priceMode, (it.availability || 'available')]
+      );
+    }
+
+    res.json({ offer });
+  } catch (e) {
+    console.error('POST /api/offers error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/offers', ensureOffers, async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    const ownerId = ctx.tenantUserId || ctx.actorUserId || null;
+    const params = [ownerId];
+    let where = `owner_user_id = $1`;
+    // Owners see the whole workspace; reps see only the offers they created.
+    if (!ctx.isOwner) { params.push(ctx.actorUserId); where += ` AND created_by = $${params.length}`; }
+    const r = await pool.query(
+      `SELECT o.*,
+              (SELECT COUNT(*) FROM stone_offer_items i WHERE i.offer_id = o.id)::int AS item_count,
+              (SELECT COUNT(*) FROM stone_offer_responses r
+                 WHERE r.offer_id = o.id AND r.action <> 'viewed')::int AS response_count
+         FROM stone_offers o
+        WHERE ${where}
+        ORDER BY o.created_at DESC`,
+      params
+    );
+    res.json({ offers: r.rows });
+  } catch (e) {
+    console.error('GET /api/offers error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Ownership guard shared by detail/patch/revoke.
+async function loadOwnedOffer(req, id) {
+  const ctx = await resolveTeamContext(req);
+  const ownerId = ctx.tenantUserId || ctx.actorUserId || null;
+  const r = await pool.query(`SELECT * FROM stone_offers WHERE id = $1`, [id]);
+  const offer = r.rows[0];
+  if (!offer) return { offer: null, ctx };
+  if (offer.owner_user_id && offer.owner_user_id !== ownerId) return { offer: null, ctx };
+  if (!ctx.isOwner && offer.created_by && offer.created_by !== ctx.actorUserId) {
+    return { offer: null, ctx };
+  }
+  return { offer, ctx };
+}
+
+app.get('/api/offers/:id', ensureOffers, async (req, res) => {
+  try {
+    const { offer } = await loadOwnedOffer(req, req.params.id);
+    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+    const itemsR = await pool.query(
+      `SELECT * FROM stone_offer_items WHERE offer_id = $1 ORDER BY position ASC, id ASC`,
+      [offer.id]
+    );
+    const respR = await pool.query(
+      `SELECT * FROM stone_offer_responses WHERE offer_id = $1 ORDER BY created_at DESC LIMIT 200`,
+      [offer.id]
+    );
+    const viewsR = await pool.query(
+      `SELECT COALESCE(offer_item_id, 0) AS item_id, COUNT(*)::int AS views
+         FROM stone_offer_events WHERE offer_id = $1 GROUP BY offer_item_id`,
+      [offer.id]
+    );
+    res.json({ offer, items: itemsR.rows, responses: respR.rows, views: viewsR.rows });
+  } catch (e) {
+    console.error('GET /api/offers/:id error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch('/api/offers/:id', ensureOffers, async (req, res) => {
+  try {
+    const { offer } = await loadOwnedOffer(req, req.params.id);
+    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+
+    const b = req.body || {};
+    const sets = [];
+    const params = [];
+    const map = {
+      alias: 'alias', contactPhone: 'contact_phone', buyerLabel: 'buyer_label',
+      title: 'title', showCertificate: 'show_certificate', hideSku: 'hide_sku',
+      expiresAt: 'expires_at', status: 'status',
+    };
+    for (const [key, col] of Object.entries(map)) {
+      if (b[key] !== undefined) {
+        params.push(typeof b[key] === 'boolean' ? b[key] : (b[key] === '' ? null : b[key]));
+        sets.push(`${col} = $${params.length}`);
+      }
+    }
+    if (sets.length) {
+      params.push(offer.id);
+      await pool.query(
+        `UPDATE stone_offers SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`,
+        params
+      );
+    }
+
+    // Per-item display updates (price / price_mode / availability / position).
+    if (Array.isArray(b.items)) {
+      for (const it of b.items) {
+        if (!it || it.id == null) continue;
+        const isets = [];
+        const iparams = [];
+        if (it.priceMode !== undefined) {
+          const pm = it.priceMode === 'show' ? 'show' : 'on_request';
+          iparams.push(pm); isets.push(`price_mode = $${iparams.length}`);
+          const price = (pm === 'show' && it.price != null && it.price !== '') ? Number(it.price) : null;
+          iparams.push(price); isets.push(`price = $${iparams.length}`);
+        } else if (it.price !== undefined) {
+          iparams.push(it.price === '' || it.price == null ? null : Number(it.price));
+          isets.push(`price = $${iparams.length}`);
+        }
+        if (it.availability !== undefined) { iparams.push(it.availability); isets.push(`availability = $${iparams.length}`); }
+        if (it.position !== undefined) { iparams.push(Number(it.position) || 0); isets.push(`position = $${iparams.length}`); }
+        if (!isets.length) continue;
+        iparams.push(it.id, offer.id);
+        await pool.query(
+          `UPDATE stone_offer_items SET ${isets.join(', ')}
+            WHERE id = $${iparams.length - 1} AND offer_id = $${iparams.length}`,
+          iparams
+        );
+      }
+    }
+
+    const fresh = await pool.query(`SELECT * FROM stone_offers WHERE id = $1`, [offer.id]);
+    res.json({ offer: fresh.rows[0] });
+  } catch (e) {
+    console.error('PATCH /api/offers/:id error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/offers/:id/revoke', ensureOffers, async (req, res) => {
+  try {
+    const { offer } = await loadOwnedOffer(req, req.params.id);
+    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+    const r = await pool.query(
+      `UPDATE stone_offers SET status = 'revoked', revoked_at = NOW(), updated_at = NOW()
+        WHERE id = $1 RETURNING *`,
+      [offer.id]
+    );
+    res.json({ offer: r.rows[0] });
+  } catch (e) {
+    console.error('POST /api/offers/:id/revoke error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- Public offer endpoints (no auth) ---------- */
+app.get('/api/public/offer/:token', async (req, res) => {
+  try {
+    if (!offersReady) { try { await offersReadyPromise; } catch (_) {} }
+    const { token } = req.params;
+    const r = await pool.query(`SELECT * FROM stone_offers WHERE token = $1`, [token]);
+    const offer = r.rows[0];
+    if (!isOfferUsable(offer)) {
+      return res.status(410).json({ error: 'This selection is no longer active.' });
+    }
+
+    const itemsR = await pool.query(
+      `SELECT * FROM stone_offer_items WHERE offer_id = $1 ORDER BY position ASC, id ASC`,
+      [offer.id]
+    );
+
+    // View counter + throttled view event (once per IP per hour).
+    pool.query(
+      `UPDATE stone_offers SET view_count = view_count + 1, last_viewed_at = NOW() WHERE id = $1`,
+      [offer.id]
+    ).catch(() => {});
+    try {
+      const ip = getRequestIp(req);
+      const ua = req.headers['user-agent'] || null;
+      const recent = await pool.query(
+        `SELECT 1 FROM stone_offer_events
+          WHERE offer_id = $1 AND type = 'view' AND ip = $2
+            AND created_at > NOW() - INTERVAL '1 hour' LIMIT 1`,
+        [offer.id, ip]
+      );
+      if (!recent.rows.length) {
+        await pool.query(
+          `INSERT INTO stone_offer_events (offer_id, type, ip, user_agent) VALUES ($1,'view',$2,$3)`,
+          [offer.id, ip, ua]
+        );
+      }
+    } catch (_) {}
+
+    res.json({
+      offer: {
+        alias: offer.alias,
+        title: offer.title,
+        contactPhone: offer.contact_phone,
+        createdAt: offer.created_at,
+      },
+      items: itemsR.rows.map((row) => publicOfferItem(row, offer)),
+    });
+  } catch (e) {
+    console.error('GET /api/public/offer/:token error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/public/offer/:token/respond', async (req, res) => {
+  try {
+    if (!offersReady) { try { await offersReadyPromise; } catch (_) {} }
+    const { token } = req.params;
+    const { action, offerItemId, buyerName, message } = req.body || {};
+    if (!VALID_OFFER_RESPONSE_ACTIONS.has(action) || action === 'viewed') {
+      return res.status(400).json({ error: 'Invalid action' });
+    }
+    const r = await pool.query(`SELECT * FROM stone_offers WHERE token = $1`, [token]);
+    const offer = r.rows[0];
+    if (!isOfferUsable(offer)) {
+      return res.status(410).json({ error: 'This selection is no longer active.' });
+    }
+    const ip = getRequestIp(req);
+    const ua = req.headers['user-agent'] || null;
+    const ins = await pool.query(
+      `INSERT INTO stone_offer_responses (offer_id, offer_item_id, action, buyer_name, message, ip, user_agent)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [offer.id, offerItemId || null, action, buyerName || null, message || null, ip, ua]
+    );
+    res.json({ response: ins.rows[0] });
+
+    // Mirror into the workspace activity feed so the salesperson sees it.
+    try {
+      const who = buyerName ? `Buyer (${buyerName})` : 'Buyer';
+      const verb = {
+        interested: 'is interested in a stone',
+        reserve_request: 'requested to reserve a stone',
+        question: 'asked a question',
+      }[action] || action;
+      logActivity({
+        userId:     offer.owner_user_id,
+        actorId:    null,
+        actorName:  who,
+        entityType: 'stone_offer',
+        entityId:   offer.id,
+        action:     `offer_${action}`,
+        summary:    `${who} ${verb}${offer.title ? ` on "${offer.title}"` : ''}`,
+        changes:    message ? { message: { from: null, to: message } } : null,
+      });
+    } catch (_) {}
+  } catch (e) {
+    console.error('POST /api/public/offer/:token/respond error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/public/offer/:token/track', async (req, res) => {
+  try {
+    if (!offersReady) { try { await offersReadyPromise; } catch (_) {} }
+    const { token } = req.params;
+    const { type, offerItemId } = req.body || {};
+    if (!VALID_OFFER_EVENT_TYPES.has(type)) return res.status(204).end();
+    const r = await pool.query(`SELECT id, status, revoked_at, expires_at FROM stone_offers WHERE token = $1`, [token]);
+    const offer = r.rows[0];
+    if (!isOfferUsable(offer)) return res.status(204).end();
+    await pool.query(
+      `INSERT INTO stone_offer_events (offer_id, offer_item_id, type, ip, user_agent)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [offer.id, offerItemId || null, type, getRequestIp(req), req.headers['user-agent'] || null]
+    ).catch(() => {});
+    res.status(204).end();
+  } catch (e) {
+    res.status(204).end();
+  }
+});
+
+/* =========================================================
    Start server
    ========================================================= */
 app.listen(port, () => {
