@@ -320,6 +320,24 @@ const run = async (options = {}) => {
       "cert_comments", "origin", "grouping_type", "box", "stones", "raw_xml",
     ];
 
+    // 🛟 Preserve manually-maintained sales fields across the truncate.
+    // cost_per_carat and holder never come from SOAP (they're loaded from a
+    // CSV via importSalesFields.js), and location is usually empty in SOAP —
+    // so snapshot them by SKU now and re-apply after the reload, otherwise
+    // every 5-hour sync would wipe them.
+    let preservedSalesFields = [];
+    try {
+      const snap = await dbPool.query(
+        `SELECT sku, cost_per_carat, holder, location
+           FROM soap_stones
+          WHERE cost_per_carat IS NOT NULL OR holder IS NOT NULL OR location IS NOT NULL`
+      );
+      preservedSalesFields = snap.rows;
+      console.log(`🛟 Preserving sales fields for ${preservedSalesFields.length} stones across sync`);
+    } catch (e) {
+      console.warn('⚠️  Could not snapshot sales fields (continuing):', e.message);
+    }
+
     onProgress({ phase: 'clearing', progress: 35, detail: 'Clearing old data...', totalStones: stoneArray.length, processedStones: 0 });
     console.log("🧹 [4/6] Clearing soap_stones table...");
     await dbPool.query("TRUNCATE TABLE soap_stones RESTART IDENTITY");
@@ -367,6 +385,35 @@ const run = async (options = {}) => {
         totalStones: stoneArray.length, 
         processedStones 
       });
+    }
+
+    // 🛟 Re-apply the preserved manual sales fields. SOAP wins for location
+    // when it actually provides one; otherwise (and always for cost/holder)
+    // the manual value is restored.
+    if (preservedSalesFields.length) {
+      console.log(`🛟 Restoring sales fields for ${preservedSalesFields.length} stones...`);
+      let restored = 0;
+      for (let i = 0; i < preservedSalesFields.length; i += CHUNK_SIZE) {
+        const chunk = preservedSalesFields.slice(i, i + CHUNK_SIZE);
+        const ph = chunk
+          .map((_, ri) => {
+            const b = ri * 4;
+            return `($${b + 1}::text,$${b + 2}::numeric,$${b + 3}::text,$${b + 4}::text)`;
+          })
+          .join(", ");
+        const flat = chunk.flatMap((r) => [r.sku, r.cost_per_carat, r.holder, r.location]);
+        const r = await dbPool.query(
+          `UPDATE soap_stones AS s SET
+             cost_per_carat = COALESCE(s.cost_per_carat, v.cpc),
+             holder         = COALESCE(s.holder, v.hold),
+             location       = COALESCE(NULLIF(s.location, ''), v.loc)
+           FROM (VALUES ${ph}) AS v(sku, cpc, hold, loc)
+           WHERE s.sku = v.sku`,
+          flat
+        );
+        restored += r.rowCount || 0;
+      }
+      console.log(`🛟 Restored sales fields on ${restored} stones.`);
     }
 
     onProgress({ phase: 'complete', progress: 100, detail: `Successfully synced ${stoneArray.length} stones!`, totalStones: stoneArray.length, processedStones: stoneArray.length });

@@ -71,9 +71,13 @@ export const soapStones = pgTable("soap_stones", {
   rapPrice: numeric("rap_price"),
   rapListPrice: numeric("rap_list_price"),
   totalPrice: numeric("total_price"),
+  // Internal cost basis (per carat) — sales page only, never exposed publicly.
+  costPerCarat: numeric("cost_per_carat"),
 
   location: text("location"),
   branch: text("branch"),
+  // Physical custodian of the stone (e.g. a person/desk holding it).
+  holder: text("holder"),
 
   image: text("image"),
   additionalPictures: text("additional_pictures"),
