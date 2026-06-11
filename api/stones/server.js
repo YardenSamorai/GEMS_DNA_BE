@@ -12821,10 +12821,12 @@ app.post('/api/team/members', async (req, res) => {
       // (or "GEMS DNA Workshop") as the workspace label.
       const workspaceName = inviter?.name ? `${inviter.name}'s workshop` : 'GEMS DNA Workshop';
 
-      // Skip email for owner role — that's the admin themselves.
+      // Skip email for owner role — that's the admin themselves. Every other
+      // role (rep / salesman / manager / store_user) gets a Clerk invite +
+      // onboarding email so they can actually sign up and sign in.
       let emailResult = { ok: false, skipped: true };
       let inviteResult = { ok: false, skipped: true };
-      if (role === 'rep' || role === 'store_user') {
+      if (role !== 'owner') {
         // Where do we send them after they finish signing up?
         // Reps land in the dashboard; store users land directly in the portal.
         const postSignUpRedirect =
