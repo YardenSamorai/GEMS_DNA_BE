@@ -144,6 +144,54 @@ function diffRows(before, after, keys) {
      signs up: when the rep first signs in, we backfill clerk_user_id
      by email and they instantly join the team.
    ========================================================= */
+// ---------------------------------------------------------------------------
+// Roles & permissions (per-user, admin-configurable).
+//
+//   Roles: 'owner' (=admin, sees everything), 'manager', 'salesman'
+//          (legacy 'rep' == salesman), 'store_user'.
+//   Every non-admin member carries a `permissions` object:
+//     sections     -> which nav sections they may open (FE gate)
+//     locationView -> how much stone-location detail they get; enforced
+//                     server-side so exactLocation/holder never leave the API.
+// ---------------------------------------------------------------------------
+const NAV_SECTION_KEYS = ['dashboard', 'inventory', 'jewelry', 'crm', 'sales', 'offers', 'team', 'tools'];
+const LOCATION_VIEWS = ['full', 'memo_branch', 'branch_only'];
+
+// Defaults for a freshly-invited member; the admin tweaks these afterwards.
+const DEFAULT_PERMISSIONS = { sections: ['sales'], locationView: 'branch_only' };
+// Admins (workspace owner) implicitly get everything.
+const ADMIN_PERMISSIONS = { sections: [...NAV_SECTION_KEYS], locationView: 'full' };
+
+const normalizePermissions = (raw) => {
+  let p = raw;
+  if (typeof p === 'string') { try { p = JSON.parse(p); } catch { p = null; } }
+  if (!p || typeof p !== 'object') p = {};
+  const sections = Array.isArray(p.sections)
+    ? p.sections.filter((s) => NAV_SECTION_KEYS.includes(s))
+    : [...DEFAULT_PERMISSIONS.sections];
+  const locationView = LOCATION_VIEWS.includes(p.locationView)
+    ? p.locationView
+    : DEFAULT_PERMISSIONS.locationView;
+  return { sections, locationView };
+};
+
+// In-house locations that are NOT a memo. Anything else with an exactLocation
+// is "out on memo". Mirrors the FE LOCATION_MAP so onMemo can be computed once,
+// server-side, letting us hide the exact place from restricted users.
+const IN_HOUSE_LOCATIONS = new Set([
+  'EMERALD OFFICE', 'OFFICE', 'ESHED DIAM INC - EY', 'ESHED DIAM INC - NY',
+  'EL - ESHED DIAM INC (LA)', 'ESHED DIAM HK EMERALDS', 'ESHED DIAM (HK) LTD',
+  'ESHED DESIGNS LTD', 'FACTORY', 'FACTORY OILED', 'FACTORY - EY', 'FACTORY NEW',
+]);
+const normLocBE = (v) => String(v || '').trim().replace(/\s+/g, ' ').toUpperCase();
+// soap_stones.location holds the exact/physical place — on memo when it's set
+// and not one of our own in-house locations.
+const computeOnMemo = (exactLocationRaw) => {
+  const raw = exactLocationRaw && String(exactLocationRaw).trim();
+  if (!raw) return false;
+  return !IN_HOUSE_LOCATIONS.has(normLocBE(raw));
+};
+
 async function resolveTeamContext(req) {
   const actorId =
     (req?.headers?.['x-actor-id'] && String(req.headers['x-actor-id']).trim()) ||
@@ -164,6 +212,7 @@ async function resolveTeamContext(req) {
     return {
       tenantUserId: null, actorUserId: null,
       role: null, memberId: null, memberName: null,
+      permissions: ADMIN_PERMISSIONS,
       isOwner: true, actorName: headerActorName,
     };
   }
@@ -218,6 +267,9 @@ async function resolveTeamContext(req) {
       // Sprint 4 — store_users are scoped to a single retail store.
       // The portal endpoints use this to filter memos.
       companyId:    m.company_id || null,
+      // Roles & permissions — admins get everything; everyone else uses the
+      // per-user set the admin configured.
+      permissions:  m.role === 'owner' ? ADMIN_PERMISSIONS : normalizePermissions(m.permissions),
       isOwner:      m.role === 'owner',
       isStoreUser:  m.role === 'store_user',
       actorName:    headerActorName || m.name,
@@ -231,6 +283,7 @@ async function resolveTeamContext(req) {
     role:         'owner',
     memberId:     null,
     memberName:   null,
+    permissions:  ADMIN_PERMISSIONS,
     isOwner:      true,
     actorName:    headerActorName,
   };
@@ -346,13 +399,15 @@ app.get("/api/soap-stones", async (req, res) => {
     const ctx = await resolveTeamContext(req);
     const ownerId = ctx.tenantUserId || ctx.actorUserId || null;
 
-    // What does the caller *want*?
+    // The sales catalog is shared — every signed-in user sees every stone.
+    // Per-user limits govern which *pages* they can open and how much *location
+    // detail* they see (below), not which stones exist.
     let assignedFilter = req.query?.assignedTo ? String(req.query.assignedTo) : null;
     if (assignedFilter === 'me') assignedFilter = ctx.actorUserId;
-    // Reps can only ever see their own + unassigned, regardless of filter.
-    if (!ctx.isOwner && assignedFilter && assignedFilter !== 'unassigned' && assignedFilter !== ctx.actorUserId) {
-      assignedFilter = ctx.actorUserId;
-    }
+    if (assignedFilter === 'all') assignedFilter = null; // 'all' == no explicit filter
+
+    // How much location detail this viewer is allowed to see.
+    const locView = ctx.permissions?.locationView || 'full';
 
     const whereClauses = [`s.sku IS NOT NULL`];
     const params = [];
@@ -361,21 +416,10 @@ app.get("/api/soap-stones", async (req, res) => {
     if (ownerId) params.push(ownerId);
     const ownerParamIdx = ownerId ? params.length : null;
 
-    // Visibility scope: admin sees all; rep sees their own claimed stones
-    // PLUS every unclaimed stone in the workshop. Stones are inventory the
-    // rep needs to *sell* — keeping them invisible until manually assigned
-    // would mean the rep has nothing to offer customers. CRM data follows
-    // a stricter policy (only explicit assignments) because it's customer
-    // relationships, not stock.
-    if (ownerId && !ctx.isOwner) {
-      params.push(ctx.actorUserId);
-      whereClauses.push(`(sa.assigned_to IS NULL OR sa.assigned_to = $${params.length})`);
-    }
-
-    // Optional explicit filter from the UI.
+    // Optional explicit assignment filter from the UI (e.g. "assigned to me").
     if (assignedFilter === 'unassigned') {
       whereClauses.push(`sa.assigned_to IS NULL`);
-    } else if (assignedFilter && assignedFilter !== 'all') {
+    } else if (assignedFilter) {
       params.push(assignedFilter);
       whereClauses.push(`sa.assigned_to = $${params.length}`);
     }
@@ -397,11 +441,21 @@ app.get("/api/soap-stones", async (req, res) => {
     const result = await pool.query(sql, params);
 
     const stones = result.rows.map((row) => {
-      // בחירת תמונה ראשית
-      let imageUrl = row.image;
+      // בחירת תמונה ראשית.
+      // Many rows carry a folder-only URL (".../StoneImages/") with no
+      // filename — the Barak export emits the directory even when no photo
+      // was uploaded, so the URL 404s. Require a filename after the last
+      // slash; otherwise treat as missing and fall back to additional pics.
+      const pickImg = (u) => {
+        if (!u || typeof u !== "string") return null;
+        const t = u.trim();
+        if (!t) return null;
+        const file = t.split("?")[0].split("/").pop();
+        return file ? t : null;
+      };
+      let imageUrl = pickImg(row.image);
       if (!imageUrl && row.additional_pictures) {
-        const first = row.additional_pictures.split(";")[0];
-        imageUrl = first ? first.trim() : null;
+        imageUrl = pickImg(row.additional_pictures.split(";")[0]);
       }
 
       return {
@@ -465,9 +519,28 @@ app.get("/api/soap-stones", async (req, res) => {
         // 📍 Location — חשיפה דו-שכבתית:
         //  - `location` נשמר תואם-אחורה (= branch). שאר ה-UI מסתמך על זה.
         //  - `branch` ו-`exactLocation` חדשים: סניף ומיקום פיזי מדויק בנפרד.
+        //
+        // Per-user masking (locationView) — note `holder` (HOLD) is ALWAYS
+        // shown; only the exact place is hidden for restricted viewers:
+        //   full        -> exact place + memo status.
+        //   memo_branch -> branch only, but DO reveal that it's on memo.
+        //   branch_only -> branch only, don't even reveal the memo status.
+        // exactLocation is nulled here so the precise place never leaves the
+        // API for restricted users (the FE can't show what it never received).
         location: row.branch || null,
         branch: row.branch || null,
-        exactLocation: row.location || null,
+        exactLocation: locView === 'full' ? (row.location || null) : null,
+        // Who is physically holding the stone (sales page) — visible to everyone.
+        holder: row.holder || null,
+        // Lets the FE show a "MEMO OUT" badge with the branch label when the
+        // exact place is hidden. Suppressed entirely for branch_only.
+        onMemo: locView === 'branch_only' ? false : computeOnMemo(row.location),
+
+        // Internal cost basis per carat — sales page only.
+        costPerCt:
+          row.cost_per_carat !== null && row.cost_per_carat !== undefined
+            ? Number(row.cost_per_carat)
+            : null,
 
         // Diamond specific fields (camelCase for frontend)
         cut: row.cut || "",
@@ -2160,6 +2233,16 @@ const crmReadyPromise = (async () => {
     // companyId so the portal endpoints can scope queries automatically.
     await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS company_id      INTEGER`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_team_members_company_id ON team_members(company_id) WHERE company_id IS NOT NULL`);
+    // Roles & permissions — per-user, admin-configurable visibility.
+    //   permissions.sections     = which nav sections the member can open
+    //                              (FE gate; admin sees everything).
+    //   permissions.locationView = how much stone-location detail they get
+    //                              ('full' | 'memo_branch' | 'branch_only').
+    //                              Enforced server-side so exactLocation/holder
+    //                              never leave the API for restricted users.
+    // (region kept as a dead column for back-compat; no longer used.)
+    await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS region          TEXT`);
+    await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS permissions     JSONB`);
     await pool.query(`UPDATE team_members SET invited_at = created_at WHERE invited_at IS NULL`);
 
     // Loose-stone assignments. We keep this in a separate table because
@@ -12544,7 +12627,7 @@ app.get('/api/team/me', async (req, res) => {
     const all = await pool.query(
       `SELECT id, team_owner_id, clerk_user_id, email, name, role,
               avatar_color, commission_pct, quota_monthly, active,
-              company_id,
+              company_id, region, permissions,
               created_at, updated_at,
               invited_at, last_invited_at, invite_count,
               (clerk_user_id IS NULL) AS pending
@@ -12574,6 +12657,8 @@ app.get('/api/team/me', async (req, res) => {
       isOwner:      role === 'owner',
       isStoreUser,
       companyId:    me?.company_id || null,
+      // Admins implicitly get everything; everyone else uses their stored set.
+      permissions:  role === 'owner' ? ADMIN_PERMISSIONS : normalizePermissions(me?.permissions),
     });
   } catch (e) {
     console.error('GET /api/team/me error:', e);
@@ -12590,6 +12675,7 @@ app.get('/api/team/members', async (req, res) => {
     const r = await pool.query(
       `SELECT id, team_owner_id, clerk_user_id, email, name, role,
               avatar_color, commission_pct, quota_monthly, active,
+              company_id, region, permissions,
               created_at, updated_at,
               invited_at, last_invited_at, invite_count,
               (clerk_user_id IS NULL) AS pending
@@ -12615,10 +12701,14 @@ app.post('/api/team/members', async (req, res) => {
     await ensureOwnerRow(ctx);
     if (!ctx.isOwner) return res.status(403).json({ error: 'Only the workspace owner can invite members' });
 
-    const { email, name, role = 'rep', commissionPct, quotaMonthly, avatarColor, companyId } = req.body || {};
+    const { email, name, role = 'salesman', commissionPct, quotaMonthly, avatarColor, companyId, permissions } = req.body || {};
     if (!email || !String(email).trim()) return res.status(400).json({ error: 'email is required' });
     if (!name || !String(name).trim())  return res.status(400).json({ error: 'name is required' });
-    if (!['rep', 'owner', 'store_user'].includes(role)) return res.status(400).json({ error: 'invalid role' });
+    if (!['rep', 'salesman', 'manager', 'owner', 'store_user'].includes(role)) return res.status(400).json({ error: 'invalid role' });
+    // Per-user permissions (store_users use company scoping instead). Stored as
+    // JSONB; admins implicitly get everything so their stored value is moot.
+    const memberPerms = role === 'store_user' ? null : normalizePermissions(permissions);
+    const memberPermsJson = memberPerms ? JSON.stringify(memberPerms) : null;
 
     const ownerId = ctx.tenantUserId || ctx.actorUserId;
 
@@ -12673,6 +12763,7 @@ app.post('/api/team/members', async (req, res) => {
                   commission_pct  = $4,
                   quota_monthly   = $5,
                   company_id      = $6,
+                  permissions     = $7,
                   invited_at      = NOW(),
                   last_invited_at = NOW(),
                   invite_count    = COALESCE(invite_count, 0) + 1,
@@ -12680,7 +12771,7 @@ app.post('/api/team/members', async (req, res) => {
                   -- the new rep gets re-linked cleanly on their first sign-in.
                   clerk_user_id   = NULL,
                   updated_at      = NOW()
-            WHERE id = $7
+            WHERE id = $8
             RETURNING *`,
           [
             String(name).trim(),
@@ -12689,6 +12780,7 @@ app.post('/api/team/members', async (req, res) => {
             Number(commissionPct) || 0,
             Number(quotaMonthly)  || 0,
             role === 'store_user' ? Number(companyId) : null,
+            memberPermsJson,
             prior.id,
           ]
         );
@@ -12696,8 +12788,8 @@ app.post('/api/team/members', async (req, res) => {
       } else {
         const ins = await pool.query(
           `INSERT INTO team_members
-             (team_owner_id, email, name, role, avatar_color, commission_pct, quota_monthly, company_id, active, invited_at, last_invited_at, invite_count)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, NOW(), NOW(), 1)
+             (team_owner_id, email, name, role, avatar_color, commission_pct, quota_monthly, company_id, permissions, active, invited_at, last_invited_at, invite_count)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, NOW(), NOW(), 1)
            RETURNING *`,
           [
             ownerId,
@@ -12708,6 +12800,7 @@ app.post('/api/team/members', async (req, res) => {
             Number(commissionPct) || 0,
             Number(quotaMonthly)  || 0,
             role === 'store_user' ? Number(companyId) : null,
+            memberPermsJson,
           ]
         );
         member = ins.rows[0];
@@ -12834,18 +12927,31 @@ app.put('/api/team/members/:id', async (req, res) => {
       quotaMonthly:  'quota_monthly',
       active: 'active',
     };
+
+    const nextRole = req.body.role;
+    if (nextRole !== undefined && !['rep', 'salesman', 'manager', 'owner'].includes(nextRole)) {
+      return res.status(400).json({ error: 'invalid role' });
+    }
+
     const sets = [];
     const params = [];
     let p = 1;
     for (const [k, col] of Object.entries(allowed)) {
       if (req.body[k] !== undefined) {
-        if (col === 'role' && !['rep', 'owner'].includes(req.body[k])) {
-          return res.status(400).json({ error: 'invalid role' });
-        }
+        let val = req.body[k];
+        if (col === 'email') val = String(val).trim().toLowerCase();
         sets.push(`${col} = $${p++}`);
-        params.push(col === 'email' ? String(req.body[k]).trim().toLowerCase() : req.body[k]);
+        params.push(val);
       }
     }
+
+    // Per-user permissions (JSONB) — accept the whole object and normalize it
+    // so we never persist unknown section keys or an invalid locationView.
+    if (req.body.permissions !== undefined) {
+      sets.push(`permissions = $${p++}`);
+      params.push(JSON.stringify(normalizePermissions(req.body.permissions)));
+    }
+
     if (!sets.length) return res.status(400).json({ error: 'no fields to update' });
     sets.push(`updated_at = NOW()`);
 
