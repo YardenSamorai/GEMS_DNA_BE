@@ -2245,6 +2245,17 @@ const crmReadyPromise = (async () => {
     await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS permissions     JSONB`);
     await pool.query(`UPDATE team_members SET invited_at = created_at WHERE invited_at IS NULL`);
 
+    // Manual sales-only fields on soap_stones. These never come from SOAP, so
+    // they're added here (columns survive the sync's TRUNCATE; importFromSoap
+    // snapshots/restores their values). holder = physical custodian ("HOLD"),
+    // cost_per_carat = internal cost basis (never exposed publicly).
+    try {
+      await pool.query(`ALTER TABLE soap_stones ADD COLUMN IF NOT EXISTS holder         TEXT`);
+      await pool.query(`ALTER TABLE soap_stones ADD COLUMN IF NOT EXISTS cost_per_carat NUMERIC`);
+    } catch (e) {
+      console.warn('⚠️  Could not ensure soap_stones sales columns:', e.message);
+    }
+
     // Loose-stone assignments. We keep this in a separate table because
     // soap_stones is synced from an external source — adding columns there
     // risks getting wiped on the next sync. Stones with no row here are
