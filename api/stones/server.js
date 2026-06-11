@@ -520,21 +520,24 @@ app.get("/api/soap-stones", async (req, res) => {
         //  - `location` נשמר תואם-אחורה (= branch). שאר ה-UI מסתמך על זה.
         //  - `branch` ו-`exactLocation` חדשים: סניף ומיקום פיזי מדויק בנפרד.
         //
-        // Per-user masking (locationView) — note `holder` (HOLD) is ALWAYS
-        // shown; only the exact place is hidden for restricted viewers:
-        //   full        -> exact place + memo status.
-        //   memo_branch -> branch only, but DO reveal that it's on memo.
-        //   branch_only -> branch only, don't even reveal the memo status.
+        // Per-user masking (locationView):
+        //   full        -> exact place + holder name + memo/hold status.
+        //   memo_branch -> branch only (no exact), holder name + memo/hold.
+        //   branch_only -> branch only, status flags ONLY: the viewer learns
+        //                  the stone is on memo / on hold, but never the exact
+        //                  place nor WHO holds it (holder name is hidden).
         // exactLocation is nulled here so the precise place never leaves the
         // API for restricted users (the FE can't show what it never received).
         location: row.branch || null,
         branch: row.branch || null,
         exactLocation: locView === 'full' ? (row.location || null) : null,
-        // Who is physically holding the stone (sales page) — visible to everyone.
-        holder: row.holder || null,
-        // Lets the FE show a "MEMO OUT" badge with the branch label when the
-        // exact place is hidden. Suppressed entirely for branch_only.
-        onMemo: locView === 'branch_only' ? false : computeOnMemo(row.location),
+        // Holder NAME — visible for full/memo_branch; hidden for branch_only
+        // (they get the name-less `onHold` flag below instead).
+        holder: locView === 'branch_only' ? null : (row.holder || null),
+        // Status flags drive the FE "Memo out" / "On hold" badges. Memo status
+        // is now revealed in every tier (only the exact place is masked).
+        onMemo: computeOnMemo(row.location),
+        onHold: !!(row.holder && String(row.holder).trim()),
 
         // Internal cost basis per carat — sales page only.
         costPerCt:
