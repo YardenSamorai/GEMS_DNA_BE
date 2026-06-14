@@ -157,14 +157,33 @@ function diffRows(before, after, keys) {
 //     sections     -> which nav sections they may open (FE gate)
 //     locationView -> how much stone-location detail they get; enforced
 //                     server-side so exactLocation/holder never leave the API.
+//     canViewCost  -> optional boolean override for internal cost / margin
+//                     visibility. Absent => role default (manager yes, salesman
+//                     no). Explicit true/false lets the admin grant a trusted
+//                     salesman cost access, or revoke it from a manager.
+//
+//   locationView tiers (most → least detail), all enforced in /api/soap-stones:
+//     full        -> exact place + holder name + memo/hold status + branch
+//     memo_branch -> branch + holder name + memo/hold status (no exact place)
+//     branch_only -> branch + memo/hold status flags (no exact, no holder name)
+//     status_only -> memo/hold status flags ONLY (no branch, holder or exact)
+//     hidden       -> nothing: no location data at all
 // ---------------------------------------------------------------------------
 const NAV_SECTION_KEYS = ['dashboard', 'inventory', 'crm', 'sales', 'team', 'tools'];
-const LOCATION_VIEWS = ['full', 'memo_branch', 'branch_only'];
+const LOCATION_VIEWS = ['full', 'memo_branch', 'branch_only', 'status_only', 'hidden'];
 
 // Defaults for a freshly-invited member; the admin tweaks these afterwards.
 const DEFAULT_PERMISSIONS = { sections: ['sales'], locationView: 'branch_only' };
 // Admins (workspace owner) implicitly get everything.
 const ADMIN_PERMISSIONS = { sections: [...NAV_SECTION_KEYS], locationView: 'full' };
+
+// Admin-tier roles get the same full, tenant-wide access as the workshop owner
+// (all data, all sections, cost/margin, full location detail, team management).
+// 'owner' is the single workshop owner; 'admin' is a grantable equivalent.
+const isAdminRole = (role) => role === 'owner' || role === 'admin';
+// Roles an admin may assign to a member. 'owner' is never assignable — there is
+// exactly one workshop owner, seeded lazily — and store_user is set elsewhere.
+const ASSIGNABLE_ROLES = ['rep', 'salesman', 'manager', 'admin', 'store_user'];
 
 const normalizePermissions = (raw) => {
   let p = raw;
@@ -176,7 +195,11 @@ const normalizePermissions = (raw) => {
   const locationView = LOCATION_VIEWS.includes(p.locationView)
     ? p.locationView
     : DEFAULT_PERMISSIONS.locationView;
-  return { sections, locationView };
+  const out = { sections, locationView };
+  // Only persist canViewCost when it's an explicit boolean — leaving it absent
+  // means "fall back to the role default" (handled where cost is masked).
+  if (typeof p.canViewCost === 'boolean') out.canViewCost = p.canViewCost;
+  return out;
 };
 
 // In-house locations that are NOT a memo. Anything else with an exactLocation
@@ -217,7 +240,7 @@ async function resolveTeamContext(req) {
       tenantUserId: null, actorUserId: null,
       role: null, memberId: null, memberName: null,
       permissions: ADMIN_PERMISSIONS,
-      isOwner: true, actorName: headerActorName,
+      isOwner: true, isWorkshopOwner: true, actorName: headerActorName,
     };
   }
 
@@ -271,10 +294,14 @@ async function resolveTeamContext(req) {
       // Sprint 4 — store_users are scoped to a single retail store.
       // The portal endpoints use this to filter memos.
       companyId:    m.company_id || null,
-      // Roles & permissions — admins get everything; everyone else uses the
-      // per-user set the admin configured.
-      permissions:  m.role === 'owner' ? ADMIN_PERMISSIONS : normalizePermissions(m.permissions),
-      isOwner:      m.role === 'owner',
+      // Roles & permissions — admin-tier roles get everything; everyone else
+      // uses the per-user set the admin configured.
+      permissions:  isAdminRole(m.role) ? ADMIN_PERMISSIONS : normalizePermissions(m.permissions),
+      // `isOwner` is the master "full access" flag used by every data gate, so
+      // an admin is treated exactly like the workshop owner. `isWorkshopOwner`
+      // stays reserved for the single real owner (protects them from demotion).
+      isOwner:      isAdminRole(m.role),
+      isWorkshopOwner: m.role === 'owner',
       isStoreUser:  m.role === 'store_user',
       actorName:    headerActorName || m.name,
     };
@@ -289,6 +316,7 @@ async function resolveTeamContext(req) {
     memberName:   null,
     permissions:  ADMIN_PERMISSIONS,
     isOwner:      true,
+    isWorkshopOwner: true,
     actorName:    headerActorName,
   };
 }
@@ -721,9 +749,20 @@ app.get("/api/soap-stones", async (req, res) => {
 
     // How much location detail this viewer is allowed to see.
     const locView = ctx.permissions?.locationView || 'full';
-    // Internal cost is owner/manager-only — never leaves the API for anyone
-    // else (a salesman must not learn the margin).
-    const canSeeCost = !!ctx.isOwner || ctx.role === 'manager';
+    // Which slices of location data each tier may receive. Computed once and
+    // applied per-row below so exactLocation/holder/branch/status never leave
+    // the API for a viewer who isn't entitled to them.
+    const showExact  = locView === 'full';
+    const showHolder = locView === 'full' || locView === 'memo_branch';
+    const showBranch = locView === 'full' || locView === 'memo_branch' || locView === 'branch_only';
+    const showStatus = locView !== 'hidden';
+    // Internal cost / margin. Owner always; otherwise the per-user override wins,
+    // and if it's absent we fall back to the historic role default (managers see
+    // cost, salesmen never do).
+    const permCost = ctx.permissions?.canViewCost;
+    const canSeeCost = !!ctx.isOwner
+      || permCost === true
+      || (permCost !== false && ctx.role === 'manager');
 
     const whereClauses = [`s.sku IS NOT NULL`];
     const params = [];
@@ -836,24 +875,20 @@ app.get("/api/soap-stones", async (req, res) => {
         //  - `location` נשמר תואם-אחורה (= branch). שאר ה-UI מסתמך על זה.
         //  - `branch` ו-`exactLocation` חדשים: סניף ומיקום פיזי מדויק בנפרד.
         //
-        // Per-user masking (locationView):
-        //   full        -> exact place + holder name + memo/hold status.
-        //   memo_branch -> branch only (no exact), holder name + memo/hold.
-        //   branch_only -> branch only, status flags ONLY: the viewer learns
-        //                  the stone is on memo / on hold, but never the exact
-        //                  place nor WHO holds it (holder name is hidden).
-        // exactLocation is nulled here so the precise place never leaves the
-        // API for restricted users (the FE can't show what it never received).
-        location: row.branch || null,
-        branch: row.branch || null,
-        exactLocation: locView === 'full' ? (row.location || null) : null,
-        // Holder NAME — visible for full/memo_branch; hidden for branch_only
-        // (they get the name-less `onHold` flag below instead).
-        holder: locView === 'branch_only' ? null : (row.holder || null),
-        // Status flags drive the FE "Memo out" / "On hold" badges. Memo status
-        // is now revealed in every tier (only the exact place is masked).
-        onMemo: computeOnMemo(row.location),
-        onHold: !!(row.holder && String(row.holder).trim()),
+        // Per-user masking (locationView) — see the LOCATION_VIEWS tier table
+        // up top. Each slice is gated by the show* flags computed above so the
+        // precise place / holder / branch / status never leave the API for a
+        // viewer who isn't entitled to it (the FE can't show what it never got).
+        location: showBranch ? (row.branch || null) : null,
+        branch: showBranch ? (row.branch || null) : null,
+        exactLocation: showExact ? (row.location || null) : null,
+        // Holder NAME — full / memo_branch only. Lower tiers still get the
+        // name-less `onHold` flag (when status is visible).
+        holder: showHolder ? (row.holder || null) : null,
+        // Status flags drive the FE "Memo out" / "On hold" badges. Visible in
+        // every tier except `hidden`, which conceals location entirely.
+        onMemo: showStatus ? computeOnMemo(row.location) : false,
+        onHold: showStatus ? !!(row.holder && String(row.holder).trim()) : false,
 
         // Internal cost basis per carat — owner/manager only. Nulled for every
         // other viewer so the figure never leaves the API.
@@ -13049,10 +13084,11 @@ app.get('/api/team/me', async (req, res) => {
       actorUserId:  finalCtx.actorUserId,
       role,
       isOwner:      role === 'owner',
+      isAdmin:      isAdminRole(role),
       isStoreUser,
       companyId:    me?.company_id || null,
-      // Admins implicitly get everything; everyone else uses their stored set.
-      permissions:  role === 'owner' ? ADMIN_PERMISSIONS : normalizePermissions(me?.permissions),
+      // Admin-tier roles implicitly get everything; everyone else uses their set.
+      permissions:  isAdminRole(role) ? ADMIN_PERMISSIONS : normalizePermissions(me?.permissions),
     });
   } catch (e) {
     console.error('GET /api/team/me error:', e);
@@ -13093,12 +13129,12 @@ app.post('/api/team/members', async (req, res) => {
     const ctx = await resolveTeamContext(req);
     if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
     await ensureOwnerRow(ctx);
-    if (!ctx.isOwner) return res.status(403).json({ error: 'Only the workspace owner can invite members' });
+    if (!ctx.isOwner) return res.status(403).json({ error: 'Only an admin can invite members' });
 
     const { email, name, role = 'salesman', commissionPct, quotaMonthly, avatarColor, companyId, permissions } = req.body || {};
     if (!email || !String(email).trim()) return res.status(400).json({ error: 'email is required' });
     if (!name || !String(name).trim())  return res.status(400).json({ error: 'name is required' });
-    if (!['rep', 'salesman', 'manager', 'owner', 'store_user'].includes(role)) return res.status(400).json({ error: 'invalid role' });
+    if (!ASSIGNABLE_ROLES.includes(role)) return res.status(400).json({ error: 'invalid role' });
     // Per-user permissions (store_users use company scoping instead). Stored as
     // JSONB; admins implicitly get everything so their stored value is moot.
     const memberPerms = role === 'store_user' ? null : normalizePermissions(permissions);
@@ -13311,10 +13347,21 @@ app.put('/api/team/members/:id', async (req, res) => {
   try {
     const ctx = await resolveTeamContext(req);
     if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
-    if (!ctx.isOwner)     return res.status(403).json({ error: 'Only the workspace owner can edit members' });
+    if (!ctx.isOwner)     return res.status(403).json({ error: 'Only an admin can edit members' });
 
     const { id } = req.params;
     const ownerId = ctx.tenantUserId || ctx.actorUserId;
+
+    // The workshop owner's row can't be edited via this endpoint (no demotion,
+    // no role change) — there is exactly one owner, managed implicitly.
+    const targetRes = await pool.query(
+      `SELECT role FROM team_members WHERE id = $1 AND team_owner_id = $2 LIMIT 1`,
+      [id, ownerId]
+    );
+    if (!targetRes.rows[0]) return res.status(404).json({ error: 'Member not found' });
+    if (targetRes.rows[0].role === 'owner') {
+      return res.status(403).json({ error: 'The workshop owner cannot be edited' });
+    }
 
     const allowed = {
       name: 'name', email: 'email', role: 'role',
@@ -13325,7 +13372,8 @@ app.put('/api/team/members/:id', async (req, res) => {
     };
 
     const nextRole = req.body.role;
-    if (nextRole !== undefined && !['rep', 'salesman', 'manager', 'owner'].includes(nextRole)) {
+    // 'owner' is never assignable — you can't crown a second workshop owner.
+    if (nextRole !== undefined && !['rep', 'salesman', 'manager', 'admin'].includes(nextRole)) {
       return res.status(400).json({ error: 'invalid role' });
     }
 
@@ -13371,7 +13419,7 @@ app.delete('/api/team/members/:id', async (req, res) => {
   try {
     const ctx = await resolveTeamContext(req);
     if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
-    if (!ctx.isOwner)     return res.status(403).json({ error: 'Only the workspace owner can remove members' });
+    if (!ctx.isOwner)     return res.status(403).json({ error: 'Only an admin can remove members' });
 
     const { id } = req.params;
     const ownerId = ctx.tenantUserId || ctx.actorUserId;
@@ -13408,7 +13456,7 @@ app.post('/api/team/members/:id/resend-invite', async (req, res) => {
   try {
     const ctx = await resolveTeamContext(req);
     if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
-    if (!ctx.isOwner)     return res.status(403).json({ error: 'Only the workspace owner can resend invitations' });
+    if (!ctx.isOwner)     return res.status(403).json({ error: 'Only an admin can resend invitations' });
 
     const { id } = req.params;
     const ownerId = ctx.tenantUserId || ctx.actorUserId;
