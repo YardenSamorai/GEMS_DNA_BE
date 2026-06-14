@@ -25,9 +25,11 @@ const safeNum = (v) => {
 
 (async () => {
   const csvPath = process.argv[2] || 'c:/Users/yarden/Desktop/Diamonds20260329_125513.csv';
-  const double = !process.argv.includes('--no-double');
+  // DB stores the real CSV price as-is. Pass --double only if you explicitly
+  // want the legacy ×2 (bruto) behaviour.
+  const double = process.argv.includes('--double');
   console.log('Reading CSV:', csvPath);
-  console.log(`Price ×2 (bruto): ${double}  (pass --no-double to store CSV values as-is)`);
+  console.log(`Price ×2 (bruto): ${double}  (default off — pass --double to re-enable)`);
   const csv = fs.readFileSync(csvPath, 'utf8');
   const rows = parse(csv, { columns: true, skip_empty_lines: true, relax_quotes: true, relax_column_count: true });
   console.log('Parsed rows:', rows.length);

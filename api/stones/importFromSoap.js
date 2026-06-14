@@ -246,10 +246,10 @@ const run = async (options = {}) => {
         stone.Clarity || null,
         stone.Lab || null,
         stone.Fluorescence || null,
-        pricePerCarat !== null ? pricePerCarat * 2 : null,  // 💰 x2
+        pricePerCarat,   // store source price as-is (no ×2)
         safeNumber(stone.RapPrice),
         safeNumber(stone["Rap.Price"]),
-        totalPrice !== null ? totalPrice * 2 : null,        // 💰 x2
+        totalPrice,      // store source price as-is (no ×2)
         stone.Location || null,
         mapBranch(stone.Branch),  // 🗺️ Map branch to consistent names
         stone.Image || null,

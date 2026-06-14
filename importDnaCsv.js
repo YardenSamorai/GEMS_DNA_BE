@@ -10,13 +10,14 @@
  * never clobber an existing value with a blank from this file (and we never
  * touch rows/columns this export doesn't carry).
  *
- * Pricing: like the other importers, neto prices are stored ×2 (bruto) so the
- * FE neto/bruto toggle stays consistent. Pass --no-double to store as-is.
+ * Pricing: prices are stored exactly as they appear in the CSV (no ×2). The
+ * Sales Inventory does its own per-category adjustment on the FE. Pass --double
+ * only if you explicitly want the legacy ×2 (bruto) behaviour.
  *
  * Usage:
  *   node importDnaCsv.js "C:/path/to/DNADNA.csv"            # dry run
  *   node importDnaCsv.js "C:/path/to/DNADNA.csv" --write    # apply
- *   node importDnaCsv.js "C:/path/to/DNADNA.csv" --write --no-double
+ *   node importDnaCsv.js "C:/path/to/DNADNA.csv" --write --double
  */
 
 const fs = require("fs");
@@ -102,7 +103,8 @@ const mapRow = (r, { double }) => {
 (async () => {
   const csvPath = process.argv[2] || "c:/Users/yarden/Desktop/DNADNA_2026-06-09 11-32-30.csv";
   const write = process.argv.includes("--write");
-  const double = !process.argv.includes("--no-double");
+  // DB stores the real CSV price as-is. Pass --double for legacy ×2 (bruto).
+  const double = process.argv.includes("--double");
 
   console.log(`File: ${csvPath}`);
   console.log(`Mode: ${write ? "WRITE (upsert)" : "DRY RUN (no writes)"} | price ×2: ${double}`);
