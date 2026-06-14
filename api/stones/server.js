@@ -1701,7 +1701,8 @@ app.post("/api/import-csv", async (req, res) => {
       'depth_percent','ratio','measurements','fancy_intensity',
       'fancy_color','fancy_overtone','fancy_color_2','fancy_overtone_2',
       'pair_stone','home_page','trade_show','comment','type',
-      'cert_comments','origin','grouping_type','box','stones','raw_xml'
+      'cert_comments','origin','grouping_type','box','stones',
+      'cost_per_carat','holder','raw_xml'
     ];
 
     const values = rows.map(r => {
@@ -1751,6 +1752,8 @@ app.post("/api/import-csv", async (req, res) => {
         r['Grouping Type'] || null,
         r['Box'] || null,
         csvSafeNum(r['Stones']),
+        csvSafeNum(r['cost_per_carat']),
+        r['Holder'] || null,
         'csv_import'
       ];
     });
