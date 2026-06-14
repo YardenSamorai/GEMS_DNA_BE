@@ -21,6 +21,10 @@ const pool = new Pool({
 console.log("🟢 Backend is running — This is the correct file.");
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+// navigator.sendBeacon (used by the rep-activity tracker) posts a text/plain
+// body to dodge a CORS preflight it can't perform. Parse those as raw text;
+// the activity handlers JSON.parse the string into req.body.
+app.use(express.text({ type: 'text/plain', limit: '1mb' }));
 
 /* =========================================================
    Encryption helper
@@ -464,6 +468,173 @@ app.get('/api/share-events', async (req, res) => {
   } catch (e) {
     console.error('GET /api/share-events error:', e.message);
     res.status(500).json({ error: 'Failed to load share events' });
+  }
+});
+
+/* ---------------------------------------------------------------------------
+ * Rep activity tracking (manager's "Team activity" view).
+ *   POST /api/activity-events  — batch-log events (sendBeacon-friendly).
+ *   POST /api/heartbeat        — keep-alive ping → updates last_seen.
+ *   GET  /api/team/activity    — owner/manager only: per-rep summary + feed.
+ * The actor is resolved from headers OR body (sendBeacon can't set headers,
+ * so the FE includes userId/userEmail/actorName in the beacon payload).
+ * ------------------------------------------------------------------------- */
+const touchLastSeen = (actorId) => {
+  if (!actorId) return;
+  pool
+    .query(`UPDATE team_members SET last_seen = NOW() WHERE clerk_user_id = $1`, [actorId])
+    .catch(() => {});
+};
+
+// sendBeacon delivers a text/plain string; normalise it back to an object so
+// resolveTeamContext can read userId/userEmail/actorName from req.body.
+const normaliseBeaconBody = (req) => {
+  if (typeof req.body === 'string') {
+    try {
+      req.body = JSON.parse(req.body || '{}');
+    } catch (_) {
+      req.body = {};
+    }
+  }
+};
+
+app.post('/api/activity-events', async (req, res) => {
+  try {
+    normaliseBeaconBody(req);
+    const ctx = await resolveTeamContext(req);
+    const actorId = ctx.actorUserId || null;
+    const actorName = ctx.actorName || ctx.memberName || null;
+    touchLastSeen(actorId);
+
+    const list = Array.isArray(req.body?.events) ? req.body.events : [];
+    let inserted = 0;
+    for (const e of list) {
+      const type = e?.type ? String(e.type).slice(0, 40) : null;
+      if (!type) continue;
+      await pool.query(
+        `INSERT INTO rep_activity (actor_id, actor_name, type, sku, category, meta)
+         VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
+        [
+          actorId,
+          actorName,
+          type,
+          e?.sku ? String(e.sku).slice(0, 80) : null,
+          e?.category ? String(e.category).slice(0, 80) : null,
+          e?.meta ? JSON.stringify(e.meta).slice(0, 2000) : null,
+        ]
+      );
+      inserted++;
+    }
+    res.json({ ok: true, inserted });
+  } catch (e) {
+    console.error('POST /api/activity-events error:', e.message);
+    // Never block the client over a logging hiccup.
+    res.status(200).json({ ok: false });
+  }
+});
+
+app.post('/api/heartbeat', async (req, res) => {
+  try {
+    normaliseBeaconBody(req);
+    const ctx = await resolveTeamContext(req);
+    touchLastSeen(ctx.actorUserId || null);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(200).json({ ok: false });
+  }
+});
+
+app.get('/api/team/activity', async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    const seesAll = ctx.isOwner || ctx.role === 'manager';
+    if (!seesAll) return res.status(403).json({ error: 'Forbidden' });
+
+    // Per-rep rollup over the last 7 days + online flag (seen in last 2 min).
+    const reps = (await pool.query(`
+      SELECT tm.clerk_user_id                          AS actor_id,
+             tm.name,
+             tm.email,
+             tm.role,
+             tm.last_seen,
+             (tm.last_seen IS NOT NULL
+              AND tm.last_seen > NOW() - INTERVAL '120 seconds')   AS online,
+             COALESCE(a.events_7d, 0)        AS events_7d,
+             COALESCE(a.stone_views_7d, 0)   AS stone_views_7d,
+             COALESCE(a.shares_7d, 0)        AS shares_7d,
+             COALESCE(a.sessions_7d, 0)      AS sessions_7d
+        FROM team_members tm
+        LEFT JOIN (
+          SELECT actor_id,
+                 COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')                          AS events_7d,
+                 COUNT(*) FILTER (WHERE type = 'stone_view'    AND created_at > NOW() - INTERVAL '7 days') AS stone_views_7d,
+                 COUNT(*) FILTER (WHERE type = 'share'         AND created_at > NOW() - INTERVAL '7 days') AS shares_7d,
+                 COUNT(*) FILTER (WHERE type = 'session_start' AND created_at > NOW() - INTERVAL '7 days') AS sessions_7d
+            FROM rep_activity
+           GROUP BY actor_id
+        ) a ON a.actor_id = tm.clerk_user_id
+       WHERE tm.active = TRUE
+         AND tm.role IN ('salesman', 'rep', 'manager')
+       ORDER BY online DESC, tm.last_seen DESC NULLS LAST, tm.name ASC
+    `)).rows;
+
+    const limit = Math.min(parseInt(req.query?.limit, 10) || 200, 1000);
+    const events = (await pool.query(`
+      SELECT id, actor_id, actor_name, type, sku, category, meta, created_at
+        FROM rep_activity
+       ORDER BY created_at DESC
+       LIMIT ${limit}
+    `)).rows;
+
+    res.json({ ok: true, reps, events });
+  } catch (e) {
+    console.error('GET /api/team/activity error:', e.message);
+    res.status(500).json({ error: 'Failed to load team activity' });
+  }
+});
+
+/* Full activity history for a single rep (owner/manager only). Powers the
+ * per-rep drill-down on the Team activity tab. */
+app.get('/api/team/rep/:actorId', async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    const seesAll = ctx.isOwner || ctx.role === 'manager';
+    if (!seesAll) return res.status(403).json({ error: 'Forbidden' });
+
+    const actorId = String(req.params.actorId || '').trim();
+    if (!actorId) return res.status(400).json({ error: 'Missing actor id' });
+
+    const rep = (await pool.query(`
+      SELECT tm.clerk_user_id AS actor_id, tm.name, tm.email, tm.role, tm.last_seen,
+             (tm.last_seen IS NOT NULL
+              AND tm.last_seen > NOW() - INTERVAL '120 seconds') AS online
+        FROM team_members tm
+       WHERE tm.clerk_user_id = $1
+       LIMIT 1
+    `, [actorId])).rows[0] || null;
+
+    // Per-type counts over the last 30 days for the breakdown bar.
+    const breakdown = (await pool.query(`
+      SELECT type, COUNT(*)::int AS count
+        FROM rep_activity
+       WHERE actor_id = $1
+         AND created_at > NOW() - INTERVAL '30 days'
+       GROUP BY type
+    `, [actorId])).rows;
+
+    const limit = Math.min(parseInt(req.query?.limit, 10) || 300, 2000);
+    const events = (await pool.query(`
+      SELECT id, actor_id, actor_name, type, sku, category, meta, created_at
+        FROM rep_activity
+       WHERE actor_id = $1
+       ORDER BY created_at DESC
+       LIMIT ${limit}
+    `, [actorId])).rows;
+
+    res.json({ ok: true, rep, breakdown, events });
+  } catch (e) {
+    console.error('GET /api/team/rep error:', e.message);
+    res.status(500).json({ error: 'Failed to load rep activity' });
   }
 });
 
@@ -2326,6 +2497,9 @@ const crmReadyPromise = (async () => {
     // (region kept as a dead column for back-compat; no longer used.)
     await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS region          TEXT`);
     await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS permissions     JSONB`);
+    // last_seen drives the "online now / last seen" indicator on the manager's
+    // Team activity view. Updated by every activity event + the heartbeat ping.
+    await pool.query(`ALTER TABLE team_members ADD COLUMN IF NOT EXISTS last_seen       TIMESTAMPTZ`);
     await pool.query(`UPDATE team_members SET invited_at = created_at WHERE invited_at IS NULL`);
 
     // Manual sales-only fields on soap_stones. These never come from SOAP, so
@@ -2362,6 +2536,38 @@ const crmReadyPromise = (async () => {
       await pool.query(`CREATE INDEX IF NOT EXISTS idx_share_events_created ON share_events(created_at DESC)`);
     } catch (e) {
       console.warn('⚠️  Could not ensure share_events table:', e.message);
+    }
+
+    // Rep activity — generic event stream for the manager's "Team activity"
+    // view: session_start (login / app open), stone_view, category_view,
+    // search, filter_apply, share. One row per event; the FE batches them via
+    // navigator.sendBeacon so logging never slows the app.
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS rep_activity (
+          id          SERIAL PRIMARY KEY,
+          actor_id    TEXT,
+          actor_name  TEXT,
+          type        TEXT NOT NULL,
+          sku         TEXT,
+          category    TEXT,
+          meta        JSONB,
+          created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_rep_activity_actor   ON rep_activity(actor_id, created_at DESC)`);
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_rep_activity_type    ON rep_activity(type)`);
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_rep_activity_created ON rep_activity(created_at DESC)`);
+
+      // Retention: keep ~90 days of activity. Prune on boot, then once a day.
+      const pruneRepActivity = () =>
+        pool
+          .query(`DELETE FROM rep_activity WHERE created_at < NOW() - INTERVAL '90 days'`)
+          .catch((err) => console.warn('⚠️  rep_activity prune failed:', err.message));
+      pruneRepActivity();
+      setInterval(pruneRepActivity, 24 * 60 * 60 * 1000).unref?.();
+    } catch (e) {
+      console.warn('⚠️  Could not ensure rep_activity table:', e.message);
     }
 
     // Loose-stone assignments. We keep this in a separate table because
