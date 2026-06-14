@@ -550,43 +550,79 @@ app.get('/api/team/activity', async (req, res) => {
     const seesAll = ctx.isOwner || ctx.role === 'manager';
     if (!seesAll) return res.status(403).json({ error: 'Forbidden' });
 
-    // Per-rep rollup over the last 7 days + online flag (seen in last 2 min).
-    const reps = (await pool.query(`
-      SELECT tm.clerk_user_id                          AS actor_id,
-             tm.name,
-             tm.email,
-             tm.role,
-             tm.last_seen,
-             (tm.last_seen IS NOT NULL
-              AND tm.last_seen > NOW() - INTERVAL '120 seconds')   AS online,
-             COALESCE(a.events_7d, 0)        AS events_7d,
-             COALESCE(a.stone_views_7d, 0)   AS stone_views_7d,
-             COALESCE(a.shares_7d, 0)        AS shares_7d,
-             COALESCE(a.sessions_7d, 0)      AS sessions_7d
-        FROM team_members tm
-        LEFT JOIN (
-          SELECT actor_id,
-                 COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')                          AS events_7d,
-                 COUNT(*) FILTER (WHERE type = 'stone_view'    AND created_at > NOW() - INTERVAL '7 days') AS stone_views_7d,
-                 COUNT(*) FILTER (WHERE type = 'share'         AND created_at > NOW() - INTERVAL '7 days') AS shares_7d,
-                 COUNT(*) FILTER (WHERE type = 'session_start' AND created_at > NOW() - INTERVAL '7 days') AS sessions_7d
-            FROM rep_activity
-           GROUP BY actor_id
-        ) a ON a.actor_id = tm.clerk_user_id
-       WHERE tm.active = TRUE
-         AND tm.role IN ('salesman', 'rep', 'manager')
-       ORDER BY online DESC, tm.last_seen DESC NULLS LAST, tm.name ASC
-    `)).rows;
+    // ?repsOnly=1 — cheap presence poll: return just the per-rep rollup (online
+    // status), no events. The live dashboard hits this on a slow interval.
+    const repsOnly = req.query?.repsOnly === '1' || req.query?.repsOnly === 'true';
 
-    const limit = Math.min(parseInt(req.query?.limit, 10) || 200, 1000);
-    const events = (await pool.query(`
-      SELECT id, actor_id, actor_name, type, sku, category, meta, created_at
-        FROM rep_activity
-       ORDER BY created_at DESC
-       LIMIT ${limit}
-    `)).rows;
+    // Keyset (cursor) pagination: ?before=<id> returns the page of events older
+    // than that id, so the feed stays small and "Load more" scales without the
+    // OFFSET slowdown. ?after=<id> fetches only newer events (incremental poll).
+    const limit = Math.min(parseInt(req.query?.limit, 10) || 50, 200);
+    const before = parseInt(req.query?.before, 10);
+    const after = parseInt(req.query?.after, 10);
 
-    res.json({ ok: true, reps, events });
+    let events = [];
+    let nextCursor = null;
+    if (!repsOnly) {
+      const params = [];
+      let where = '';
+      if (Number.isFinite(after)) {
+        params.push(after);
+        where = `WHERE id > $${params.length}`;
+      } else if (Number.isFinite(before)) {
+        params.push(before);
+        where = `WHERE id < $${params.length}`;
+      }
+      // For "after" we still want the newest first; cap how many new rows we pull.
+      params.push(limit);
+      events = (await pool.query(`
+        SELECT id, actor_id, actor_name, type, sku, category, meta, created_at
+          FROM rep_activity
+          ${where}
+         ORDER BY id DESC
+         LIMIT $${params.length}
+      `, params)).rows;
+
+      // More pages exist (for "Load more") when we filled a full page going back.
+      nextCursor =
+        !Number.isFinite(after) && events.length === limit
+          ? events[events.length - 1].id
+          : null;
+    }
+
+    // The per-rep rollup is needed on the first load (no cursor) and on the
+    // dedicated presence poll — skip it on "Load more" / "after" to stay cheap.
+    let reps = null;
+    if (repsOnly || (!Number.isFinite(before) && !Number.isFinite(after))) {
+      reps = (await pool.query(`
+        SELECT tm.clerk_user_id                          AS actor_id,
+               tm.name,
+               tm.email,
+               tm.role,
+               tm.last_seen,
+               (tm.last_seen IS NOT NULL
+                AND tm.last_seen > NOW() - INTERVAL '120 seconds')   AS online,
+               COALESCE(a.events_7d, 0)        AS events_7d,
+               COALESCE(a.stone_views_7d, 0)   AS stone_views_7d,
+               COALESCE(a.shares_7d, 0)        AS shares_7d,
+               COALESCE(a.sessions_7d, 0)      AS sessions_7d
+          FROM team_members tm
+          LEFT JOIN (
+            SELECT actor_id,
+                   COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')                          AS events_7d,
+                   COUNT(*) FILTER (WHERE type = 'stone_view'    AND created_at > NOW() - INTERVAL '7 days') AS stone_views_7d,
+                   COUNT(*) FILTER (WHERE type = 'share'         AND created_at > NOW() - INTERVAL '7 days') AS shares_7d,
+                   COUNT(*) FILTER (WHERE type = 'session_start' AND created_at > NOW() - INTERVAL '7 days') AS sessions_7d
+              FROM rep_activity
+             GROUP BY actor_id
+          ) a ON a.actor_id = tm.clerk_user_id
+         WHERE tm.active = TRUE
+           AND tm.role IN ('salesman', 'rep', 'manager')
+         ORDER BY online DESC, tm.last_seen DESC NULLS LAST, tm.name ASC
+      `)).rows;
+    }
+
+    res.json({ ok: true, reps, events, nextCursor });
   } catch (e) {
     console.error('GET /api/team/activity error:', e.message);
     res.status(500).json({ error: 'Failed to load team activity' });
@@ -613,25 +649,40 @@ app.get('/api/team/rep/:actorId', async (req, res) => {
        LIMIT 1
     `, [actorId])).rows[0] || null;
 
-    // Per-type counts over the last 30 days for the breakdown bar.
-    const breakdown = (await pool.query(`
-      SELECT type, COUNT(*)::int AS count
-        FROM rep_activity
-       WHERE actor_id = $1
-         AND created_at > NOW() - INTERVAL '30 days'
-       GROUP BY type
-    `, [actorId])).rows;
+    // Per-type counts over the last 30 days for the breakdown bar. Only needed
+    // on the first page (no cursor).
+    const before = parseInt(req.query?.before, 10);
+    let breakdown = null;
+    if (!Number.isFinite(before)) {
+      breakdown = (await pool.query(`
+        SELECT type, COUNT(*)::int AS count
+          FROM rep_activity
+         WHERE actor_id = $1
+           AND created_at > NOW() - INTERVAL '30 days'
+         GROUP BY type
+      `, [actorId])).rows;
+    }
 
-    const limit = Math.min(parseInt(req.query?.limit, 10) || 300, 2000);
+    // Keyset pagination — same scheme as the global feed.
+    const limit = Math.min(parseInt(req.query?.limit, 10) || 50, 200);
+    const params = [actorId];
+    let cursorClause = '';
+    if (Number.isFinite(before)) {
+      params.push(before);
+      cursorClause = `AND id < $${params.length}`;
+    }
+    params.push(limit);
     const events = (await pool.query(`
       SELECT id, actor_id, actor_name, type, sku, category, meta, created_at
         FROM rep_activity
-       WHERE actor_id = $1
-       ORDER BY created_at DESC
-       LIMIT ${limit}
-    `, [actorId])).rows;
+       WHERE actor_id = $1 ${cursorClause}
+       ORDER BY id DESC
+       LIMIT $${params.length}
+    `, params)).rows;
 
-    res.json({ ok: true, rep, breakdown, events });
+    const nextCursor = events.length === limit ? events[events.length - 1].id : null;
+
+    res.json({ ok: true, rep, breakdown, events, nextCursor });
   } catch (e) {
     console.error('GET /api/team/rep error:', e.message);
     res.status(500).json({ error: 'Failed to load rep activity' });
