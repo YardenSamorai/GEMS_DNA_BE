@@ -25,7 +25,9 @@ const safeNum = (v) => {
 
 (async () => {
   const csvPath = process.argv[2] || 'c:/Users/yarden/Desktop/Diamonds20260329_125513.csv';
+  const double = !process.argv.includes('--no-double');
   console.log('Reading CSV:', csvPath);
+  console.log(`Price ×2 (bruto): ${double}  (pass --no-double to store CSV values as-is)`);
   const csv = fs.readFileSync(csvPath, 'utf8');
   const rows = parse(csv, { columns: true, skip_empty_lines: true, relax_quotes: true, relax_column_count: true });
   console.log('Parsed rows:', rows.length);
@@ -39,7 +41,8 @@ const safeNum = (v) => {
     'depth_percent','ratio','measurements','fancy_intensity',
     'fancy_color','fancy_overtone','fancy_color_2','fancy_overtone_2',
     'pair_stone','home_page','trade_show','comment','type',
-    'cert_comments','origin','grouping_type','box','stones','raw_xml'
+    'cert_comments','origin','grouping_type','box','stones',
+    'cost_per_carat','holder','raw_xml'
   ];
 
   const values = rows.map(r => {
@@ -54,10 +57,10 @@ const safeNum = (v) => {
       r['Clarity'] || null,
       r['Lab'] || null,
       r['Fluorescence'] || null,
-      ppc !== null ? ppc * 2 : null,
+      ppc !== null ? (double ? ppc * 2 : ppc) : null,
       safeNum(r['Rap Price % ']),
       safeNum(r['Rap. Price']),
-      tp !== null ? tp * 2 : null,
+      tp !== null ? (double ? tp * 2 : tp) : null,
       r['Location'] || null,
       mapBranch(r['Branch']),
       r['Image'] || null,
@@ -89,6 +92,8 @@ const safeNum = (v) => {
       r['Grouping Type'] || null,
       r['Box'] || null,
       safeNum(r['Stones']),
+      safeNum(r['cost_per_carat']),
+      r['Holder'] || null,
       'csv_import'
     ];
   });
