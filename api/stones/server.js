@@ -481,6 +481,9 @@ app.get("/api/soap-stones", async (req, res) => {
 
     // How much location detail this viewer is allowed to see.
     const locView = ctx.permissions?.locationView || 'full';
+    // Internal cost is owner/manager-only — never leaves the API for anyone
+    // else (a salesman must not learn the margin).
+    const canSeeCost = !!ctx.isOwner || ctx.role === 'manager';
 
     const whereClauses = [`s.sku IS NOT NULL`];
     const params = [];
@@ -612,9 +615,10 @@ app.get("/api/soap-stones", async (req, res) => {
         onMemo: computeOnMemo(row.location),
         onHold: !!(row.holder && String(row.holder).trim()),
 
-        // Internal cost basis per carat — sales page only.
+        // Internal cost basis per carat — owner/manager only. Nulled for every
+        // other viewer so the figure never leaves the API.
         costPerCt:
-          row.cost_per_carat !== null && row.cost_per_carat !== undefined
+          canSeeCost && row.cost_per_carat !== null && row.cost_per_carat !== undefined
             ? Number(row.cost_per_carat)
             : null,
 
