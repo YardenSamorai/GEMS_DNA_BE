@@ -394,6 +394,79 @@ app.get("/api/stones", async (req, res) => {
      <clerk-id>    → that rep's pile (admin-only respect, otherwise
                      silently coerced to "me" so reps can't snoop)
    ========================================================= */
+/* ---- Share events (sales Dashboard) ----------------------------------------
+ * Logs every stone a rep shares to WhatsApp from the sales catalog, one row
+ * per stone. Salesmen see only their own sends; owners (admin) and managers
+ * see everyone's. */
+app.post('/api/share-events', async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    const stones = Array.isArray(req.body?.stones) ? req.body.stones : [];
+    const channel = (req.body?.channel && String(req.body.channel).trim()) || 'whatsapp';
+    if (!stones.length) return res.json({ ok: true, inserted: 0 });
+
+    const actorId = ctx.actorUserId || null;
+    const actorName = ctx.actorName || ctx.memberName || null;
+    const actorEmail = ctx.memberEmail || null;
+
+    let inserted = 0;
+    for (const s of stones) {
+      const sku = s?.sku ? String(s.sku).trim() : null;
+      if (!sku) continue;
+      await pool.query(
+        `INSERT INTO share_events (actor_id, actor_name, actor_email, sku, category, kind, title, channel)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [
+          actorId, actorName, actorEmail, sku,
+          s?.category ? String(s.category) : null,
+          s?.kind ? String(s.kind) : null,
+          s?.title ? String(s.title) : null,
+          channel,
+        ]
+      );
+      inserted++;
+    }
+    res.json({ ok: true, inserted });
+  } catch (e) {
+    console.error('POST /api/share-events error:', e.message);
+    res.status(500).json({ error: 'Failed to log share' });
+  }
+});
+
+app.get('/api/share-events', async (req, res) => {
+  try {
+    const ctx = await resolveTeamContext(req);
+    // Admins (owner) + managers see every rep's sends; everyone else only theirs.
+    const seesAll = ctx.isOwner || ctx.role === 'manager';
+    const params = [];
+    let where = '';
+    if (!seesAll) {
+      params.push(ctx.actorUserId || '__none__');
+      where = `WHERE actor_id = $1`;
+    }
+    const limit = Math.min(parseInt(req.query?.limit, 10) || 1000, 5000);
+    const rows = (await pool.query(
+      `SELECT id, actor_id, actor_name, actor_email, sku, category, kind, title, channel, created_at
+         FROM share_events ${where}
+        ORDER BY created_at DESC
+        LIMIT ${limit}`,
+      params
+    )).rows;
+
+    const uniqueStones = new Set(rows.map((r) => r.sku)).size;
+    res.json({
+      ok: true,
+      scope: seesAll ? 'all' : 'me',
+      count: rows.length,        // total sends (one per stone per share)
+      uniqueStones,              // distinct SKUs shared
+      events: rows,
+    });
+  } catch (e) {
+    console.error('GET /api/share-events error:', e.message);
+    res.status(500).json({ error: 'Failed to load share events' });
+  }
+});
+
 app.get("/api/soap-stones", async (req, res) => {
   try {
     const ctx = await resolveTeamContext(req);
@@ -2257,6 +2330,31 @@ const crmReadyPromise = (async () => {
       await pool.query(`ALTER TABLE soap_stones ADD COLUMN IF NOT EXISTS cost_per_carat NUMERIC`);
     } catch (e) {
       console.warn('⚠️  Could not ensure soap_stones sales columns:', e.message);
+    }
+
+    // Share events — one row per stone shared to WhatsApp from the sales
+    // catalog. Drives the sales Dashboard ("how many / which stones a rep
+    // sent"). A batch share of N stones inserts N rows. actor_* is the rep
+    // who shared; salesmen see only their own rows, admins/managers see all.
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS share_events (
+          id          SERIAL PRIMARY KEY,
+          actor_id    TEXT,
+          actor_name  TEXT,
+          actor_email TEXT,
+          sku         TEXT,
+          category    TEXT,
+          kind        TEXT,
+          title       TEXT,
+          channel     TEXT DEFAULT 'whatsapp',
+          created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_share_events_actor   ON share_events(actor_id)`);
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_share_events_created ON share_events(created_at DESC)`);
+    } catch (e) {
+      console.warn('⚠️  Could not ensure share_events table:', e.message);
     }
 
     // Loose-stone assignments. We keep this in a separate table because
