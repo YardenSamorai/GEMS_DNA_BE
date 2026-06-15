@@ -7,6 +7,7 @@
     "vercel-start": "node api/stones/server.js"
   },
   "dependencies": {
+    "@clerk/backend": "^3.7.0",
     "@vercel/blob": "^0.27.0",
     "@woocommerce/woocommerce-rest-api": "^1.0.1",
     "cors": "^2.8.5",

@@ -5,10 +5,15 @@ const dotenv = require("dotenv");
 const path = require("path");
 const crypto = require("crypto");
 const CryptoJS = require("crypto-js");
+const { verifyToken, createClerkClient } = require("@clerk/backend");
 
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 const ENCRYPT_SECRET = process.env.ENCRYPT_SECRET;
+const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY;
+const clerkClient = CLERK_SECRET_KEY
+  ? createClerkClient({ secretKey: CLERK_SECRET_KEY })
+  : null;
 const app = express();
 const port = process.env.PORT;
 const dbUrl = process.env.DATABASE_URL;
@@ -25,6 +30,139 @@ app.use(express.json({ limit: '50mb' }));
 // body to dodge a CORS preflight it can't perform. Parse those as raw text;
 // the activity handlers JSON.parse the string into req.body.
 app.use(express.text({ type: 'text/plain', limit: '1mb' }));
+
+/* =========================================================
+   Clerk session verification (Phase 1 — identity foundation)
+   ---------------------------------------------------------
+   The only trustworthy source of "who is calling" is a Clerk
+   session JWT, verified here against Clerk's JWKS via the
+   secret key. When a valid `Authorization: Bearer <token>` is
+   present we stamp the cryptographically-verified user id onto
+   `req.auth`; resolveTeamContext then prefers it over the
+   spoofable x-actor-* headers.
+
+   This pass is intentionally non-blocking: a missing/invalid
+   token simply leaves `req.auth` unset so genuinely public
+   endpoints (diamond cards, share/sign tokens, dna-lead) keep
+   working. Enforcement (rejecting unauthenticated internal
+   calls) is layered on per-route.
+   ========================================================= */
+app.use(async (req, res, next) => {
+  try {
+    const header = req.headers['authorization'] || req.headers['Authorization'];
+    if (header && /^Bearer\s+/i.test(header) && CLERK_SECRET_KEY) {
+      const token = header.replace(/^Bearer\s+/i, '').trim();
+      if (token) {
+        const claims = await verifyToken(token, { secretKey: CLERK_SECRET_KEY });
+        if (claims && claims.sub) {
+          req.auth = {
+            userId: claims.sub,
+            email: claims.email || claims.email_address || null,
+            claims,
+          };
+        }
+      }
+    }
+  } catch (e) {
+    // Expired/invalid/forged token — leave req.auth unset. Downstream
+    // route guards decide whether anonymous access is allowed.
+  }
+  next();
+});
+
+// Guard for internal (non-public) endpoints: requires a verified Clerk
+// session. Use on routes that must never be reachable anonymously.
+function requireAuth(req, res, next) {
+  if (req.auth && req.auth.userId) return next();
+  return res.status(401).json({ error: 'Authentication required' });
+}
+
+/* =========================================================
+   Single-active-session policy
+   ---------------------------------------------------------
+   The app enforces one active session per user: signing in
+   on a new device offers to "take over" and sign out every
+   other device. These endpoints are called from the custom
+   login sheet right after authentication, BEFORE the new
+   session is activated on the client (so no bearer token is
+   available yet) — authorization is proven by possession of a
+   freshly-created, still-active Clerk session id, and a caller
+   can only ever see/revoke sessions belonging to that same
+   user.
+   ========================================================= */
+const sessionDeviceLabel = (s) => {
+  const a = (s && s.latestActivity) || {};
+  const who = [a.browserName, a.deviceType].filter(Boolean).join(' · ');
+  const where = [a.city, a.country].filter(Boolean).join(', ');
+  if (who && where) return `${who} (${where})`;
+  return who || where || 'another device';
+};
+
+// Returns a Clerk session list as a plain array across SDK shapes.
+const sessionListArray = (list) =>
+  Array.isArray(list) ? list : (list && Array.isArray(list.data) ? list.data : []);
+
+// Resolves the owning user for a session id, then returns its sibling active
+// sessions (every active session for that user except the one provided).
+async function otherActiveSessions(sessionId) {
+  const current = await clerkClient.sessions.getSession(sessionId);
+  if (!current || !current.userId) return { userId: null, others: [] };
+  const list = await clerkClient.sessions.getSessionList({
+    userId: current.userId,
+    status: 'active',
+  });
+  const others = sessionListArray(list).filter((s) => s.id !== sessionId);
+  return { userId: current.userId, others };
+}
+
+// Peek: does this freshly-signed-in user already have other live sessions?
+app.post('/api/auth/sessions/peers', async (req, res) => {
+  try {
+    if (!clerkClient) return res.json({ count: 0, others: [] });
+    const sessionId = String(req.body?.sessionId || '').trim();
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+    const { others } = await otherActiveSessions(sessionId);
+    return res.json({
+      count: others.length,
+      others: others.map((s) => ({ id: s.id, label: sessionDeviceLabel(s) })),
+    });
+  } catch (e) {
+    // Never block sign-in on a session-lookup hiccup — just report "no peers".
+    return res.json({ count: 0, others: [] });
+  }
+});
+
+// Take over: revoke every OTHER active session for this user, keeping only the
+// one just created on this device.
+app.post('/api/auth/sessions/revoke-others', async (req, res) => {
+  try {
+    if (!clerkClient) return res.json({ ok: true, revoked: 0 });
+    const sessionId = String(req.body?.sessionId || '').trim();
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+    const { others } = await otherActiveSessions(sessionId);
+    let revoked = 0;
+    for (const s of others) {
+      try { await clerkClient.sessions.revokeSession(s.id); revoked++; } catch (_) {}
+    }
+    return res.json({ ok: true, revoked });
+  } catch (e) {
+    return res.status(500).json({ error: 'Could not update sessions' });
+  }
+});
+
+// Cancel: drop the just-created session so it doesn't linger when the user
+// chooses not to take over.
+app.post('/api/auth/sessions/revoke', async (req, res) => {
+  try {
+    if (!clerkClient) return res.json({ ok: true });
+    const sessionId = String(req.body?.sessionId || '').trim();
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+    await clerkClient.sessions.revokeSession(sessionId);
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.json({ ok: true });
+  }
+});
 
 /* =========================================================
    Encryption helper
@@ -220,12 +358,18 @@ const computeOnMemo = (exactLocationRaw) => {
 };
 
 async function resolveTeamContext(req) {
+  // Identity comes from the cryptographically-verified Clerk session first.
+  // The x-actor-*/userId values are client-controlled and only used as a
+  // legacy fallback during rollout (removed once the FE always sends a token).
+  const verifiedId = req?.auth?.userId ? String(req.auth.userId).trim() : null;
   const actorId =
+    verifiedId ||
     (req?.headers?.['x-actor-id'] && String(req.headers['x-actor-id']).trim()) ||
     (req?.query?.userId && String(req.query.userId).trim()) ||
     (req?.body?.userId && String(req.body.userId).trim()) ||
     null;
   const actorEmail =
+    (req?.auth?.email && String(req.auth.email).trim()) ||
     (req?.headers?.['x-actor-email'] && String(req.headers['x-actor-email']).trim()) ||
     (req?.query?.userEmail && String(req.query.userEmail).trim()) ||
     (req?.body?.userEmail && String(req.body.userEmail).trim()) ||
@@ -235,14 +379,19 @@ async function resolveTeamContext(req) {
     (req?.body?.actorName && String(req.body.actorName).trim()) ||
     null;
 
+  // No identity at all → no access. (Previously this branch granted full
+  // owner+admin access, which let any anonymous caller read/write every
+  // workshop's data. Hard fail-closed instead.)
   if (!actorId) {
     return {
       tenantUserId: null, actorUserId: null,
       role: null, memberId: null, memberName: null,
-      permissions: ADMIN_PERMISSIONS,
-      isOwner: true, isWorkshopOwner: true, actorName: headerActorName,
+      permissions: {},
+      isOwner: false, isWorkshopOwner: false, isAuthenticated: false,
+      actorName: headerActorName,
     };
   }
+  const isAuthenticated = !!verifiedId;
 
   let rows = [];
   try {
@@ -303,6 +452,7 @@ async function resolveTeamContext(req) {
       isOwner:      isAdminRole(m.role),
       isWorkshopOwner: m.role === 'owner',
       isStoreUser:  m.role === 'store_user',
+      isAuthenticated,
       actorName:    headerActorName || m.name,
     };
   }
@@ -317,6 +467,7 @@ async function resolveTeamContext(req) {
     permissions:  ADMIN_PERMISSIONS,
     isOwner:      true,
     isWorkshopOwner: true,
+    isAuthenticated,
     actorName:    headerActorName,
   };
 }
@@ -12814,6 +12965,71 @@ function isDeliverableEmail(value) {
 }
 
 /**
+ * purgeClerkIdentity({ clerkUserId, email })
+ *
+ * Removes a person from Clerk so the Team page stays the single source of
+ * truth: a member deleted from the team can no longer sign in, isn't
+ * "recognized" on a re-invite, and truly ceases to exist. It:
+ *   1. Revokes any pending invitations for the email.
+ *   2. Deletes the Clerk user (resolved by id, or looked up by email),
+ *      which also revokes all of their sessions.
+ *
+ * Best-effort and safe to call when CLERK_SECRET_KEY is missing (no-op).
+ * IMPORTANT: callers must ensure the email isn't an active member of another
+ * workspace before purging — this deletes the Clerk account globally.
+ */
+async function purgeClerkIdentity({ clerkUserId = null, email = null } = {}) {
+  const result = { invitationsRevoked: 0, userDeleted: false };
+  if (!process.env.CLERK_SECRET_KEY) return result;
+  const auth = `Bearer ${process.env.CLERK_SECRET_KEY}`;
+
+  // 1. Revoke pending invitations for this email.
+  if (email) {
+    try {
+      const list = await fetch(
+        `https://api.clerk.com/v1/invitations?status=pending&query=${encodeURIComponent(email)}`,
+        { headers: { Authorization: auth } }
+      );
+      if (list.ok) {
+        const items = await list.json().catch(() => []);
+        const arr = Array.isArray(items) ? items : (items?.data || []);
+        for (const inv of arr) {
+          if (inv?.email_address?.toLowerCase() === email.toLowerCase() && inv?.id) {
+            const rev = await fetch(`https://api.clerk.com/v1/invitations/${inv.id}/revoke`, {
+              method: 'POST',
+              headers: { Authorization: auth },
+            }).catch(() => null);
+            if (rev && rev.ok) result.invitationsRevoked++;
+          }
+        }
+      }
+    } catch (_) { /* best effort */ }
+  }
+
+  // 2. Resolve the Clerk user id (fall back to an email lookup so we also
+  //    catch people who signed up but were never linked back to their row).
+  let userId = clerkUserId;
+  if (!userId && email && clerkClient) {
+    try {
+      const users = await clerkClient.users.getUserList({ emailAddress: [email] });
+      const arr = Array.isArray(users) ? users : (users?.data || []);
+      if (arr[0]?.id) userId = arr[0].id;
+    } catch (_) { /* best effort */ }
+  }
+
+  // 3. Delete the Clerk user (also revokes their sessions).
+  if (userId && clerkClient) {
+    try {
+      await clerkClient.users.deleteUser(userId);
+      result.userDeleted = true;
+    } catch (e) {
+      console.error(`[purgeClerkIdentity] deleteUser ${userId} failed:`, e.message);
+    }
+  }
+  return result;
+}
+
+/**
  * createClerkInvitation({ email, redirectUrl, metadata, revokeExisting })
  *
  * Talks to Clerk's Backend API to mint an invitation ticket. Required when
@@ -13165,6 +13381,26 @@ app.post('/api/team/members', async (req, res) => {
       return res.status(400).json({ error: 'Team is full (max 10 reps + owner). Deactivate someone first.' });
     }
 
+    // Team page is the single source of truth. If this email has a leftover
+    // Clerk account but is NOT an active member of ANY workspace, it's an
+    // orphan from a previous (deleted) membership — purge it so the invite
+    // mints a fresh sign-up ticket instead of "you already exist → sign in".
+    // We never touch a user who is still an active member somewhere.
+    if (role !== 'owner' && process.env.CLERK_SECRET_KEY) {
+      try {
+        const normEmail = String(email).trim().toLowerCase();
+        const activeAnywhere = await pool.query(
+          `SELECT 1 FROM team_members WHERE LOWER(email) = $1 AND active = TRUE LIMIT 1`,
+          [normEmail]
+        );
+        if (!activeAnywhere.rows.length) {
+          await purgeClerkIdentity({ email: normEmail });
+        }
+      } catch (e) {
+        console.warn('[invite] orphan Clerk purge warn:', e.message);
+      }
+    }
+
     try {
       // If we previously had this email as a *removed* (active=FALSE) row,
       // bring it back to life instead of erroring out with a duplicate.
@@ -13452,7 +13688,26 @@ app.delete('/api/team/members/:id', async (req, res) => {
       [id, ownerId]
     );
     if (!r.rows[0]) return res.status(404).json({ error: 'Member not found (cannot remove owner)' });
-    res.json({ success: true, member: r.rows[0] });
+    const removed = r.rows[0];
+
+    // Single source of truth: removing someone from the Team removes them from
+    // Clerk too, so they can no longer sign in and aren't "recognized" if
+    // re-invited later. Only purge when this email isn't still an active member
+    // of another workspace (multi-tenant safety).
+    let clerk = { invitationsRevoked: 0, userDeleted: false };
+    try {
+      const stillActive = await pool.query(
+        `SELECT 1 FROM team_members WHERE LOWER(email) = LOWER($1) AND active = TRUE LIMIT 1`,
+        [removed.email]
+      );
+      if (!stillActive.rows.length) {
+        clerk = await purgeClerkIdentity({ clerkUserId: removed.clerk_user_id, email: removed.email });
+      }
+    } catch (e) {
+      console.error('DELETE /api/team/members clerk purge error:', e.message);
+    }
+
+    res.json({ success: true, member: removed, clerk });
 
     logActivity({
       userId:     ownerId,
@@ -13461,7 +13716,7 @@ app.delete('/api/team/members/:id', async (req, res) => {
       entityType: 'team_member',
       entityId:   id,
       action:     'removed',
-      summary:    `Removed ${r.rows[0].name} from the team`,
+      summary:    `Removed ${removed.name} from the team`,
     });
   } catch (e) {
     console.error('DELETE /api/team/members error:', e);
