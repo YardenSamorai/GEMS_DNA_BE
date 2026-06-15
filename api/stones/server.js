@@ -11705,6 +11705,17 @@ app.post('/api/jewelry-items/from-template', async (req, res) => {
 });
 
 /* ---------- Jewelry Items: Update ---------- */
+// Confirms a jewelry item belongs to the caller's workspace before any
+// child mutation (files/stones/metals/costs/shares/etc.) touches it.
+async function jewelryItemBelongsToTenant(itemId, tenantUserId) {
+  if (!tenantUserId) return false;
+  const r = await pool.query(
+    `SELECT 1 FROM jewelry_items WHERE id = $1 AND user_id = $2 LIMIT 1`,
+    [itemId, tenantUserId]
+  );
+  return r.rows.length > 0;
+}
+
 app.put('/api/jewelry-items/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -11747,12 +11758,14 @@ app.put('/api/jewelry-items/:id', async (req, res) => {
     if (!sets.length) return res.status(400).json({ error: 'no valid fields' });
     sets.push(`updated_at = NOW()`);
 
-    // Snapshot before so we can record what changed.
-    const beforeRes = await pool.query(`SELECT * FROM jewelry_items WHERE id = $1`, [id]);
+    // Snapshot before so we can record what changed (scoped to the workspace).
+    const beforeRes = await pool.query(`SELECT * FROM jewelry_items WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
     const before = beforeRes.rows[0] || null;
+    if (!before) return res.status(404).json({ error: 'Item not found' });
 
     params.push(id);
-    const sql = `UPDATE jewelry_items SET ${sets.join(', ')} WHERE id = $${p} RETURNING *`;
+    params.push(ctx.tenantUserId);
+    const sql = `UPDATE jewelry_items SET ${sets.join(', ')} WHERE id = $${p} AND user_id = $${p + 1} RETURNING *`;
     const r = await pool.query(sql, params);
     if (!r.rows[0]) return res.status(404).json({ error: 'Item not found' });
     res.json({ item: r.rows[0] });
@@ -11789,11 +11802,12 @@ app.put('/api/jewelry-items/:id', async (req, res) => {
 app.delete('/api/jewelry-items/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const beforeRes = await pool.query(
-      `SELECT user_id, sku, name, contact_id FROM jewelry_items WHERE id = $1`,
-      [id]
+      `SELECT user_id, sku, name, contact_id FROM jewelry_items WHERE id = $1 AND user_id = $2`,
+      [id, ctx.tenantUserId]
     );
-    const r = await pool.query(`DELETE FROM jewelry_items WHERE id = $1 RETURNING id`, [id]);
+    const r = await pool.query(`DELETE FROM jewelry_items WHERE id = $1 AND user_id = $2 RETURNING id`, [id, ctx.tenantUserId]);
     if (!r.rows[0]) return res.status(404).json({ error: 'Item not found' });
     res.json({ success: true, id: r.rows[0].id });
 
@@ -11824,19 +11838,20 @@ app.delete('/api/jewelry-items/:id', async (req, res) => {
 app.post('/api/jewelry-items/:id/status', async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const { newStatus, notes, userId } = req.body || {};
     if (!isValidStatus(newStatus)) return res.status(400).json({ error: 'invalid status' });
 
     const cur = await pool.query(
-      `SELECT status, contact_id, sku, name, user_id FROM jewelry_items WHERE id = $1`,
-      [id]
+      `SELECT status, contact_id, sku, name, user_id FROM jewelry_items WHERE id = $1 AND user_id = $2`,
+      [id, ctx.tenantUserId]
     );
     if (!cur.rows[0]) return res.status(404).json({ error: 'Item not found' });
 
     const fromStatus = cur.rows[0].status;
     const r = await pool.query(
-      `UPDATE jewelry_items SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
-      [newStatus, id]
+      `UPDATE jewelry_items SET status = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3 RETURNING *`,
+      [newStatus, id, ctx.tenantUserId]
     );
     await pool.query(
       `INSERT INTO jewelry_item_history (item_id, from_status, to_status, changed_by, notes)
@@ -11920,6 +11935,8 @@ app.post('/api/jewelry-items/:id/status', async (req, res) => {
 app.post('/api/jewelry-items/:id/files', async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!(await jewelryItemBelongsToTenant(id, ctx.tenantUserId))) return res.status(404).json({ error: 'Item not found' });
     const { url, kind, stage, filename, mimeType, sizeBytes, uploadedBy, setAsCover } = req.body || {};
     if (!url) return res.status(400).json({ error: 'url is required' });
 
@@ -11931,7 +11948,7 @@ app.post('/api/jewelry-items/:id/files', async (req, res) => {
     );
 
     if (setAsCover) {
-      await pool.query(`UPDATE jewelry_items SET cover_image_url = $1, updated_at = NOW() WHERE id = $2`, [url, id]);
+      await pool.query(`UPDATE jewelry_items SET cover_image_url = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`, [url, id, ctx.tenantUserId]);
     }
 
     res.json({ file: r.rows[0] });
@@ -11944,6 +11961,8 @@ app.post('/api/jewelry-items/:id/files', async (req, res) => {
 app.delete('/api/jewelry-items/:id/files/:fileId', async (req, res) => {
   try {
     const { id, fileId } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!(await jewelryItemBelongsToTenant(id, ctx.tenantUserId))) return res.status(404).json({ error: 'Item not found' });
     const r = await pool.query(
       `DELETE FROM jewelry_item_files WHERE id = $1 AND item_id = $2 RETURNING id`,
       [fileId, id]
@@ -12078,6 +12097,8 @@ function _initialInventoryStatusFromItemStatus(itemStatus) {
 app.post('/api/jewelry-items/:id/stones', async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!(await jewelryItemBelongsToTenant(id, ctx.tenantUserId))) return res.status(404).json({ error: 'Item not found' });
     const body = req.body || {};
     // Normalise to a list so single + batch payloads share one path.
     const rows = Array.isArray(body.stones) && body.stones.length
@@ -12176,6 +12197,8 @@ app.post('/api/jewelry-items/:id/stones', async (req, res) => {
 app.delete('/api/jewelry-items/:id/stones/:stoneId', async (req, res) => {
   try {
     const { id, stoneId } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!(await jewelryItemBelongsToTenant(id, ctx.tenantUserId))) return res.status(404).json({ error: 'Item not found' });
     // Just removing the row releases the stone back to inventory (the active-row index
     // no longer matches it). No extra cleanup needed because we don't mutate soap_stones.
     const r = await pool.query(
@@ -12215,6 +12238,8 @@ app.delete('/api/jewelry-items/:id/stones/:stoneId', async (req, res) => {
 app.post('/api/jewelry-items/:id/metals', async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!(await jewelryItemBelongsToTenant(id, ctx.tenantUserId))) return res.status(404).json({ error: 'Item not found' });
     const { metalType, purity, color, weightGrams, pricePerGram } = req.body || {};
     if (!weightGrams) return res.status(400).json({ error: 'weightGrams is required' });
     const totalCost = pricePerGram ? Number(pricePerGram) * Number(weightGrams) : null;
@@ -12232,6 +12257,8 @@ app.post('/api/jewelry-items/:id/metals', async (req, res) => {
 app.delete('/api/jewelry-items/:id/metals/:metalId', async (req, res) => {
   try {
     const { id, metalId } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!(await jewelryItemBelongsToTenant(id, ctx.tenantUserId))) return res.status(404).json({ error: 'Item not found' });
     const r = await pool.query(
       `DELETE FROM jewelry_item_metals WHERE id = $1 AND item_id = $2 RETURNING id`,
       [metalId, id]
@@ -12247,6 +12274,8 @@ app.delete('/api/jewelry-items/:id/metals/:metalId', async (req, res) => {
 app.post('/api/jewelry-items/:id/costs', async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!(await jewelryItemBelongsToTenant(id, ctx.tenantUserId))) return res.status(404).json({ error: 'Item not found' });
     const { label, category, amount, notes } = req.body || {};
     if (!label || amount == null) {
       return res.status(400).json({ error: 'label and amount are required' });
@@ -12265,6 +12294,8 @@ app.post('/api/jewelry-items/:id/costs', async (req, res) => {
 app.delete('/api/jewelry-items/:id/costs/:costId', async (req, res) => {
   try {
     const { id, costId } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!(await jewelryItemBelongsToTenant(id, ctx.tenantUserId))) return res.status(404).json({ error: 'Item not found' });
     const r = await pool.query(
       `DELETE FROM jewelry_item_costs WHERE id = $1 AND item_id = $2 RETURNING id`,
       [costId, id]
@@ -12280,6 +12311,8 @@ app.delete('/api/jewelry-items/:id/costs/:costId', async (req, res) => {
 app.post('/api/jewelry-items/:id/recalc', async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!(await jewelryItemBelongsToTenant(id, ctx.tenantUserId))) return res.status(404).json({ error: 'Item not found' });
     const stones = await pool.query(`SELECT snapshot FROM jewelry_item_stones WHERE item_id = $1`, [id]);
     const stonesTotal = stones.rows.reduce((sum, r) => {
       const p = Number(r.snapshot?.price ?? r.snapshot?.priceTotal ?? 0);
@@ -12306,15 +12339,25 @@ app.post('/api/jewelry-items/:id/recalc', async (req, res) => {
 app.post('/api/jewelry-items/:id/sell', async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const { contactId, salePrice, currency = 'USD', notes, userId } = req.body || {};
     if (!contactId) return res.status(400).json({ error: 'contactId is required' });
 
-    const itemRes = await pool.query(`SELECT * FROM jewelry_items WHERE id = $1`, [id]);
+    const itemRes = await pool.query(`SELECT * FROM jewelry_items WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
     const item = itemRes.rows[0];
     if (!item) return res.status(404).json({ error: 'Item not found' });
 
+    // The buyer contact must live in the same workspace.
+    const contactOk = await pool.query(
+      `SELECT 1 FROM crm_contacts WHERE id = $1 AND (user_id = $2 OR shared = TRUE) LIMIT 1`,
+      [contactId, ctx.tenantUserId]
+    );
+    if (!contactOk.rows.length) return res.status(404).json({ error: 'Contact not found' });
+
     const finalPrice = salePrice != null ? Number(salePrice) : Number(item.sale_price || 0);
-    const ownerUserId = userId || item.user_id;
+    // Always attribute the sale to the verified workspace owner, never a
+    // client-supplied userId.
+    const ownerUserId = item.user_id;
 
     // If the item is already attached to a CRM deal, reuse it: mark won + update value.
     // Otherwise spin up a brand new "won" deal so the sale always lives in the pipeline.
@@ -12474,6 +12517,8 @@ function getRequestIp(req) {
 app.get('/api/jewelry-items/:id/shares', async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!(await jewelryItemBelongsToTenant(id, ctx.tenantUserId))) return res.status(404).json({ error: 'Item not found' });
     const r = await pool.query(
       `SELECT s.*,
               (SELECT COUNT(*) FROM jewelry_share_responses
@@ -12497,11 +12542,12 @@ app.get('/api/jewelry-items/:id/shares', async (req, res) => {
 app.post('/api/jewelry-items/:id/shares', async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const { userId, expiresAt, notes } = req.body || {};
 
     const itemRes = await pool.query(
-      `SELECT user_id, name, sku, contact_id FROM jewelry_items WHERE id = $1`,
-      [id]
+      `SELECT user_id, name, sku, contact_id FROM jewelry_items WHERE id = $1 AND user_id = $2`,
+      [id, ctx.tenantUserId]
     );
     const item = itemRes.rows[0];
     if (!item) return res.status(404).json({ error: 'Item not found' });
@@ -12535,6 +12581,8 @@ app.post('/api/jewelry-items/:id/shares', async (req, res) => {
 app.delete('/api/jewelry-items/:id/shares/:shareId', async (req, res) => {
   try {
     const { id, shareId } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!(await jewelryItemBelongsToTenant(id, ctx.tenantUserId))) return res.status(404).json({ error: 'Item not found' });
     const r = await pool.query(
       `UPDATE jewelry_shares
           SET revoked_at = NOW()
@@ -12747,6 +12795,8 @@ app.post('/api/share/:token/respond', async (req, res) => {
 app.get('/api/jewelry-items/:id/share-responses', async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!(await jewelryItemBelongsToTenant(id, ctx.tenantUserId))) return res.status(404).json({ error: 'Item not found' });
     const r = await pool.query(
       `SELECT r.*, s.token
          FROM jewelry_share_responses r
@@ -12772,6 +12822,8 @@ app.get('/api/jewelry-items/:id/share-responses', async (req, res) => {
 app.post('/api/jewelry-items/:id/ai-mockup', sensitiveLimiter, requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
+    if (!(await jewelryItemBelongsToTenant(id, ctx.tenantUserId))) return res.status(404).json({ error: 'Item not found' });
     const {
       prompt,
       userId,
