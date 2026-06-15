@@ -13258,12 +13258,12 @@ app.post('/api/team/members', async (req, res) => {
       let inviteResult = { ok: false, skipped: true };
       let inviteBlocked = false;
       if (role !== 'owner') {
-        // Where do we send them after they finish signing up?
-        // Reps land in the dashboard; store users land directly in the portal.
+        // Land the invitee on our dedicated /sign-up page with the email
+        // prefilled. Clerk appends `__clerk_ticket` to this URL, and our
+        // LoginSheet completes the ticket sign-up there. (Post-sign-up
+        // navigation to the dashboard/portal is handled client-side.)
         const postSignUpRedirect =
-          role === 'store_user'
-            ? `${FRONTEND_URL.replace(/\/$/, '')}/store-portal`
-            : `${FRONTEND_URL.replace(/\/$/, '')}/dashboard`;
+          `${FRONTEND_URL.replace(/\/$/, '')}/sign-up?email=${encodeURIComponent(member.email)}`;
 
         // Mint a Clerk invitation ticket so the invitee can sign up even
         // when Sign-up Mode is set to Restricted in the Clerk dashboard.
@@ -13513,7 +13513,7 @@ app.post('/api/team/members/:id/resend-invite', async (req, res) => {
     // at a working URL (Clerk doesn't expose ticket URLs on GET).
     const inviteResult = await createClerkInvitation({
       email: member.email,
-      redirectUrl: `${FRONTEND_URL.replace(/\/$/, '')}/dashboard`,
+      redirectUrl: `${FRONTEND_URL.replace(/\/$/, '')}/sign-up?email=${encodeURIComponent(member.email)}`,
       metadata: {
         team_owner_id: ownerId,
         team_member_id: member.id,
