@@ -1,5 +1,7 @@
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 const { Pool } = require("pg");
 const dotenv = require("dotenv");
 const path = require("path");
@@ -15,6 +17,10 @@ const clerkClient = CLERK_SECRET_KEY
   ? createClerkClient({ secretKey: CLERK_SECRET_KEY })
   : null;
 const app = express();
+// Render/Vercel terminate TLS at a proxy; trust the first hop so req.ip
+// reflects the real client (correct per-client rate limiting) instead of the
+// shared proxy address.
+app.set('trust proxy', 1);
 const port = process.env.PORT;
 const dbUrl = process.env.DATABASE_URL;
 
@@ -24,7 +30,52 @@ const pool = new Pool({
 });
 
 console.log("🟢 Backend is running — This is the correct file.");
-app.use(cors());
+
+// Security headers. CSP/CORP are disabled because this server also serves
+// images (diamond cards, image-proxy, blob) that the frontend loads
+// cross-origin; the useful protections (HSTS, nosniff, frame-deny, etc.)
+// stay on.
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: false,
+  crossOriginEmbedderPolicy: false,
+}));
+
+// CORS allowlist. Auth is token-based (Bearer), not cookie-based, so we do
+// not enable credentials. Requests with no Origin (curl, server-to-server,
+// same-origin) are allowed; browser origins must be on the allowlist.
+const CORS_ALLOWLIST = [
+  process.env.FRONTEND_URL,
+  "https://gems-dna.com",
+  "https://www.gems-dna.com",
+].filter(Boolean);
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // non-browser / same-origin
+  if (CORS_ALLOWLIST.includes(origin)) return true;
+  try {
+    const { hostname, protocol } = new URL(origin);
+    if (protocol === "http:" && (hostname === "localhost" || hostname === "127.0.0.1")) return true;
+    if (hostname.endsWith(".vercel.app")) return true; // preview deploys
+  } catch (_) {}
+  return false;
+}
+
+app.use(cors({
+  origin: (origin, cb) => cb(null, isAllowedOrigin(origin)),
+}));
+
+// Rate limiter for sensitive / expensive endpoints (invites, imports, AI,
+// session control, card scanning). Deliberately NOT global so the data-heavy
+// inventory UI is never throttled.
+const sensitiveLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please slow down.' },
+});
+
 app.use(express.json({ limit: '50mb' }));
 // navigator.sendBeacon (used by the rep-activity tracker) posts a text/plain
 // body to dodge a CORS preflight it can't perform. Parse those as raw text;
@@ -77,6 +128,26 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ error: 'Authentication required' });
 }
 
+// Guard for owner/admin-only endpoints (destructive or workspace-wide
+// operations: full re-sync, CSV import, etc.). Resolves the verified team
+// context and rejects anyone who is not an owner/admin. The resolved
+// context is cached on req.teamCtx so the handler can reuse it.
+async function requireOwner(req, res, next) {
+  if (!req.auth || !req.auth.userId) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (!ctx.isOwner) {
+      return res.status(403).json({ error: 'Owner access required' });
+    }
+    req.teamCtx = ctx;
+    return next();
+  } catch (e) {
+    return res.status(500).json({ error: 'Authorization check failed' });
+  }
+}
+
 /* =========================================================
    Single-active-session policy
    ---------------------------------------------------------
@@ -116,7 +187,7 @@ async function otherActiveSessions(sessionId) {
 }
 
 // Peek: does this freshly-signed-in user already have other live sessions?
-app.post('/api/auth/sessions/peers', async (req, res) => {
+app.post('/api/auth/sessions/peers', sensitiveLimiter, async (req, res) => {
   try {
     if (!clerkClient) return res.json({ count: 0, others: [] });
     const sessionId = String(req.body?.sessionId || '').trim();
@@ -134,7 +205,7 @@ app.post('/api/auth/sessions/peers', async (req, res) => {
 
 // Take over: revoke every OTHER active session for this user, keeping only the
 // one just created on this device.
-app.post('/api/auth/sessions/revoke-others', async (req, res) => {
+app.post('/api/auth/sessions/revoke-others', sensitiveLimiter, async (req, res) => {
   try {
     if (!clerkClient) return res.json({ ok: true, revoked: 0 });
     const sessionId = String(req.body?.sessionId || '').trim();
@@ -152,7 +223,7 @@ app.post('/api/auth/sessions/revoke-others', async (req, res) => {
 
 // Cancel: drop the just-created session so it doesn't linger when the user
 // chooses not to take over.
-app.post('/api/auth/sessions/revoke', async (req, res) => {
+app.post('/api/auth/sessions/revoke', sensitiveLimiter, async (req, res) => {
   try {
     if (!clerkClient) return res.json({ ok: true });
     const sessionId = String(req.body?.sessionId || '').trim();
@@ -1450,7 +1521,7 @@ app.get("/api/jewelry/import-csv/progress", (req, res) => {
   res.json(jewelryImportProgress);
 });
 
-app.post("/api/jewelry/import-csv", async (req, res) => {
+app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, res) => {
   if (jewelryImportProgress.active) {
     return res.status(409).json({ success: false, error: "A jewelry import is already in progress" });
   }
@@ -1637,9 +1708,7 @@ app.get("/api/jewelry/:modelNumber", async (req, res) => {
     });
 
     if (item.price !== null && item.price !== undefined) {
-      const originalPrice = item.price;
       item.price = encrypt(item.price.toString());
-      console.log("🔐 Encrypted price:", originalPrice, "→", item.price);
     }
 
     res.json(item);
@@ -1936,7 +2005,7 @@ app.get("/api/sync/progress", (req, res) => {
   res.json(syncProgress);
 });
 
-app.post("/api/sync", async (req, res) => {
+app.post("/api/sync", sensitiveLimiter, requireOwner, async (req, res) => {
   if (syncProgress.active) {
     return res.status(409).json({ 
       success: false, 
@@ -2017,6 +2086,56 @@ app.post("/api/sync", async (req, res) => {
    /api/image-proxy – Proxy for loading images (bypass CORS)
    ========================================================= */
 const fetch = require('node-fetch');
+const dns = require('dns').promises;
+const net = require('net');
+
+// SSRF guard: reject private / loopback / link-local / reserved addresses so
+// the image proxy can't be turned into a tool for reaching internal services
+// (cloud metadata at 169.254.169.254, localhost, RFC1918 ranges, etc.).
+function isPrivateIp(ip) {
+  if (!ip) return true;
+  let addr = ip;
+  // IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) → inspect the embedded v4.
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(addr);
+  if (mapped) addr = mapped[1];
+
+  if (net.isIPv4(addr)) {
+    const p = addr.split('.').map(Number);
+    if (p[0] === 10) return true;
+    if (p[0] === 127) return true;
+    if (p[0] === 0) return true;
+    if (p[0] === 169 && p[1] === 254) return true;          // link-local / metadata
+    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+    if (p[0] === 192 && p[1] === 168) return true;
+    if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return true; // CGNAT
+    if (p[0] >= 224) return true;                            // multicast / reserved
+    return false;
+  }
+  if (net.isIPv6(addr)) {
+    const low = addr.toLowerCase();
+    if (low === '::1' || low === '::') return true;
+    if (low.startsWith('fc') || low.startsWith('fd')) return true; // ULA
+    if (low.startsWith('fe8') || low.startsWith('fe9') || low.startsWith('fea') || low.startsWith('feb')) return true; // link-local
+    return false;
+  }
+  return true; // unknown format → treat as unsafe
+}
+
+async function assertPublicHttpUrl(rawUrl) {
+  let parsed;
+  try { parsed = new URL(rawUrl); } catch (_) { throw new Error('Invalid URL'); }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Only http/https URLs are allowed');
+  }
+  // Block direct private-IP hosts and resolve hostnames to verify they don't
+  // point at an internal address.
+  const host = parsed.hostname;
+  if (net.isIP(host) && isPrivateIp(host)) throw new Error('Blocked address');
+  const records = await dns.lookup(host, { all: true });
+  if (!records.length || records.some((r) => isPrivateIp(r.address))) {
+    throw new Error('Blocked address');
+  }
+}
 
 app.get("/api/image-proxy", async (req, res) => {
   try {
@@ -2026,11 +2145,19 @@ app.get("/api/image-proxy", async (req, res) => {
       return res.status(400).json({ error: "URL parameter required" });
     }
 
+    try {
+      await assertPublicHttpUrl(url);
+    } catch (e) {
+      return res.status(400).json({ error: "Invalid or disallowed image URL" });
+    }
+
     console.log("📷 Proxying image:", url);
 
     // Fetch the image from the external URL
     const response = await fetch(url, {
       timeout: 15000,
+      follow: 2,
+      size: 25 * 1024 * 1024,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'image/*,*/*;q=0.8',
@@ -2100,7 +2227,7 @@ app.get("/api/import-csv/progress", (req, res) => {
   res.json(csvImportProgress);
 });
 
-app.post("/api/import-csv", async (req, res) => {
+app.post("/api/import-csv", sensitiveLimiter, requireOwner, async (req, res) => {
   if (csvImportProgress.active) {
     return res.status(409).json({ success: false, error: "A CSV import is already in progress" });
   }
@@ -4254,7 +4381,7 @@ app.get("/api/crm/tags", async (req, res) => {
 });
 
 /* ---------- Verify business online (OpenAI Web Search) ---------- */
-app.post("/api/crm/verify-business", async (req, res) => {
+app.post("/api/crm/verify-business", sensitiveLimiter, requireAuth, async (req, res) => {
   try {
     const { contact } = req.body;
     if (!contact || (!contact.name && !contact.company)) {
@@ -6248,7 +6375,7 @@ app.get("/api/dashboard/reports", async (req, res) => {
 
 const normPhone = (p) => (p || "").replace(/[^\d]/g, "");
 
-app.post("/api/crm/scan-card", async (req, res) => {
+app.post("/api/crm/scan-card", sensitiveLimiter, requireAuth, async (req, res) => {
   try {
     const { userId, imageBase64, imageBase64Front, imageBase64Back } = req.body;
     if (!userId) return res.status(400).json({ error: "userId is required" });
@@ -12542,7 +12669,7 @@ app.get('/api/jewelry-items/:id/share-responses', async (req, res) => {
 // flag. We compose a strong prompt for jewelry photography, ask OpenAI's
 // gpt-image-1 model for a 1024x1024 b64 PNG, push it to Vercel Blob, and
 // register it on the item as kind='ai_mockup'. Optionally promote to cover.
-app.post('/api/jewelry-items/:id/ai-mockup', async (req, res) => {
+app.post('/api/jewelry-items/:id/ai-mockup', sensitiveLimiter, requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const {
@@ -12681,7 +12808,7 @@ app.post('/api/jewelry-items/:id/ai-mockup', async (req, res) => {
 });
 
 /* ---------- Vercel Blob: Upload ---------- */
-app.post('/api/blob/upload', blobUpload.single('file'), async (req, res) => {
+app.post('/api/blob/upload', sensitiveLimiter, requireAuth, blobUpload.single('file'), async (req, res) => {
   try {
     if (!blobPut) {
       return res.status(503).json({
@@ -13340,7 +13467,7 @@ app.get('/api/team/members', async (req, res) => {
 // POST /api/team/members  — admin invites a rep by email + name.
 // The rep doesn't need to exist in Clerk yet; clerk_user_id gets backfilled
 // when they first sign in (resolveTeamContext does the email match).
-app.post('/api/team/members', async (req, res) => {
+app.post('/api/team/members', sensitiveLimiter, async (req, res) => {
   try {
     const ctx = await resolveTeamContext(req);
     if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
@@ -13729,7 +13856,7 @@ app.delete('/api/team/members/:id', async (req, res) => {
 // POST /api/team/members/:id/resend-invite
 //   Owner-only. Re-sends the invitation email and bumps invite_count /
 //   last_invited_at. Returns the updated row + the email status.
-app.post('/api/team/members/:id/resend-invite', async (req, res) => {
+app.post('/api/team/members/:id/resend-invite', sensitiveLimiter, async (req, res) => {
   try {
     const ctx = await resolveTeamContext(req);
     if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
