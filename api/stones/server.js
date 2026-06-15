@@ -13256,6 +13256,7 @@ app.post('/api/team/members', async (req, res) => {
       // onboarding email so they can actually sign up and sign in.
       let emailResult = { ok: false, skipped: true };
       let inviteResult = { ok: false, skipped: true };
+      let inviteBlocked = false;
       if (role !== 'owner') {
         // Where do we send them after they finish signing up?
         // Reps land in the dashboard; store users land directly in the portal.
@@ -13292,16 +13293,30 @@ app.post('/api/team/members', async (req, res) => {
           console.warn(`[clerk invite] ${member.email}:`, inviteResult.error);
         }
 
-        emailResult = await sendTeamInviteEmail({
-          rep: member,
-          inviter,
-          workspaceName,
-          ctaUrl,
-          variant: role === 'store_user' ? 'store_user' : 'rep',
-          companyName: companyRow?.name || null,
-        });
-        if (!emailResult.ok && !emailResult.skipped) {
-          console.warn(`[team invite] failed to email ${member.email}:`, emailResult.error);
+        // Safety net: under Restricted sign-up, a ticket-less /sign-up link can
+        // NEVER work. If we couldn't mint a ticket (and the invitee isn't an
+        // existing user), refuse to email a dead link — surface the
+        // misconfiguration loudly so the owner can fix CLERK_SECRET_KEY and
+        // resend, rather than the invite silently failing for the recipient.
+        inviteBlocked = !ctaUrl && !inviteResult.alreadyUser;
+        if (inviteBlocked) {
+          console.error(
+            `[team invite] No invitation ticket for ${member.email} — ` +
+            `${inviteResult.skipped ? 'CLERK_SECRET_KEY not configured' : (inviteResult.error || 'Clerk API error')}. ` +
+            `Not sending a ticket-less link that cannot work under Restricted sign-up.`
+          );
+        } else {
+          emailResult = await sendTeamInviteEmail({
+            rep: member,
+            inviter,
+            workspaceName,
+            ctaUrl,
+            variant: role === 'store_user' ? 'store_user' : 'rep',
+            companyName: companyRow?.name || null,
+          });
+          if (!emailResult.ok && !emailResult.skipped) {
+            console.warn(`[team invite] failed to email ${member.email}:`, emailResult.error);
+          }
         }
       }
 
@@ -13316,7 +13331,12 @@ app.post('/api/team/members', async (req, res) => {
           ticketed:    inviteResult.ok === true && !inviteResult.alreadyUser && !!inviteResult.url,
           alreadyUser: inviteResult.alreadyUser === true,
           skipped:     inviteResult.skipped === true,
-          error:       inviteResult.ok ? null : (inviteResult.error || null),
+          blocked:     inviteBlocked,
+          error: inviteBlocked
+            ? (inviteResult.skipped
+                ? 'Invitation link could not be created: CLERK_SECRET_KEY is not configured on the server. Set it and resend.'
+                : `Invitation link could not be created: ${inviteResult.error || 'Clerk API error'}. Fix and resend.`)
+            : (inviteResult.ok ? null : (inviteResult.error || null)),
         },
       });
 
@@ -13510,6 +13530,21 @@ app.post('/api/team/members/:id/resend-invite', async (req, res) => {
     }
     if (!inviteResult.ok && !inviteResult.skipped) {
       console.warn(`[clerk invite resend] ${member.email}:`, inviteResult.error);
+    }
+
+    // Safety net: don't email a ticket-less /sign-up link — it can't work under
+    // Restricted sign-up. Fail loudly so the owner fixes the config & retries.
+    if (!ctaUrl && !inviteResult.alreadyUser) {
+      console.error(
+        `[clerk invite resend] No invitation ticket for ${member.email} — ` +
+        `${inviteResult.skipped ? 'CLERK_SECRET_KEY not configured' : (inviteResult.error || 'Clerk API error')}.`
+      );
+      return res.status(inviteResult.skipped ? 503 : 502).json({
+        error: inviteResult.skipped
+          ? 'Cannot create an invitation link: CLERK_SECRET_KEY is not configured on the server.'
+          : `Cannot create an invitation link: ${inviteResult.error || 'Clerk API error'}.`,
+        member,
+      });
     }
 
     const emailResult = await sendTeamInviteEmail({ rep: member, inviter, workspaceName, ctaUrl });
