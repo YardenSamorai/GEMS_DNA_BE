@@ -2390,7 +2390,8 @@ app.post("/api/saved-filters", async (req, res) => {
 app.delete("/api/saved-filters/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query("DELETE FROM saved_filters WHERE id = $1", [id]);
+    const ctx = await resolveTeamContext(req);
+    await pool.query("DELETE FROM saved_filters WHERE id = $1 AND user_id = $2", [id, ctx.actorUserId]);
     res.json({ success: true });
   } catch (error) {
     console.error("Error deleting saved filter:", error);
@@ -2447,6 +2448,7 @@ app.post("/api/label-templates", async (req, res) => {
 app.put("/api/label-templates/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const { name, elements, isActive } = req.body;
     const fields = [];
     const values = [];
@@ -2460,8 +2462,9 @@ app.put("/api/label-templates/:id", async (req, res) => {
     if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
 
     values.push(id);
+    values.push(ctx.actorUserId);
     const result = await pool.query(
-      `UPDATE label_templates SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      `UPDATE label_templates SET ${fields.join(", ")} WHERE id = $${idx} AND user_id = $${idx + 1} RETURNING *`,
       values
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Template not found" });
@@ -2493,7 +2496,8 @@ app.put("/api/label-templates/set-active/:id", async (req, res) => {
 app.delete("/api/label-templates/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query("DELETE FROM label_templates WHERE id = $1", [id]);
+    const ctx = await resolveTeamContext(req);
+    await pool.query("DELETE FROM label_templates WHERE id = $1 AND user_id = $2", [id, ctx.actorUserId]);
     res.json({ success: true });
   } catch (error) {
     console.error("Error deleting label template:", error);
@@ -3838,12 +3842,18 @@ app.put("/api/crm/contacts/:id", async (req, res) => {
     if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
 
     // Snapshot the row before mutating so we can compute a `changes` diff.
-    const beforeRes = await pool.query("SELECT * FROM crm_contacts WHERE id = $1", [id]);
+    // Scoped to the caller's workspace so one tenant can never edit another's.
+    const beforeRes = await pool.query(
+      "SELECT * FROM crm_contacts WHERE id = $1 AND (user_id = $2 OR shared = TRUE)",
+      [id, ctx.tenantUserId]
+    );
     const before = beforeRes.rows[0] || null;
+    if (!before) return res.status(404).json({ error: "Contact not found" });
 
     values.push(id);
+    values.push(ctx.tenantUserId);
     const result = await pool.query(
-      `UPDATE crm_contacts SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      `UPDATE crm_contacts SET ${fields.join(", ")} WHERE id = $${idx} AND (user_id = $${idx + 1} OR shared = TRUE) RETURNING *`,
       values
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Contact not found" });
@@ -3884,12 +3894,15 @@ app.put("/api/crm/contacts/:id", async (req, res) => {
 app.delete("/api/crm/contacts/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     // Capture name + owner before delete so the activity row is human-readable.
+    // Scoped to the caller's workspace to prevent cross-tenant deletes.
     const beforeRes = await pool.query(
-      "SELECT user_id, name FROM crm_contacts WHERE id = $1",
-      [id]
+      "SELECT user_id, name FROM crm_contacts WHERE id = $1 AND (user_id = $2 OR shared = TRUE)",
+      [id, ctx.tenantUserId]
     );
-    await pool.query("DELETE FROM crm_contacts WHERE id = $1", [id]);
+    if (!beforeRes.rows.length) return res.status(404).json({ error: "Contact not found" });
+    await pool.query("DELETE FROM crm_contacts WHERE id = $1 AND (user_id = $2 OR shared = TRUE)", [id, ctx.tenantUserId]);
     res.json({ success: true });
 
     const before = beforeRes.rows[0];
@@ -4002,6 +4015,7 @@ app.get("/api/health", (req, res) => {
 // after the (lean) list payload has already painted.
 app.get("/api/crm/contacts/thumbs", async (req, res) => {
   try {
+    const ctx = await resolveTeamContext(req);
     const ids = String(req.query.ids || "")
       .split(",")
       .map((x) => parseInt(x, 10))
@@ -4013,14 +4027,17 @@ app.get("/api/crm/contacts/thumbs", async (req, res) => {
     // generated (legacy contacts created before the thumb pipeline existed).
     // The FE is expected to downscale `thumb` locally when `needs_backfill`
     // is true and POST a real thumb back, so subsequent loads are small.
+    // Scoped to the caller's workspace so card images can't be enumerated
+    // across tenants by guessing ids.
     const r = await pool.query(
       `SELECT id,
               COALESCE(card_image_thumb, card_image_front) AS thumb,
               (card_image_thumb IS NULL AND card_image_front IS NOT NULL) AS needs_backfill
          FROM crm_contacts
         WHERE id = ANY($1::int[])
+          AND (user_id = $2 OR shared = TRUE)
           AND (card_image_thumb IS NOT NULL OR card_image_front IS NOT NULL)`,
-      [capped]
+      [capped, ctx.tenantUserId]
     );
     // Cache hint: thumbs change rarely
     res.set("Cache-Control", "private, max-age=60");
@@ -4505,15 +4522,24 @@ ${detailsLines}`;
 
 app.post("/api/crm/interactions", async (req, res) => {
   try {
+    const ctx = await resolveTeamContext(req);
     const { userId, contactId, dealId, type, direction, subject, content, metadata, occurredAt } = req.body;
     if (!userId || !contactId || !type) return res.status(400).json({ error: "userId, contactId and type are required" });
+
+    // The contact the interaction is attached to must live in the caller's
+    // workspace — blocks logging activity against another tenant's contact.
+    const owns = await pool.query(
+      "SELECT 1 FROM crm_contacts WHERE id = $1 AND (user_id = $2 OR shared = TRUE) LIMIT 1",
+      [contactId, ctx.tenantUserId]
+    );
+    if (!owns.rows.length) return res.status(404).json({ error: "Contact not found" });
 
     const result = await pool.query(
       `INSERT INTO crm_interactions (user_id, contact_id, deal_id, type, direction, subject, content, metadata, occurred_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9, NOW())) RETURNING *`,
       [userId, contactId, dealId || null, type, direction || 'outgoing', subject || null, content || null, JSON.stringify(metadata || {}), occurredAt || null]
     );
-    await pool.query("UPDATE crm_contacts SET last_contact_at = NOW(), updated_at = NOW() WHERE id = $1", [contactId]);
+    await pool.query("UPDATE crm_contacts SET last_contact_at = NOW(), updated_at = NOW() WHERE id = $1 AND (user_id = $2 OR shared = TRUE)", [contactId, ctx.tenantUserId]);
     res.status(201).json(result.rows[0]);
 
     // Mirror into the unified activity log so the contact's timeline + the
@@ -4544,11 +4570,13 @@ app.post("/api/crm/interactions", async (req, res) => {
 app.delete("/api/crm/interactions/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const beforeRes = await pool.query(
-      "SELECT user_id, contact_id, deal_id, subject, type FROM crm_interactions WHERE id = $1",
-      [id]
+      "SELECT user_id, contact_id, deal_id, subject, type FROM crm_interactions WHERE id = $1 AND user_id = $2",
+      [id, ctx.tenantUserId]
     );
-    await pool.query("DELETE FROM crm_interactions WHERE id = $1", [id]);
+    if (!beforeRes.rows.length) return res.status(404).json({ error: "Interaction not found" });
+    await pool.query("DELETE FROM crm_interactions WHERE id = $1 AND user_id = $2", [id, ctx.tenantUserId]);
     res.json({ success: true });
 
     const before = beforeRes.rows[0];
@@ -4742,12 +4770,18 @@ app.put("/api/crm/deals/:id", async (req, res) => {
     if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
 
     // Snapshot before so we can detect stage transitions and field diffs.
-    const beforeRes = await pool.query("SELECT * FROM crm_deals WHERE id = $1", [id]);
+    // Scoped to the caller's workspace.
+    const beforeRes = await pool.query(
+      "SELECT * FROM crm_deals WHERE id = $1 AND (user_id = $2 OR shared = TRUE)",
+      [id, ctx.tenantUserId]
+    );
     const before = beforeRes.rows[0] || null;
+    if (!before) return res.status(404).json({ error: "Deal not found" });
 
     values.push(id);
+    values.push(ctx.tenantUserId);
     const result = await pool.query(
-      `UPDATE crm_deals SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      `UPDATE crm_deals SET ${fields.join(", ")} WHERE id = $${idx} AND (user_id = $${idx + 1} OR shared = TRUE) RETURNING *`,
       values
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Deal not found" });
@@ -4787,11 +4821,13 @@ app.put("/api/crm/deals/:id", async (req, res) => {
 app.delete("/api/crm/deals/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const beforeRes = await pool.query(
-      "SELECT user_id, title, contact_id FROM crm_deals WHERE id = $1",
-      [id]
+      "SELECT user_id, title, contact_id FROM crm_deals WHERE id = $1 AND user_id = $2",
+      [id, ctx.tenantUserId]
     );
-    await pool.query("DELETE FROM crm_deals WHERE id = $1", [id]);
+    if (!beforeRes.rows.length) return res.status(404).json({ error: "Deal not found" });
+    await pool.query("DELETE FROM crm_deals WHERE id = $1 AND user_id = $2", [id, ctx.tenantUserId]);
     res.json({ success: true });
 
     const before = beforeRes.rows[0];
@@ -4818,8 +4854,16 @@ app.delete("/api/crm/deals/:id", async (req, res) => {
 app.post("/api/crm/deals/:id/items", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const { items } = req.body;
     if (!Array.isArray(items)) return res.status(400).json({ error: "items array is required" });
+
+    // The parent deal must belong to the caller's workspace.
+    const ownsDeal = await pool.query(
+      "SELECT 1 FROM crm_deals WHERE id = $1 AND (user_id = $2 OR shared = TRUE) LIMIT 1",
+      [id, ctx.tenantUserId]
+    );
+    if (!ownsDeal.rows.length) return res.status(404).json({ error: "Deal not found" });
 
     const inserted = [];
     for (const item of items) {
@@ -4858,6 +4902,7 @@ app.post("/api/crm/deals/:id/items", async (req, res) => {
 app.put("/api/crm/deal-items/:itemId", async (req, res) => {
   try {
     const { itemId } = req.params;
+    const ctx = await resolveTeamContext(req);
     const allowed = ['custom_price','quantity','notes'];
     const fields = [];
     const values = [];
@@ -4871,10 +4916,16 @@ app.put("/api/crm/deal-items/:itemId", async (req, res) => {
     }
     if (fields.length === 0) return res.status(400).json({ error: "No fields to update" });
     values.push(itemId);
+    values.push(ctx.tenantUserId);
+    // Only touch items whose parent deal belongs to the caller's workspace.
     const result = await pool.query(
-      `UPDATE crm_deal_items SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      `UPDATE crm_deal_items SET ${fields.join(", ")}
+        WHERE id = $${idx}
+          AND deal_id IN (SELECT id FROM crm_deals WHERE user_id = $${idx + 1})
+        RETURNING *`,
       values
     );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Deal item not found" });
     res.json(result.rows[0]);
   } catch (error) {
     console.error("Error updating deal item:", error);
@@ -4884,7 +4935,13 @@ app.put("/api/crm/deal-items/:itemId", async (req, res) => {
 
 app.delete("/api/crm/deal-items/:itemId", async (req, res) => {
   try {
-    await pool.query("DELETE FROM crm_deal_items WHERE id = $1", [req.params.itemId]);
+    const ctx = await resolveTeamContext(req);
+    await pool.query(
+      `DELETE FROM crm_deal_items
+        WHERE id = $1
+          AND deal_id IN (SELECT id FROM crm_deals WHERE user_id = $2)`,
+      [req.params.itemId, ctx.tenantUserId]
+    );
     res.json({ success: true });
   } catch (error) {
     console.error("Error deleting deal item:", error);
@@ -5005,14 +5062,20 @@ app.put("/api/crm/tasks/:id", async (req, res) => {
     fields.push(`updated_at = NOW()`);
     if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
 
-    const beforeRes = await pool.query("SELECT * FROM crm_tasks WHERE id = $1", [id]);
+    const beforeRes = await pool.query(
+      "SELECT * FROM crm_tasks WHERE id = $1 AND user_id = $2",
+      [id, ctx.tenantUserId]
+    );
     const before = beforeRes.rows[0] || null;
+    if (!before) return res.status(404).json({ error: "Task not found" });
 
     values.push(id);
+    values.push(ctx.tenantUserId);
     const result = await pool.query(
-      `UPDATE crm_tasks SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      `UPDATE crm_tasks SET ${fields.join(", ")} WHERE id = $${idx} AND user_id = $${idx + 1} RETURNING *`,
       values
     );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Task not found" });
     res.json(result.rows[0]);
 
     const after = result.rows[0];
@@ -5049,11 +5112,13 @@ app.put("/api/crm/tasks/:id", async (req, res) => {
 app.delete("/api/crm/tasks/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const beforeRes = await pool.query(
-      "SELECT user_id, title, contact_id, deal_id FROM crm_tasks WHERE id = $1",
-      [id]
+      "SELECT user_id, title, contact_id, deal_id FROM crm_tasks WHERE id = $1 AND user_id = $2",
+      [id, ctx.tenantUserId]
     );
-    await pool.query("DELETE FROM crm_tasks WHERE id = $1", [id]);
+    if (!beforeRes.rows.length) return res.status(404).json({ error: "Task not found" });
+    await pool.query("DELETE FROM crm_tasks WHERE id = $1 AND user_id = $2", [id, ctx.tenantUserId]);
     res.json({ success: true });
 
     const before = beforeRes.rows[0];
@@ -5144,6 +5209,7 @@ app.get("/api/crm/interactions", async (req, res) => {
 app.put("/api/crm/interactions/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const allowed = ["type", "direction", "subject", "content", "metadata", "occurred_at"];
     const fields = [];
     const values = [];
@@ -5157,10 +5223,12 @@ app.put("/api/crm/interactions/:id", async (req, res) => {
     }
     if (fields.length === 0) return res.status(400).json({ error: "No fields to update" });
     values.push(id);
+    values.push(ctx.tenantUserId);
     const result = await pool.query(
-      `UPDATE crm_interactions SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      `UPDATE crm_interactions SET ${fields.join(", ")} WHERE id = $${idx} AND user_id = $${idx + 1} RETURNING *`,
       values
     );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Interaction not found" });
     res.json(result.rows[0]);
   } catch (error) {
     console.error("Error updating interaction:", error);
@@ -5218,13 +5286,14 @@ app.get("/api/crm/invoices", async (req, res) => {
 
 app.get("/api/crm/invoices/:id", async (req, res) => {
   try {
+    const ctx = await resolveTeamContext(req);
     const result = await pool.query(
       `SELECT i.*, c.name AS contact_name, d.title AS deal_title
        FROM crm_invoices i
        LEFT JOIN crm_contacts c ON c.id = i.contact_id
        LEFT JOIN crm_deals d ON d.id = i.deal_id
-       WHERE i.id = $1`,
-      [req.params.id]
+       WHERE i.id = $1 AND i.user_id = $2`,
+      [req.params.id, ctx.tenantUserId]
     );
     if (!result.rows[0]) return res.status(404).json({ error: "Invoice not found" });
     res.json(result.rows[0]);
@@ -5268,6 +5337,7 @@ app.post("/api/crm/invoices", async (req, res) => {
 app.put("/api/crm/invoices/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const allowed = ["status", "subtotal", "tax", "total", "currency", "issued_at", "due_at", "paid_at", "notes", "metadata", "deal_id"];
     const fields = [];
     const values = [];
@@ -5286,10 +5356,12 @@ app.put("/api/crm/invoices/:id", async (req, res) => {
     fields.push(`updated_at = NOW()`);
     if (fields.length === 1) return res.status(400).json({ error: "No fields to update" });
     values.push(id);
+    values.push(ctx.tenantUserId);
     const result = await pool.query(
-      `UPDATE crm_invoices SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      `UPDATE crm_invoices SET ${fields.join(", ")} WHERE id = $${idx} AND user_id = $${idx + 1} RETURNING *`,
       values
     );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Invoice not found" });
     res.json(result.rows[0]);
   } catch (error) {
     console.error("Error updating invoice:", error);
@@ -5299,7 +5371,8 @@ app.put("/api/crm/invoices/:id", async (req, res) => {
 
 app.delete("/api/crm/invoices/:id", async (req, res) => {
   try {
-    await pool.query("DELETE FROM crm_invoices WHERE id = $1", [req.params.id]);
+    const ctx = await resolveTeamContext(req);
+    await pool.query("DELETE FROM crm_invoices WHERE id = $1 AND user_id = $2", [req.params.id, ctx.tenantUserId]);
     res.json({ success: true });
   } catch (error) {
     console.error("Error deleting invoice:", error);
@@ -5370,6 +5443,7 @@ app.post("/api/crm/occasions", async (req, res) => {
 app.put("/api/crm/occasions/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const allowed = ["kind", "label", "occurs_on", "recurring_yearly", "notes"];
     const fields = [];
     const values = [];
@@ -5383,10 +5457,12 @@ app.put("/api/crm/occasions/:id", async (req, res) => {
     }
     if (fields.length === 0) return res.status(400).json({ error: "No fields to update" });
     values.push(id);
+    values.push(ctx.tenantUserId);
     const result = await pool.query(
-      `UPDATE crm_occasions SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      `UPDATE crm_occasions SET ${fields.join(", ")} WHERE id = $${idx} AND user_id = $${idx + 1} RETURNING *`,
       values
     );
+    if (result.rows.length === 0) return res.status(404).json({ error: "Occasion not found" });
     res.json(result.rows[0]);
   } catch (error) {
     console.error("Error updating occasion:", error);
@@ -5396,7 +5472,8 @@ app.put("/api/crm/occasions/:id", async (req, res) => {
 
 app.delete("/api/crm/occasions/:id", async (req, res) => {
   try {
-    await pool.query("DELETE FROM crm_occasions WHERE id = $1", [req.params.id]);
+    const ctx = await resolveTeamContext(req);
+    await pool.query("DELETE FROM crm_occasions WHERE id = $1 AND user_id = $2", [req.params.id, ctx.tenantUserId]);
     res.json({ success: true });
   } catch (error) {
     console.error("Error deleting occasion:", error);
@@ -6784,9 +6861,10 @@ app.put("/api/crm/companies/:id", async (req, res) => {
     if (!fields.length) return res.status(400).json({ error: 'No updatable fields supplied' });
     fields.push(`updated_at = NOW()`);
     values.push(id);
+    values.push(ctx.tenantUserId);
 
     const r = await pool.query(
-      `UPDATE crm_companies SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
+      `UPDATE crm_companies SET ${fields.join(', ')} WHERE id = $${idx} AND user_id = $${idx + 1} RETURNING *`,
       values
     );
     if (r.rows.length === 0) return res.status(404).json({ error: 'Company not found' });
@@ -6808,18 +6886,20 @@ app.put("/api/crm/companies/:id", async (req, res) => {
 app.delete("/api/crm/companies/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const before = await pool.query(`SELECT user_id, name FROM crm_companies WHERE id = $1`, [id]);
+    const ctx = await resolveTeamContext(req);
+    const before = await pool.query(`SELECT user_id, name FROM crm_companies WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
+    if (!before.rows.length) return res.status(404).json({ error: 'Company not found' });
     // Refuse to delete a company that has open memos — those would
     // silently disappear, hiding inventory we sent out. The user has
     // to close/return those memos first.
     const open = await pool.query(
-      `SELECT COUNT(*)::int AS n FROM memos WHERE company_id = $1 AND status IN ('out','partially_returned')`,
-      [id]
+      `SELECT COUNT(*)::int AS n FROM memos WHERE company_id = $1 AND user_id = $2 AND status IN ('out','partially_returned')`,
+      [id, ctx.tenantUserId]
     );
     if (open.rows[0].n > 0) {
       return res.status(409).json({ error: 'Company has open memos — close them before deleting' });
     }
-    await pool.query(`DELETE FROM crm_companies WHERE id = $1`, [id]);
+    await pool.query(`DELETE FROM crm_companies WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
     res.json({ success: true });
 
     if (before.rows[0]) {
@@ -7204,9 +7284,10 @@ app.put("/api/memos/:id", async (req, res) => {
     if (!fields.length) return res.status(400).json({ error: 'No updatable fields supplied' });
     fields.push(`updated_at = NOW()`);
     values.push(id);
+    values.push(ctx.tenantUserId);
 
     const r = await pool.query(
-      `UPDATE memos SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
+      `UPDATE memos SET ${fields.join(', ')} WHERE id = $${idx} AND user_id = $${idx + 1} RETURNING *`,
       values
     );
     if (r.rows.length === 0) return res.status(404).json({ error: 'Memo not found' });
@@ -7220,14 +7301,15 @@ app.put("/api/memos/:id", async (req, res) => {
 app.delete("/api/memos/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     // Refuse to delete a memo that's already been issued — those have
     // physical items at the customer. Only drafts can be removed.
-    const r = await pool.query(`SELECT user_id, status, memo_number FROM memos WHERE id = $1`, [id]);
+    const r = await pool.query(`SELECT user_id, status, memo_number FROM memos WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Memo not found' });
     if (r.rows[0].status !== 'draft') {
       return res.status(409).json({ error: 'Only draft memos can be deleted — close it instead' });
     }
-    await pool.query(`DELETE FROM memos WHERE id = $1`, [id]);
+    await pool.query(`DELETE FROM memos WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
     res.json({ success: true });
 
     const { actorId, actorName } = getActor(req);
@@ -7247,10 +7329,15 @@ app.delete("/api/memos/:id", async (req, res) => {
 app.post("/api/memos/:id/items", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const { items } = req.body;
     if (!Array.isArray(items) || !items.length) {
       return res.status(400).json({ error: 'items array is required' });
     }
+
+    // The parent memo must belong to the caller's workspace.
+    const ownsMemo = await pool.query(`SELECT 1 FROM memos WHERE id = $1 AND user_id = $2 LIMIT 1`, [id, ctx.tenantUserId]);
+    if (!ownsMemo.rows.length) return res.status(404).json({ error: 'Memo not found' });
 
     // Block adding items that are already on another OPEN memo — same
     // physical stone/jewelry can't sit at two stores at once.
@@ -7300,6 +7387,11 @@ app.post("/api/memos/:id/items", async (req, res) => {
 app.put("/api/memos/:id/items/:itemId", async (req, res) => {
   try {
     const { id, itemId } = req.params;
+    const ctx = await resolveTeamContext(req);
+
+    // The parent memo must belong to the caller's workspace.
+    const ownsMemo = await pool.query(`SELECT 1 FROM memos WHERE id = $1 AND user_id = $2 LIMIT 1`, [id, ctx.tenantUserId]);
+    if (!ownsMemo.rows.length) return res.status(404).json({ error: 'Memo not found' });
 
     // Operational gate for status flips (sold / returned). Price /
     // quantity / notes edits remain allowed without a signature so the
@@ -7361,9 +7453,10 @@ app.put("/api/memos/:id/items/:itemId", async (req, res) => {
 app.delete("/api/memos/:id/items/:itemId", async (req, res) => {
   try {
     const { id, itemId } = req.params;
+    const ctx = await resolveTeamContext(req);
     // Only allow removing items from drafts. Once issued, you must
     // mark the item as returned/sold instead — that preserves history.
-    const memoRes = await pool.query(`SELECT status FROM memos WHERE id = $1`, [id]);
+    const memoRes = await pool.query(`SELECT status FROM memos WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
     if (memoRes.rows.length === 0) return res.status(404).json({ error: 'Memo not found' });
     if (memoRes.rows[0].status !== 'draft') {
       return res.status(409).json({ error: 'Only draft memo items can be removed' });
@@ -7383,7 +7476,7 @@ app.post("/api/memos/:id/issue", async (req, res) => {
   try {
     const { id } = req.params;
     const ctx = await resolveTeamContext(req);
-    const memoRes = await pool.query(`SELECT * FROM memos WHERE id = $1`, [id]);
+    const memoRes = await pool.query(`SELECT * FROM memos WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
     if (memoRes.rows.length === 0) return res.status(404).json({ error: 'Memo not found' });
     const memo = memoRes.rows[0];
     if (memo.status !== 'draft') return res.status(409).json({ error: 'Only drafts can be issued' });
@@ -7411,8 +7504,8 @@ app.post("/api/memos/:id/issue", async (req, res) => {
 
     const r = await pool.query(
       `UPDATE memos SET status = 'out', issued_at = NOW(), updated_at = NOW()
-        WHERE id = $1 RETURNING *`,
-      [id]
+        WHERE id = $1 AND user_id = $2 RETURNING *`,
+      [id, ctx.tenantUserId]
     );
 
     const { actorId, actorName } = getActor(req);
@@ -7434,7 +7527,8 @@ app.post("/api/memos/:id/issue", async (req, res) => {
 app.post("/api/memos/:id/close", async (req, res) => {
   try {
     const { id } = req.params;
-    const memoRes = await pool.query(`SELECT * FROM memos WHERE id = $1`, [id]);
+    const ctx = await resolveTeamContext(req);
+    const memoRes = await pool.query(`SELECT * FROM memos WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
     if (memoRes.rows.length === 0) return res.status(404).json({ error: 'Memo not found' });
     const memo = memoRes.rows[0];
     if (memo.status === 'closed') return res.json(memo);
@@ -7474,8 +7568,8 @@ app.post("/api/memos/:id/close", async (req, res) => {
     );
     const r = await pool.query(
       `UPDATE memos SET status = 'closed', closed_at = NOW(), updated_at = NOW()
-        WHERE id = $1 RETURNING *`,
-      [id]
+        WHERE id = $1 AND user_id = $2 RETURNING *`,
+      [id, ctx.tenantUserId]
     );
 
     const { actorId, actorName } = getActor(req);
@@ -10006,6 +10100,7 @@ app.post("/api/crm/folders", async (req, res) => {
 app.put("/api/crm/folders/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const { name, parentId, color } = req.body;
     const fields = [];
     const values = [];
@@ -10031,8 +10126,9 @@ app.put("/api/crm/folders/:id", async (req, res) => {
     }
 
     values.push(id);
+    values.push(ctx.tenantUserId);
     const result = await pool.query(
-      `UPDATE crm_folders SET ${fields.join(", ")} WHERE id = $${idx} RETURNING *`,
+      `UPDATE crm_folders SET ${fields.join(", ")} WHERE id = $${idx} AND user_id = $${idx + 1} RETURNING *`,
       values
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "Folder not found" });
@@ -10046,8 +10142,9 @@ app.put("/api/crm/folders/:id", async (req, res) => {
 app.delete("/api/crm/folders/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     // ON DELETE CASCADE deletes children folders; ON DELETE SET NULL on contacts.folder_id moves contacts to root
-    await pool.query("DELETE FROM crm_folders WHERE id = $1", [id]);
+    await pool.query("DELETE FROM crm_folders WHERE id = $1 AND user_id = $2", [id, ctx.tenantUserId]);
     res.json({ success: true });
   } catch (error) {
     console.error("Folder delete error:", error);
@@ -10478,6 +10575,7 @@ app.post("/api/crm/email/templates", async (req, res) => {
 app.put("/api/crm/email/templates/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const ctx = await resolveTeamContext(req);
     const { name, subject, html, thumbnail } = req.body || {};
     const fields = [];
     const values = [];
@@ -10489,8 +10587,9 @@ app.put("/api/crm/email/templates/:id", async (req, res) => {
     if (fields.length === 0) return res.status(400).json({ error: "No fields to update" });
     fields.push(`updated_at = NOW()`);
     values.push(id);
+    values.push(ctx.tenantUserId);
     const result = await pool.query(
-      `UPDATE crm_email_templates SET ${fields.join(", ")} WHERE id = $${i}
+      `UPDATE crm_email_templates SET ${fields.join(", ")} WHERE id = $${i} AND user_id = $${i + 1}
        RETURNING id, name, subject, html, thumbnail, created_at, updated_at`,
       values
     );
@@ -10505,7 +10604,8 @@ app.put("/api/crm/email/templates/:id", async (req, res) => {
 app.delete("/api/crm/email/templates/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query(`DELETE FROM crm_email_templates WHERE id = $1`, [id]);
+    const ctx = await resolveTeamContext(req);
+    await pool.query(`DELETE FROM crm_email_templates WHERE id = $1 AND user_id = $2`, [id, ctx.tenantUserId]);
     res.json({ success: true });
   } catch (error) {
     console.error("Email template delete error:", error);
