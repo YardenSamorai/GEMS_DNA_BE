@@ -13389,11 +13389,13 @@ app.post('/api/team/members', async (req, res) => {
     if (role !== 'owner' && process.env.CLERK_SECRET_KEY) {
       try {
         const normEmail = String(email).trim().toLowerCase();
-        const activeAnywhere = await pool.query(
-          `SELECT 1 FROM team_members WHERE LOWER(email) = $1 AND active = TRUE LIMIT 1`,
+        const linkedActive = await pool.query(
+          `SELECT 1 FROM team_members
+            WHERE LOWER(email) = $1 AND active = TRUE AND clerk_user_id IS NOT NULL
+            LIMIT 1`,
           [normEmail]
         );
-        if (!activeAnywhere.rows.length) {
+        if (!linkedActive.rows.length) {
           await purgeClerkIdentity({ email: normEmail });
         }
       } catch (e) {
@@ -13749,6 +13751,28 @@ app.post('/api/team/members/:id/resend-invite', async (req, res) => {
     }
     if (member.clerk_user_id) {
       return res.status(400).json({ error: `${member.name} has already accepted and signed in` });
+    }
+
+    // This member is still pending (no linked Clerk id). If a leftover Clerk
+    // account exists for their email from a previous life, purge it so the
+    // resend mints a fresh sign-up ticket (bottom-sheet register) instead of
+    // bouncing them to the sign-in page. Never touch an account that's still
+    // linked to an active member (here or in another workspace).
+    if (process.env.CLERK_SECRET_KEY) {
+      try {
+        const linkedActive = await pool.query(
+          `SELECT 1 FROM team_members
+            WHERE LOWER(email) = LOWER($1) AND active = TRUE
+              AND clerk_user_id IS NOT NULL AND id <> $2
+            LIMIT 1`,
+          [member.email, member.id]
+        );
+        if (!linkedActive.rows.length) {
+          await purgeClerkIdentity({ email: String(member.email).trim().toLowerCase() });
+        }
+      } catch (e) {
+        console.warn('[resend] orphan Clerk purge warn:', e.message);
+      }
     }
 
     let inviter = null;
