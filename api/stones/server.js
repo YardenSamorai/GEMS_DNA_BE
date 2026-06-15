@@ -748,6 +748,31 @@ const normaliseBeaconBody = (req) => {
   }
 };
 
+// Serialise an activity event's `meta` into JSONB-safe text. The old code did
+// `JSON.stringify(meta).slice(0, 2000)` which could cut a string mid-token and
+// produce invalid JSON → the INSERT threw and the event was silently lost.
+// Filter snapshots (criteria + a sample of result stones) are richer now, so we
+// allow a larger budget and, when oversized, trim the heavy arrays instead of
+// corrupting the JSON.
+const META_MAX = 16000;
+const safeMetaJson = (meta) => {
+  if (!meta || typeof meta !== 'object') return null;
+  try {
+    let s = JSON.stringify(meta);
+    if (s.length <= META_MAX) return s;
+    const trimmed = { ...meta, _trimmed: true };
+    if (Array.isArray(trimmed.sample)) trimmed.sample = trimmed.sample.slice(0, 20);
+    if (Array.isArray(trimmed.resultSkus)) trimmed.resultSkus = trimmed.resultSkus.slice(0, 60);
+    s = JSON.stringify(trimmed);
+    if (s.length <= META_MAX) return s;
+    // Still too big — keep just the scalar summary fields.
+    const { criteria, sort, q, results, mode, zeroResults } = meta;
+    return JSON.stringify({ criteria, sort, q, results, mode, zeroResults, _trimmed: true });
+  } catch (_) {
+    return null;
+  }
+};
+
 app.post('/api/activity-events', async (req, res) => {
   try {
     normaliseBeaconBody(req);
@@ -770,7 +795,7 @@ app.post('/api/activity-events', async (req, res) => {
           type,
           e?.sku ? String(e.sku).slice(0, 80) : null,
           e?.category ? String(e.category).slice(0, 80) : null,
-          e?.meta ? JSON.stringify(e.meta).slice(0, 2000) : null,
+          safeMetaJson(e?.meta),
         ]
       );
       inserted++;
