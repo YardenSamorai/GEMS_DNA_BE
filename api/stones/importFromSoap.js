@@ -328,9 +328,10 @@ const run = async (options = {}) => {
     let preservedSalesFields = [];
     try {
       const snap = await dbPool.query(
-        `SELECT sku, cost_per_carat, holder, location
+        `SELECT sku, cost_per_carat, holder, location, jewelry_model
            FROM soap_stones
-          WHERE cost_per_carat IS NOT NULL OR holder IS NOT NULL OR location IS NOT NULL`
+          WHERE cost_per_carat IS NOT NULL OR holder IS NOT NULL OR location IS NOT NULL
+                OR jewelry_model IS NOT NULL`
       );
       preservedSalesFields = snap.rows;
       console.log(`🛟 Preserving sales fields for ${preservedSalesFields.length} stones across sync`);
@@ -397,17 +398,18 @@ const run = async (options = {}) => {
         const chunk = preservedSalesFields.slice(i, i + CHUNK_SIZE);
         const ph = chunk
           .map((_, ri) => {
-            const b = ri * 4;
-            return `($${b + 1}::text,$${b + 2}::numeric,$${b + 3}::text,$${b + 4}::text)`;
+            const b = ri * 5;
+            return `($${b + 1}::text,$${b + 2}::numeric,$${b + 3}::text,$${b + 4}::text,$${b + 5}::text)`;
           })
           .join(", ");
-        const flat = chunk.flatMap((r) => [r.sku, r.cost_per_carat, r.holder, r.location]);
+        const flat = chunk.flatMap((r) => [r.sku, r.cost_per_carat, r.holder, r.location, r.jewelry_model]);
         const r = await dbPool.query(
           `UPDATE soap_stones AS s SET
              cost_per_carat = COALESCE(s.cost_per_carat, v.cpc),
              holder         = COALESCE(s.holder, v.hold),
-             location       = COALESCE(NULLIF(s.location, ''), v.loc)
-           FROM (VALUES ${ph}) AS v(sku, cpc, hold, loc)
+             location       = COALESCE(NULLIF(s.location, ''), v.loc),
+             jewelry_model  = COALESCE(s.jewelry_model, v.jm)
+           FROM (VALUES ${ph}) AS v(sku, cpc, hold, loc, jm)
            WHERE s.sku = v.sku`,
           flat
         );

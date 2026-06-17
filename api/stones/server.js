@@ -1167,6 +1167,9 @@ app.get("/api/soap-stones", async (req, res) => {
         box: row.box || "",
         stones: row.stones != null ? Number(row.stones) : null,
 
+        // Linked jewelry model (from the CSV "Jewelry Model" column).
+        jewelryModel: row.jewelry_model || "",
+
         // Marketing flags
         homePage: row.home_page || "",
         tradeShow: row.trade_show || "",
@@ -2280,7 +2283,7 @@ app.post("/api/import-csv", sensitiveLimiter, requireOwner, async (req, res) => 
       'fancy_color','fancy_overtone','fancy_color_2','fancy_overtone_2',
       'pair_stone','home_page','trade_show','comment','type',
       'cert_comments','origin','grouping_type','box','stones',
-      'cost_per_carat','holder','raw_xml'
+      'cost_per_carat','holder','jewelry_model','raw_xml'
     ];
 
     const values = rows.map(r => {
@@ -2332,6 +2335,7 @@ app.post("/api/import-csv", sensitiveLimiter, requireOwner, async (req, res) => 
         csvSafeNum(r['Stones']),
         csvSafeNum(r['cost_per_carat']),
         r['Holder'] || null,
+        r['Jewelry Model'] || null,
         'csv_import'
       ];
     });
@@ -2920,6 +2924,9 @@ const crmReadyPromise = (async () => {
     try {
       await pool.query(`ALTER TABLE soap_stones ADD COLUMN IF NOT EXISTS holder         TEXT`);
       await pool.query(`ALTER TABLE soap_stones ADD COLUMN IF NOT EXISTS cost_per_carat NUMERIC`);
+      // jewelry_model links a loose stone to a jewelry model (from the CSV's
+      // "Jewelry Model" column, e.g. "RI-HE-007"). Never comes from SOAP.
+      await pool.query(`ALTER TABLE soap_stones ADD COLUMN IF NOT EXISTS jewelry_model  TEXT`);
     } catch (e) {
       console.warn('⚠️  Could not ensure soap_stones sales columns:', e.message);
     }
