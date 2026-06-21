@@ -2220,6 +2220,7 @@ app.get("/api/image-proxy", async (req, res) => {
    /api/import-csv – Import stones from CSV file upload
    ========================================================= */
 const { parse: parseCsv } = require('csv-parse/sync');
+const { cleanText: cleanCsvText, snapshotPreserved, restorePreserved } = require('../../utils/preserveFields');
 
 const CSV_BRANCH_MAP = {
   IL:'Israel',EM:'Israel',JI:'Israel',
@@ -2290,55 +2291,67 @@ app.post("/api/import-csv", sensitiveLimiter, requireOwner, async (req, res) => 
       const ppc = csvSafeNum(r['Price Per Carat']);
       const tp = csvSafeNum(r['Total Price']);
       return [
-        r['Category'] || null,
-        r['SKU'] || null,
-        r['Shape'] || null,
+        cleanCsvText(r['Category']),
+        cleanCsvText(r['SKU']),
+        cleanCsvText(r['Shape']),
         csvSafeNum(r['Weight']),
-        r['Color'] || null,
-        r['Clarity'] || null,
-        r['Lab'] || null,
-        r['Fluorescence'] || null,
+        cleanCsvText(r['Color']),
+        cleanCsvText(r['Clarity']),
+        cleanCsvText(r['Lab']),
+        cleanCsvText(r['Fluorescence']),
         ppc,
         csvSafeNum(r['Rap Price % ']),
         csvSafeNum(r['Rap. Price']),
         tp,
-        r['Location'] || null,
+        cleanCsvText(r['Location']),
         csvMapBranch(r['Branch']),
-        r['Image'] || null,
-        r['additional_pictures'] || null,
-        r['Video'] || null,
-        r['additional_videos'] || null,
-        r['Certificate image'] || null,
-        r['Certificate Number'] || null,
-        r['certificateImageJPG'] || null,
-        r['Cut'] || null,
-        r['Polish'] || null,
-        r['Symmetry'] || null,
+        cleanCsvText(r['Image']),
+        cleanCsvText(r['additional_pictures']),
+        cleanCsvText(r['Video']),
+        cleanCsvText(r['additional_videos']),
+        cleanCsvText(r['Certificate image']),
+        cleanCsvText(r['Certificate Number']),
+        cleanCsvText(r['certificateImageJPG']),
+        cleanCsvText(r['Cut']),
+        cleanCsvText(r['Polish']),
+        cleanCsvText(r['Symmetry']),
         csvSafeNum(r['Table']),
         csvSafeNum(r['Depth']),
         csvSafeNum(r['ratio']),
-        r['Measurements (- delimiter)'] || null,
-        r['fancy_intensity'] || null,
-        r['fancy_color'] || null,
-        r['fancy_overtone'] || null,
-        r['fancy_color_2'] || null,
-        r['fancy_overtone_2'] || null,
-        r['Pair Stone'] || null,
-        r['home_page'] || null,
-        r['TradeShow'] || null,
-        r['Comment'] || null,
-        r['Type'] || null,
-        r['Cert. Comments'] || null,
-        r['Origin'] || null,
-        r['Grouping Type'] || null,
-        r['Box'] || null,
+        cleanCsvText(r['Measurements (- delimiter)']),
+        cleanCsvText(r['fancy_intensity']),
+        cleanCsvText(r['fancy_color']),
+        cleanCsvText(r['fancy_overtone']),
+        cleanCsvText(r['fancy_color_2']),
+        cleanCsvText(r['fancy_overtone_2']),
+        cleanCsvText(r['Pair Stone']),
+        cleanCsvText(r['home_page']),
+        cleanCsvText(r['TradeShow']),
+        cleanCsvText(r['Comment']),
+        cleanCsvText(r['Type']),
+        cleanCsvText(r['Cert. Comments']),
+        cleanCsvText(r['Origin']),
+        cleanCsvText(r['Grouping Type']),
+        cleanCsvText(r['Box']),
         csvSafeNum(r['Stones']),
         csvSafeNum(r['cost_per_carat']),
-        r['Holder'] || null,
-        r['Jewelry Model'] || null,
+        cleanCsvText(r['Holder']),
+        cleanCsvText(r['Jewelry Model']),
         'csv_import'
       ];
     });
+
+    // 🛟 Snapshot enriched fields before the truncate so a CSV that omits some
+    // data (e.g. cost_per_carat / holder added in-app, or fields only the SOAP
+    // feed carries) isn't wiped. The incoming CSV value wins when present.
+    // Shared with the SOAP importer so both paths behave identically.
+    let preservedFields = [];
+    try {
+      preservedFields = await snapshotPreserved(pool);
+      console.log(`🛟 Preserving enriched fields for ${preservedFields.length} stones across CSV import`);
+    } catch (e) {
+      console.warn('⚠️  Could not snapshot preserved fields (continuing):', e.message);
+    }
 
     csvImportProgress = { ...csvImportProgress, phase: 'clearing', progress: 40, detail: 'Preparing database...' };
     await pool.query('TRUNCATE TABLE soap_stones RESTART IDENTITY');
@@ -2353,8 +2366,15 @@ app.post("/api/import-csv", sensitiveLimiter, requireOwner, async (req, res) => 
         '(' + columns.map((_, ci) => '$' + (ri * columns.length + ci + 1)).join(',') + ')'
       ).join(',');
       await pool.query('INSERT INTO soap_stones (' + columns.join(',') + ') VALUES ' + ph, chunk.flat());
-      const pct = 50 + Math.round((chunkIdx / totalChunks) * 45);
+      const pct = 50 + Math.round((chunkIdx / totalChunks) * 40);
       csvImportProgress = { ...csvImportProgress, progress: pct, processedStones: Math.min(i + CHUNK, values.length), detail: `Inserted ${Math.min(i + CHUNK, values.length)} / ${values.length} stones` };
+    }
+
+    // 🛟 Restore preserved fields the CSV left empty (CSV value wins otherwise).
+    if (preservedFields.length) {
+      csvImportProgress = { ...csvImportProgress, phase: 'restoring', progress: 95, detail: 'Restoring preserved fields...' };
+      const restored = await restorePreserved(pool, preservedFields, CHUNK);
+      console.log(`🛟 Restored enriched fields on ${restored} stones after CSV import.`);
     }
 
     csvImportProgress = { active: false, phase: 'complete', progress: 100, detail: `Successfully imported ${values.length} stones!`, totalStones: values.length, processedStones: values.length };

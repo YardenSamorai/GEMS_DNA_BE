@@ -3,6 +3,7 @@
 const { fetchSoapData } = require("../../utils/soapClient");
 const { parseXml } = require("../../utils/xmlParser");
 const { pool } = require("../../db/client");
+const { cleanText, snapshotPreserved, restorePreserved } = require("../../utils/preserveFields");
 
 const CHUNK_SIZE = 300; // ⭐ הכי יציב
 
@@ -238,48 +239,48 @@ const run = async (options = {}) => {
       const totalPrice = safeNumber(stone.TotalPrice);
 
       return [
-        stone.Category || null,
-        stone.SKU || null,
-        stone.Shape || null,
+        cleanText(stone.Category),
+        cleanText(stone.SKU),
+        cleanText(stone.Shape),
         safeNumber(stone.Weight),
-        stone.Color || null,
-        stone.Clarity || null,
-        stone.Lab || null,
-        stone.Fluorescence || null,
+        cleanText(stone.Color),
+        cleanText(stone.Clarity),
+        cleanText(stone.Lab),
+        cleanText(stone.Fluorescence),
         pricePerCarat,   // store source price as-is (no ×2)
         safeNumber(stone.RapPrice),
         safeNumber(stone["Rap.Price"]),
         totalPrice,      // store source price as-is (no ×2)
-        stone.Location || null,
+        cleanText(stone.Location),
         mapBranch(stone.Branch),  // 🗺️ Map branch to consistent names
-        stone.Image || null,
-        stone.additional_pictures || null,
-        stone.Video || null,
-        stone.additional_videos || null,
-        stone.Certificateimage || null,
-        stone.CertificateNumber || null,
-        stone.certificateImageJPG || null,
-        stone.Cut || null,
-        stone.Polish || null,
-        stone.Symmetry || null,
+        cleanText(stone.Image),
+        cleanText(stone.additional_pictures),
+        cleanText(stone.Video),
+        cleanText(stone.additional_videos),
+        cleanText(stone.Certificateimage),
+        cleanText(stone.CertificateNumber),
+        cleanText(stone.certificateImageJPG),
+        cleanText(stone.Cut),
+        cleanText(stone.Polish),
+        cleanText(stone.Symmetry),
         safeNumber(stone.Table),
         safeNumber(stone.Depth),
         safeNumber(stone.ratio),
-        stone["Measurements-delimiter"] || null,
-        stone.fancy_intensity || null,
-        stone.fancy_color || null,
-        stone.fancy_overtone || null,
-        stone.fancy_color_2 || null,
-        stone.fancy_overtone_2 || null,
-        stone.PairStone || null,
-        stone.home_page || null,
-        stone.TradeShow || null,
-        stone.Comment || null,
-        stone.Type || null,
-        stone["Cert.Comments"] || null,
-        stone.Origin || null,
-        stone.GroupingType || null,
-        stone.Box || null,
+        cleanText(stone["Measurements-delimiter"]),
+        cleanText(stone.fancy_intensity),
+        cleanText(stone.fancy_color),
+        cleanText(stone.fancy_overtone),
+        cleanText(stone.fancy_color_2),
+        cleanText(stone.fancy_overtone_2),
+        cleanText(stone.PairStone),
+        cleanText(stone.home_page),
+        cleanText(stone.TradeShow),
+        cleanText(stone.Comment),
+        cleanText(stone.Type),
+        cleanText(stone["Cert.Comments"]),
+        cleanText(stone.Origin),
+        cleanText(stone.GroupingType),
+        cleanText(stone.Box),
         safeNumber(stone.Stones),
         rawSnapshot,
       ];
@@ -320,23 +321,18 @@ const run = async (options = {}) => {
       "cert_comments", "origin", "grouping_type", "box", "stones", "raw_xml",
     ];
 
-    // 🛟 Preserve manually-maintained sales fields across the truncate.
-    // cost_per_carat and holder never come from SOAP (they're loaded from a
-    // CSV via importSalesFields.js), and location is usually empty in SOAP —
-    // so snapshot them by SKU now and re-apply after the reload, otherwise
-    // every 5-hour sync would wipe them.
+    // 🛟 Preserve enriched fields across the truncate so a SOAP sync never
+    // wipes data that a CSV import (or a prior sync) carried but the live SOAP
+    // feed lacks — e.g. colour/clarity on older stones, cost_per_carat, holder,
+    // jewelry_model. SOAP still WINS for any field it actually provides; the
+    // snapshot only fills the gaps. Shared with the CSV importer so both paths
+    // behave identically.
     let preservedSalesFields = [];
     try {
-      const snap = await dbPool.query(
-        `SELECT sku, cost_per_carat, holder, location, jewelry_model
-           FROM soap_stones
-          WHERE cost_per_carat IS NOT NULL OR holder IS NOT NULL OR location IS NOT NULL
-                OR jewelry_model IS NOT NULL`
-      );
-      preservedSalesFields = snap.rows;
-      console.log(`🛟 Preserving sales fields for ${preservedSalesFields.length} stones across sync`);
+      preservedSalesFields = await snapshotPreserved(dbPool);
+      console.log(`🛟 Preserving enriched fields for ${preservedSalesFields.length} stones across sync`);
     } catch (e) {
-      console.warn('⚠️  Could not snapshot sales fields (continuing):', e.message);
+      console.warn('⚠️  Could not snapshot preserved fields (continuing):', e.message);
     }
 
     onProgress({ phase: 'clearing', progress: 35, detail: 'Clearing old data...', totalStones: stoneArray.length, processedStones: 0 });
@@ -388,34 +384,12 @@ const run = async (options = {}) => {
       });
     }
 
-    // 🛟 Re-apply the preserved manual sales fields. SOAP wins for location
-    // when it actually provides one; otherwise (and always for cost/holder)
-    // the manual value is restored.
+    // 🛟 Re-apply the preserved fields. The freshly-synced SOAP value wins
+    // whenever it is non-empty; otherwise the snapshot value is restored.
     if (preservedSalesFields.length) {
-      console.log(`🛟 Restoring sales fields for ${preservedSalesFields.length} stones...`);
-      let restored = 0;
-      for (let i = 0; i < preservedSalesFields.length; i += CHUNK_SIZE) {
-        const chunk = preservedSalesFields.slice(i, i + CHUNK_SIZE);
-        const ph = chunk
-          .map((_, ri) => {
-            const b = ri * 5;
-            return `($${b + 1}::text,$${b + 2}::numeric,$${b + 3}::text,$${b + 4}::text,$${b + 5}::text)`;
-          })
-          .join(", ");
-        const flat = chunk.flatMap((r) => [r.sku, r.cost_per_carat, r.holder, r.location, r.jewelry_model]);
-        const r = await dbPool.query(
-          `UPDATE soap_stones AS s SET
-             cost_per_carat = COALESCE(s.cost_per_carat, v.cpc),
-             holder         = COALESCE(s.holder, v.hold),
-             location       = COALESCE(NULLIF(s.location, ''), v.loc),
-             jewelry_model  = COALESCE(s.jewelry_model, v.jm)
-           FROM (VALUES ${ph}) AS v(sku, cpc, hold, loc, jm)
-           WHERE s.sku = v.sku`,
-          flat
-        );
-        restored += r.rowCount || 0;
-      }
-      console.log(`🛟 Restored sales fields on ${restored} stones.`);
+      console.log(`🛟 Restoring enriched fields for ${preservedSalesFields.length} stones...`);
+      const restored = await restorePreserved(dbPool, preservedSalesFields, CHUNK_SIZE);
+      console.log(`🛟 Restored enriched fields on ${restored} stones.`);
     }
 
     onProgress({ phase: 'complete', progress: 100, detail: `Successfully synced ${stoneArray.length} stones!`, totalStones: stoneArray.length, processedStones: stoneArray.length });
