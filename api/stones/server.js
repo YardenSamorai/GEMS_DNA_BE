@@ -1521,36 +1521,78 @@ app.get("/api/stones/:sku/usage", async (req, res) => {
    ========================================================= */
 app.get("/api/jewelry", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM jewelry_products ORDER BY model_number ASC");
-    const items = result.rows.map(row => ({
-      model_number: row.model_number,
-      stock_number: row.stock_number,
-      jewelry_type: row.jewelry_type,
-      style: row.style,
-      collection: row.collection,
-      price: row.price !== null ? parseFloat(row.price) : null,
-      video_link: row.video_link,
-      all_pictures_link: row.all_pictures_link,
-      certificate_link: row.certificate_link,
-      certificate_number: row.certificate_number,
-      title: row.title,
-      description: row.description,
-      jewelry_weight: row.jewelry_weight !== null ? parseFloat(row.jewelry_weight) : null,
-      total_carat: row.total_carat !== null ? parseFloat(row.total_carat) : null,
-      stone_type: row.stone_type,
-      center_stone_carat: row.center_stone_carat !== null ? parseFloat(row.center_stone_carat) : null,
-      center_stone_shape: row.center_stone_shape,
-      center_stone_color: row.center_stone_color,
-      center_stone_clarity: row.center_stone_clarity,
-      metal_type: row.metal_type,
-      currency: row.currency,
-      availability: row.availability,
-      shipping_from: row.shipping_from,
-      category: row.category,
-      full_description: row.full_description,
-      jewelry_size: row.jewelry_size,
-      instructions_main: row.instructions_main,
-    }));
+    // Same per-viewer location masking as /api/soap-stones. A finished piece's
+    // physical place lives on its component stone(s) in soap_stones (linked by
+    // jewelry_model), so we surface the exact location / branch / memo + hold
+    // status from the representative (heaviest = centre) linked stone — gated by
+    // the viewer's locationView tier exactly like loose stones.
+    const ctx = await resolveTeamContext(req);
+    const locView = ctx.permissions?.locationView || 'full';
+    const showExact  = locView === 'full';
+    const showHolder = locView === 'full' || locView === 'memo_branch';
+    const showBranch = locView === 'full' || locView === 'memo_branch' || locView === 'branch_only';
+    const showStatus = locView !== 'hidden';
+
+    // LEFT JOIN LATERAL picks one representative stone per jewelry item (the
+    // centre/heaviest), giving us its exact location, branch and holder.
+    const result = await pool.query(`
+      SELECT jp.*,
+             st.location AS stone_location,
+             st.branch   AS stone_branch,
+             st.holder   AS stone_holder
+        FROM jewelry_products jp
+        LEFT JOIN LATERAL (
+          SELECT ss.location, ss.branch, ss.holder
+            FROM soap_stones ss
+           WHERE ss.jewelry_model IS NOT NULL
+             AND TRIM(ss.jewelry_model) <> ''
+             AND UPPER(TRIM(ss.jewelry_model)) = UPPER(TRIM(jp.model_number))
+           ORDER BY ss.weight DESC NULLS LAST
+           LIMIT 1
+        ) st ON TRUE
+       ORDER BY jp.model_number ASC
+    `);
+    const items = result.rows.map(row => {
+      // The branch comes from the linked stone when known; otherwise fall back
+      // to the coarse shipping_from (USA / ISRAEL / HK) the WooCommerce feed has.
+      const branch = row.stone_branch || row.shipping_from || null;
+      const exact = row.stone_location || null;
+      return {
+        model_number: row.model_number,
+        stock_number: row.stock_number,
+        jewelry_type: row.jewelry_type,
+        style: row.style,
+        collection: row.collection,
+        price: row.price !== null ? parseFloat(row.price) : null,
+        video_link: row.video_link,
+        all_pictures_link: row.all_pictures_link,
+        certificate_link: row.certificate_link,
+        certificate_number: row.certificate_number,
+        title: row.title,
+        description: row.description,
+        jewelry_weight: row.jewelry_weight !== null ? parseFloat(row.jewelry_weight) : null,
+        total_carat: row.total_carat !== null ? parseFloat(row.total_carat) : null,
+        stone_type: row.stone_type,
+        center_stone_carat: row.center_stone_carat !== null ? parseFloat(row.center_stone_carat) : null,
+        center_stone_shape: row.center_stone_shape,
+        center_stone_color: row.center_stone_color,
+        center_stone_clarity: row.center_stone_clarity,
+        metal_type: row.metal_type,
+        currency: row.currency,
+        availability: row.availability,
+        shipping_from: row.shipping_from,
+        category: row.category,
+        full_description: row.full_description,
+        jewelry_size: row.jewelry_size,
+        instructions_main: row.instructions_main,
+        // Location surface (masked per viewer), mirroring the loose-stone shape.
+        branch: showBranch ? branch : null,
+        exact_location: showExact ? exact : null,
+        holder: showHolder ? (row.stone_holder || null) : null,
+        on_memo: showStatus ? computeOnMemo(exact) : false,
+        on_hold: showStatus ? !!(row.stone_holder && String(row.stone_holder).trim()) : false,
+      };
+    });
     res.json({ jewelry: items });
   } catch (error) {
     console.error("Error fetching jewelry:", error);
