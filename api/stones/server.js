@@ -420,6 +420,19 @@ const IN_HOUSE_LOCATIONS = new Set([
   'ESHED DESIGNS LTD', 'FACTORY', 'FACTORY OILED', 'FACTORY - EY', 'FACTORY NEW',
 ]);
 const normLocBE = (v) => String(v || '').trim().replace(/\s+/g, ' ').toUpperCase();
+// Prefixes of our own branches/offices. Locations change naming over time
+// ("Eshed New York", "Eshed Diam Inc - NY", "Factory …", "Jewelry New York - JN")
+// so we match by the leading branch name rather than maintaining an exact list.
+// Third-party stores (Cartier, Tiffany, named jewelers, …) never start with
+// these, so they still register as a memo correctly.
+const IN_HOUSE_PREFIXES = [
+  'ESHED',
+  'FACTORY',
+  'JEWELRY NEW YORK',
+  'JEWELRY LOS ANGELES',
+  'JEWELRY HONG KONG',
+  'JEWELRY ISRAEL',
+];
 // soap_stones.location holds the exact/physical place — on memo when it's set
 // and not one of our own in-house locations.
 const computeOnMemo = (exactLocationRaw) => {
@@ -427,11 +440,9 @@ const computeOnMemo = (exactLocationRaw) => {
   if (!raw) return false;
   const n = normLocBE(raw);
   if (IN_HOUSE_LOCATIONS.has(n)) return false;
-  // Our own branches/offices show up under several naming schemes over time
-  // ("Eshed New York", "Eshed Los Angeles", "Eshed Diam Inc - NY", "Factory …").
   // Any location that is one of ours is in-house, never a memo — so a new branch
   // label doesn't get mis-flagged as "Memo out" the moment it appears.
-  if (n.startsWith('ESHED') || n.startsWith('FACTORY')) return false;
+  if (IN_HOUSE_PREFIXES.some((p) => n.startsWith(p))) return false;
   return true;
 };
 
