@@ -425,7 +425,14 @@ const normLocBE = (v) => String(v || '').trim().replace(/\s+/g, ' ').toUpperCase
 const computeOnMemo = (exactLocationRaw) => {
   const raw = exactLocationRaw && String(exactLocationRaw).trim();
   if (!raw) return false;
-  return !IN_HOUSE_LOCATIONS.has(normLocBE(raw));
+  const n = normLocBE(raw);
+  if (IN_HOUSE_LOCATIONS.has(n)) return false;
+  // Our own branches/offices show up under several naming schemes over time
+  // ("Eshed New York", "Eshed Los Angeles", "Eshed Diam Inc - NY", "Factory …").
+  // Any location that is one of ours is in-house, never a memo — so a new branch
+  // label doesn't get mis-flagged as "Memo out" the moment it appears.
+  if (n.startsWith('ESHED') || n.startsWith('FACTORY')) return false;
+  return true;
 };
 
 async function resolveTeamContext(req) {
