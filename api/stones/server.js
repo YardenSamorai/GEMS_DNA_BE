@@ -446,6 +446,21 @@ const computeOnMemo = (exactLocationRaw) => {
   return true;
 };
 
+// Jewelry rows carry only an exact `location` (e.g. "Jewelry New York - JN",
+// "Eiseman Jewels - JN") plus a coarse `shipping_from` country. Derive a branch:
+// the trailing branch codes (JN/JL/JI/JH) are authoritative, otherwise map the
+// shipping country.
+const JEWELRY_SHIP_BRANCH = { USA: 'New York', ISRAEL: 'Israel', HK: 'Hong Kong', AUSTRALIA: 'Australia' };
+const resolveJewelryBranch = (location, shippingFrom) => {
+  const loc = String(location || '').toUpperCase();
+  if (/-\s*JL\b|\(LA\)/.test(loc)) return 'Los Angeles';
+  if (/-\s*JN\b|\bNY\b|NEW YORK/.test(loc)) return 'New York';
+  if (/-\s*JI\b|\(JI\)/.test(loc)) return 'Israel';
+  if (/-\s*JH\b|\bHK\b|HONG KONG/.test(loc)) return 'Hong Kong';
+  const sf = String(shippingFrom || '').toUpperCase().trim();
+  return JEWELRY_SHIP_BRANCH[sf] || (shippingFrom ? String(shippingFrom).trim() : null);
+};
+
 async function resolveTeamContext(req) {
   // Identity comes from the cryptographically-verified Clerk session first.
   // The x-actor-*/userId values are client-controlled and only used as a
@@ -1533,8 +1548,10 @@ app.get("/api/jewelry", async (req, res) => {
     const showBranch = locView === 'full' || locView === 'memo_branch' || locView === 'branch_only';
     const showStatus = locView !== 'hidden';
 
-    // LEFT JOIN LATERAL picks one representative stone per jewelry item (the
-    // centre/heaviest), giving us its exact location, branch and holder.
+    // The piece's physical place now comes straight from jewelry_products.location
+    // (the CSV's trailing "Location" column). The linked centre stone is still
+    // pulled as a fallback for items missing a location and for hold (holder)
+    // status, which only lives on soap_stones.
     const result = await pool.query(`
       SELECT jp.*,
              st.location AS stone_location,
@@ -1553,10 +1570,15 @@ app.get("/api/jewelry", async (req, res) => {
        ORDER BY jp.model_number ASC
     `);
     const items = result.rows.map(row => {
-      // The branch comes from the linked stone when known; otherwise fall back
-      // to the coarse shipping_from (USA / ISRAEL / HK) the WooCommerce feed has.
-      const branch = row.stone_branch || row.shipping_from || null;
-      const exact = row.stone_location || null;
+      // Prefer the jewelry's own location column; fall back to the linked stone.
+      const exact = (row.location && String(row.location).trim())
+        ? String(row.location).trim()
+        : (row.stone_location || null);
+      // Branch derives from the exact location's branch code / shipping country;
+      // when there's no jewelry location, reuse the linked stone's branch.
+      const branch = (row.location && String(row.location).trim())
+        ? resolveJewelryBranch(exact, row.shipping_from)
+        : (row.stone_branch || resolveJewelryBranch(null, row.shipping_from));
       return {
         model_number: row.model_number,
         stock_number: row.stock_number,
@@ -1633,7 +1655,7 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
       'title','description','jewelry_weight','total_carat','stone_type',
       'center_stone_carat','center_stone_shape','center_stone_color','center_stone_clarity',
       'metal_type','currency','availability','shipping_from','category',
-      'full_description','jewelry_size','instructions_main'
+      'full_description','jewelry_size','instructions_main','location'
     ];
 
     const rawValues = rows.map(r => [
@@ -1664,6 +1686,9 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
       r['full_description'] || null,
       r['jewelry_size'] || null,
       r['Instructions_main'] || null,
+      // New trailing column: the piece's physical location (exact place), same
+      // vocabulary as soap_stones.location (in-house branch or third-party store).
+      (r['Location'] || '').trim() || null,
     ]).filter(v => v[0] !== null && String(v[0]).trim() !== '');
 
     // De-duplicate by model_number BEFORE issuing the upsert. If a single
@@ -1723,9 +1748,12 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
         category VARCHAR(100),
         full_description TEXT,
         jewelry_size VARCHAR(50),
-        instructions_main TEXT
+        instructions_main TEXT,
+        location VARCHAR(150)
       );
     `);
+    // The table predates the `location` column — add it for existing installs.
+    await pool.query(`ALTER TABLE jewelry_products ADD COLUMN IF NOT EXISTS location VARCHAR(150)`);
 
     await pool.query('DELETE FROM jewelry_products');
 
