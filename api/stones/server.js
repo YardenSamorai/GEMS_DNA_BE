@@ -1075,6 +1075,21 @@ app.get("/api/soap-stones", async (req, res) => {
     `;
     const result = await pool.query(sql, params);
 
+    // Set of jewelry model numbers that actually exist in the catalog. A stone's
+    // "In Jewelry" link is only surfaced when its jewelry_model is in here —
+    // otherwise the tap dead-ends on the jewelry page's "Item not found".
+    let jewelryModelSet = new Set();
+    try {
+      const jm = await pool.query(
+        `SELECT model_number FROM jewelry_products WHERE model_number IS NOT NULL`
+      );
+      jewelryModelSet = new Set(
+        jm.rows.map((r) => String(r.model_number).trim().toUpperCase())
+      );
+    } catch {
+      /* jewelry_products may not exist yet — leave the set empty. */
+    }
+
     const stones = result.rows.map((row) => {
       // בחירת תמונה ראשית.
       // Many rows carry a folder-only URL (".../StoneImages/") with no
@@ -1200,8 +1215,14 @@ app.get("/api/soap-stones", async (req, res) => {
         box: row.box || "",
         stones: row.stones != null ? Number(row.stones) : null,
 
-        // Linked jewelry model (from the CSV "Jewelry Model" column).
-        jewelryModel: row.jewelry_model || "",
+        // Linked jewelry model (from the CSV "Jewelry Model" column). Only kept
+        // when the jewelry piece exists in the catalog, so the "In Jewelry" link
+        // never points at a missing page.
+        jewelryModel:
+          row.jewelry_model &&
+          jewelryModelSet.has(String(row.jewelry_model).trim().toUpperCase())
+            ? row.jewelry_model
+            : "",
 
         // Marketing flags
         homePage: row.home_page || "",
