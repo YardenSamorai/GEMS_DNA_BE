@@ -360,8 +360,9 @@ function diffRows(before, after, keys) {
 // ---------------------------------------------------------------------------
 // Roles & permissions (per-user, admin-configurable).
 //
-//   Roles: 'owner' (=admin, sees everything), 'manager', 'salesman'
-//          (legacy 'rep' == salesman), 'store_user'.
+//   Roles: 'owner' (=admin, sees everything), 'manager', 'salesman',
+//          'sales_agent' (region-scoped rep, less access than salesman;
+//          legacy 'rep' == salesman), 'store_user'.
 //   Every non-admin member carries a `permissions` object:
 //     sections     -> which nav sections they may open (FE gate)
 //     locationView -> how much stone-location detail they get; enforced
@@ -392,7 +393,7 @@ const ADMIN_PERMISSIONS = { sections: [...NAV_SECTION_KEYS], locationView: 'full
 const isAdminRole = (role) => role === 'owner' || role === 'admin';
 // Roles an admin may assign to a member. 'owner' is never assignable — there is
 // exactly one workshop owner, seeded lazily — and store_user is set elsewhere.
-const ASSIGNABLE_ROLES = ['rep', 'salesman', 'manager', 'admin', 'store_user'];
+const ASSIGNABLE_ROLES = ['rep', 'salesman', 'sales_agent', 'manager', 'admin', 'store_user'];
 
 const normalizePermissions = (raw) => {
   let p = raw;
@@ -935,7 +936,7 @@ app.get('/api/team/activity', async (req, res) => {
           ) a ON a.actor_id = tm.clerk_user_id
          WHERE tm.active = TRUE
            AND tm.team_owner_id = $1
-           AND tm.role IN ('salesman', 'rep', 'manager')
+           AND tm.role IN ('salesman', 'sales_agent', 'rep', 'manager')
          ORDER BY online DESC, tm.last_seen DESC NULLS LAST, tm.name ASC
       `, [ownerId])).rows;
     }
@@ -14071,7 +14072,7 @@ app.put('/api/team/members/:id', async (req, res) => {
 
     const nextRole = req.body.role;
     // 'owner' is never assignable — you can't crown a second workshop owner.
-    if (nextRole !== undefined && !['rep', 'salesman', 'manager', 'admin'].includes(nextRole)) {
+    if (nextRole !== undefined && !['rep', 'salesman', 'sales_agent', 'manager', 'admin'].includes(nextRole)) {
       return res.status(400).json({ error: 'invalid role' });
     }
 
