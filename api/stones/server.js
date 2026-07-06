@@ -14552,6 +14552,23 @@ const offersReadyPromise = (async () => {
  * place (data preserved) but no API surface is exposed anymore.
  * ------------------------------------------------------------------------- */
 
+/* Ensure the jewelry recency column exists at startup. The same migration runs
+ * inside the CSV import, but /api/jewelry now ORDERs BY first_seen_at, so the
+ * column must exist even before the first import of the process. Existing rows
+ * all receive the migration timestamp, so the catalog falls back to the
+ * model_number DESC tiebreaker until genuinely new pieces are imported (which
+ * get a real, later timestamp and float to the top). */
+(async () => {
+  try {
+    await pool.query(`ALTER TABLE jewelry_products ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP DEFAULT NOW()`);
+    console.log('jewelry_products.first_seen_at ready');
+  } catch (err) {
+    // jewelry_products may not exist yet on a fresh install — the CSV import
+    // will create the table (with the column) on first upload.
+    console.warn('first_seen_at ensure skipped:', err.message);
+  }
+})();
+
 /* =========================================================
    Start server
    ========================================================= */
