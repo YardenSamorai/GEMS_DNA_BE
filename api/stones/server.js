@@ -1589,7 +1589,7 @@ app.get("/api/jewelry", async (req, res) => {
            ORDER BY ss.weight DESC NULLS LAST
            LIMIT 1
         ) st ON TRUE
-       ORDER BY jp.model_number ASC
+       ORDER BY jp.first_seen_at DESC NULLS LAST, jp.model_number DESC
     `);
     const items = result.rows.map(row => {
       // Prefer the jewelry's own location column; fall back to the linked stone.
@@ -1629,6 +1629,7 @@ app.get("/api/jewelry", async (req, res) => {
         full_description: row.full_description,
         jewelry_size: row.jewelry_size,
         instructions_main: row.instructions_main,
+        first_seen_at: row.first_seen_at || null,
         // Location surface (masked per viewer), mirroring the loose-stone shape.
         branch: showBranch ? branch : null,
         exact_location: showExact ? exact : null,
@@ -1771,13 +1772,24 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
         full_description TEXT,
         jewelry_size VARCHAR(50),
         instructions_main TEXT,
-        location VARCHAR(150)
+        location VARCHAR(150),
+        -- When this model_number was first imported. Set once on INSERT and
+        -- never overwritten (see the ON CONFLICT below) so the catalog can be
+        -- ordered newest-first even though the CSV is re-imported wholesale.
+        first_seen_at TIMESTAMP DEFAULT NOW()
       );
     `);
     // The table predates the `location` column — add it for existing installs.
     await pool.query(`ALTER TABLE jewelry_products ADD COLUMN IF NOT EXISTS location VARCHAR(150)`);
+    // Recency tracking for "newest first" sorting. Existing rows get the
+    // migration timestamp; genuinely new model_numbers get their real insert
+    // time going forward.
+    await pool.query(`ALTER TABLE jewelry_products ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP DEFAULT NOW()`);
 
-    await pool.query('DELETE FROM jewelry_products');
+    // NOTE: we intentionally no longer wipe the table. A full DELETE would
+    // reset every first_seen_at on each import, losing all recency history.
+    // Instead we upsert every CSV row (preserving first_seen_at for existing
+    // model_numbers) and then prune the ones that disappeared from the feed.
 
     jewelryImportProgress = { ...jewelryImportProgress, phase: 'inserting', progress: 50, detail: 'Saving jewelry to database...' };
     const CHUNK = 100;
@@ -1794,6 +1806,21 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
       );
       const pct = 50 + Math.round((chunkIdx / totalChunks) * 45);
       jewelryImportProgress = { ...jewelryImportProgress, progress: pct, processed: Math.min(i + CHUNK, values.length), detail: `Inserted ${Math.min(i + CHUNK, values.length)} / ${values.length} items` };
+    }
+
+    // Prune: drop any model_number that is no longer present in this CSV feed
+    // (sold / removed). Everything still in the feed keeps its first_seen_at.
+    const importedModels = values.map((v) => v[0]);
+    let prunedCount = 0;
+    if (importedModels.length) {
+      const pruneRes = await pool.query(
+        'DELETE FROM jewelry_products WHERE NOT (model_number = ANY($1::text[]))',
+        [importedModels]
+      );
+      prunedCount = pruneRes.rowCount || 0;
+    }
+    if (prunedCount > 0) {
+      console.log(`[jewelry CSV import] Pruned ${prunedCount} model_number(s) no longer in the feed.`);
     }
 
     const completionDetail = duplicateModelCount > 0
