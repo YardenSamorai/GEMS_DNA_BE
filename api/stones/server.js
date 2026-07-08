@@ -2354,6 +2354,56 @@ app.get("/api/image-proxy", async (req, res) => {
 });
 
 /* =========================================================
+   /api/check-product-links – Which SKUs still have a live
+   product page on eshed.com (used by the PDF catalog export
+   to avoid dead "View more" links)
+   ========================================================= */
+app.post("/api/check-product-links", async (req, res) => {
+  try {
+    const { skus } = req.body || {};
+    if (!Array.isArray(skus) || skus.length === 0) {
+      return res.status(400).json({ error: "skus array required" });
+    }
+    // Sanitize: plausible SKU strings only, capped so this can't be abused.
+    const clean = [...new Set(
+      skus
+        .map((s) => String(s || "").trim())
+        .filter((s) => /^[\w.\- ]{1,60}$/.test(s))
+    )].slice(0, 500);
+
+    const checkOne = async (sku) => {
+      const url = `https://eshed.com/eshed/${encodeURIComponent(sku)}/`;
+      try {
+        let response = await fetch(url, { method: "HEAD", timeout: 8000, follow: 3 });
+        if (response.status === 405) {
+          response = await fetch(url, { method: "GET", timeout: 8000, follow: 3, size: 1024 * 1024 });
+        }
+        if (response.status === 404 || response.status === 410) return false;
+        return true;
+      } catch (_) {
+        // Network hiccup — fail open so a flaky check never rewrites a
+        // link that might actually be fine.
+        return true;
+      }
+    };
+
+    const results = {};
+    const CONCURRENCY = 10;
+    for (let i = 0; i < clean.length; i += CONCURRENCY) {
+      const batch = clean.slice(i, i + CONCURRENCY);
+      const alive = await Promise.all(batch.map(checkOne));
+      batch.forEach((sku, idx) => { results[sku] = alive[idx]; });
+    }
+
+    console.log(`🔗 check-product-links: ${clean.length} skus, ${Object.values(results).filter((v) => !v).length} dead`);
+    res.json({ results });
+  } catch (error) {
+    console.error("❌ Error checking product links:", error.message);
+    res.status(500).json({ error: "Failed to check product links" });
+  }
+});
+
+/* =========================================================
    /api/import-csv – Import stones from CSV file upload
    ========================================================= */
 const { parse: parseCsv } = require('csv-parse/sync');
