@@ -2172,20 +2172,35 @@ app.get("/api/sync/progress", (req, res) => {
 
 // GET /api/sync/history — recent sync runs (cron + manual), newest first.
 // Backs the Dashboard's "Sync history" window. Admin-only, same as /api/sync.
+// Covers both feeds: stones (SOAP) and jewelry (FTP CSV), told apart by
+// sync_type ('stones' | 'jewelry').
 app.get("/api/sync/history", requireOwner, async (req, res) => {
+  const limit = Math.min(parseInt(req.query?.limit, 10) || 50, 200);
+  const baseCols = "id, source, success, stones_count, message, duration_ms, started_at, finished_at";
   try {
-    const limit = Math.min(parseInt(req.query?.limit, 10) || 50, 200);
     const r = await pool.query(
-      `SELECT id, source, success, stones_count, message, duration_ms, started_at, finished_at
-         FROM sync_log
-        ORDER BY id DESC
-        LIMIT $1`,
+      `SELECT ${baseCols}, sync_type FROM sync_log ORDER BY id DESC LIMIT $1`,
       [limit]
     );
     res.json({ history: r.rows });
   } catch (e) {
     // 42P01 = table doesn't exist yet (no sync has run since this feature shipped)
     if (e.code === "42P01") return res.json({ history: [] });
+    // 42703 = sync_type column not added yet (no jewelry sync has run) —
+    // fall back to the legacy shape and tag everything as stones.
+    if (e.code === "42703") {
+      try {
+        const r = await pool.query(
+          `SELECT ${baseCols} FROM sync_log ORDER BY id DESC LIMIT $1`,
+          [limit]
+        );
+        return res.json({ history: r.rows.map((row) => ({ ...row, sync_type: "stones" })) });
+      } catch (e2) {
+        if (e2.code === "42P01") return res.json({ history: [] });
+        console.error("GET /api/sync/history error:", e2);
+        return res.status(500).json({ error: e2.message });
+      }
+    }
     console.error("GET /api/sync/history error:", e);
     res.status(500).json({ error: e.message });
   }
@@ -2265,6 +2280,36 @@ app.post("/api/sync", sensitiveLimiter, requireOwner, async (req, res) => {
       success: false, 
       error: error.message 
     });
+  }
+});
+
+/* =========================================================
+   /api/jewelry/sync – Trigger jewelry FTP sync (Barak's
+   Jewelry_Web.csv → jewelry_products). Logged to sync_log
+   with sync_type='jewelry'.
+   ========================================================= */
+const { run: runJewelryImport } = require('./importJewelryFromFtp');
+
+let jewelrySyncActive = false;
+
+app.post("/api/jewelry/sync", sensitiveLimiter, requireOwner, async (req, res) => {
+  if (jewelrySyncActive) {
+    return res.status(409).json({ success: false, error: "A jewelry sync is already in progress" });
+  }
+  jewelrySyncActive = true;
+  try {
+    console.log("🔄 Jewelry FTP sync requested via API");
+    const result = await runJewelryImport({ dbPool: pool, closePool: false, source: 'manual' });
+    if (result.success) {
+      res.json({ success: true, message: result.message, count: result.count, status: "completed" });
+    } else {
+      res.status(500).json({ success: false, error: result.message, status: "failed" });
+    }
+  } catch (error) {
+    console.error("❌ Error during jewelry sync:", error);
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    jewelrySyncActive = false;
   }
 });
 
