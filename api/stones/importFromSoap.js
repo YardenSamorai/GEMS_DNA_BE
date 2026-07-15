@@ -64,16 +64,14 @@ const mapBranch = (branch) => {
 };
 
 /**
- * Run the SOAP import
+ * Run the SOAP import (internal — use `run` which also records the sync_log row)
  * @param {object} options
  * @param {object} options.dbPool - Optional database pool to use (if called from server)
- * @param {boolean} options.closePool - Whether to close the pool when done (default: true)
  * @param {function} options.onProgress - Optional progress callback: ({ phase, progress, detail, totalStones, processedStones })
  * @returns {Promise<{success: boolean, count: number, message: string}>}
  */
-const run = async (options = {}) => {
+const runImport = async (options = {}) => {
   const dbPool = options.dbPool || pool;
-  const closePool = options.closePool !== undefined ? options.closePool : true;
   const onProgress = options.onProgress || (() => {});
   
   try {
@@ -398,19 +396,80 @@ const run = async (options = {}) => {
   } catch (err) {
     console.error("❌ Error:", err);
     return { success: false, count: 0, message: err.message || "Unknown error during sync" };
-  } finally {
-    if (closePool) {
-      await pool.end().catch(() => {});
-    }
   }
+};
+
+// Append one row to sync_log for every run — the Dashboard's "Sync history"
+// window reads this. Logging must never fail the sync itself.
+const logSyncRun = async (dbPool, entry) => {
+  try {
+    await dbPool.query(`
+      CREATE TABLE IF NOT EXISTS sync_log (
+        id           SERIAL PRIMARY KEY,
+        source       TEXT NOT NULL DEFAULT 'manual',
+        success      BOOLEAN NOT NULL,
+        stones_count INTEGER NOT NULL DEFAULT 0,
+        message      TEXT,
+        duration_ms  INTEGER,
+        started_at   TIMESTAMPTZ NOT NULL,
+        finished_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await dbPool.query(
+      `INSERT INTO sync_log (source, success, stones_count, message, duration_ms, started_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [entry.source, entry.success, entry.count, entry.message, entry.durationMs, entry.startedAt]
+    );
+    console.log(`📝 sync_log recorded (${entry.source}, success=${entry.success}, count=${entry.count})`);
+  } catch (e) {
+    console.warn("⚠️  Could not write sync_log entry:", e.message);
+  }
+};
+
+/**
+ * Run the SOAP import and record the outcome in sync_log.
+ * @param {object} options
+ * @param {object} options.dbPool - Optional database pool to use (if called from server)
+ * @param {boolean} options.closePool - Whether to close the pool when done (default: true)
+ * @param {string} options.source - 'manual' (Sync button) or 'cron' (scheduled job)
+ * @param {function} options.onProgress - Optional progress callback
+ * @returns {Promise<{success: boolean, count: number, message: string}>}
+ */
+const run = async (options = {}) => {
+  const dbPool = options.dbPool || pool;
+  const closePool = options.closePool !== undefined ? options.closePool : true;
+  const source = options.source || "manual";
+  const startedAt = new Date();
+
+  let result;
+  try {
+    result = await runImport(options);
+  } catch (err) {
+    result = { success: false, count: 0, message: err.message || "Unknown error during sync" };
+  }
+
+  await logSyncRun(dbPool, {
+    source,
+    success: result.success,
+    count: result.count,
+    message: result.message,
+    durationMs: Date.now() - startedAt.getTime(),
+    startedAt,
+  });
+
+  if (closePool) {
+    await pool.end().catch(() => {});
+  }
+  return result;
 };
 
 // Export run function for use by server.js
 module.exports = { run };
 
-// Only auto-run when executed directly (node importFromSoap.js)
+// Only auto-run when executed directly (the Render Cron Job runs
+// `node api/stones/importFromSoap.js`)
 if (require.main === module) {
-  run().then((result) => {
+  run({ source: "cron" }).then((result) => {
     console.log("📋 Result:", result);
     process.exit(result.success ? 0 : 1);
   });

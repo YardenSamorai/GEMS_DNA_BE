@@ -2170,6 +2170,27 @@ app.get("/api/sync/progress", (req, res) => {
   res.json(syncProgress);
 });
 
+// GET /api/sync/history — recent sync runs (cron + manual), newest first.
+// Backs the Dashboard's "Sync history" window. Admin-only, same as /api/sync.
+app.get("/api/sync/history", requireOwner, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query?.limit, 10) || 50, 200);
+    const r = await pool.query(
+      `SELECT id, source, success, stones_count, message, duration_ms, started_at, finished_at
+         FROM sync_log
+        ORDER BY id DESC
+        LIMIT $1`,
+      [limit]
+    );
+    res.json({ history: r.rows });
+  } catch (e) {
+    // 42P01 = table doesn't exist yet (no sync has run since this feature shipped)
+    if (e.code === "42P01") return res.json({ history: [] });
+    console.error("GET /api/sync/history error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/api/sync", sensitiveLimiter, requireOwner, async (req, res) => {
   if (syncProgress.active) {
     return res.status(409).json({ 
@@ -2198,7 +2219,7 @@ app.post("/api/sync", sensitiveLimiter, requireOwner, async (req, res) => {
 
     // Run the import directly (not via exec) using the server's db pool
     // closePool: false so we don't kill the server's connection pool
-    const result = await runSoapImport({ dbPool: pool, closePool: false, onProgress });
+    const result = await runSoapImport({ dbPool: pool, closePool: false, source: 'manual', onProgress });
     
     if (result.success) {
       console.log(`✅ Sync completed: ${result.count} stones`);
