@@ -2420,6 +2420,76 @@ app.get("/api/image-proxy", async (req, res) => {
 });
 
 /* =========================================================
+   /api/vimeo-file/:id – Direct MP4 link for a Vimeo video
+   ---------------------------------------------------------
+   iOS Safari ignores every quality hint on embedded Vimeo
+   players (native HLS = Apple decides, and it downgrades
+   small players to 240p/360p). The product pages therefore
+   play the direct progressive MP4 instead — one fixed-quality
+   file, no adaptive engine, no way to degrade.
+   Requires VIMEO_ACCESS_TOKEN (scopes: public private
+   video_files) and a Vimeo Pro+ account. Links are cached
+   in-memory; Vimeo's `files` links don't expire.
+   ========================================================= */
+const VIMEO_TOKEN = process.env.VIMEO_ACCESS_TOKEN;
+const vimeoFileCache = new Map(); // videoId -> { link, width, height, cachedAt }
+const VIMEO_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+
+app.get("/api/vimeo-file/:id", async (req, res) => {
+  try {
+    const videoId = String(req.params.id || "").trim();
+    if (!/^\d{6,20}$/.test(videoId)) {
+      return res.status(400).json({ error: "Invalid video id" });
+    }
+    if (!VIMEO_TOKEN) {
+      return res.status(503).json({ error: "Vimeo token not configured" });
+    }
+
+    const cached = vimeoFileCache.get(videoId);
+    if (cached && Date.now() - cached.cachedAt < VIMEO_CACHE_TTL_MS) {
+      return res.json(cached.payload);
+    }
+
+    const vr = await fetch(
+      `https://api.vimeo.com/videos/${videoId}?fields=files`,
+      {
+        timeout: 10000,
+        headers: {
+          Authorization: `Bearer ${VIMEO_TOKEN}`,
+          Accept: "application/vnd.vimeo.*+json;version=3.4",
+        },
+      }
+    );
+    if (!vr.ok) {
+      return res.status(vr.status === 404 ? 404 : 502).json({ error: `Vimeo API ${vr.status}` });
+    }
+    const data = await vr.json();
+
+    // Pick the highest-resolution progressive MP4 (skip the HLS entry).
+    const mp4s = (data.files || []).filter(
+      (f) => f.type === "video/mp4" && f.rendition !== "adaptive" && f.link
+    );
+    if (!mp4s.length) {
+      return res.status(404).json({ error: "No progressive files for this video" });
+    }
+    mp4s.sort((a, b) => (b.height || 0) - (a.height || 0));
+    const best = mp4s[0];
+
+    const payload = {
+      link: best.link,
+      rendition: best.rendition,
+      width: best.width || null,
+      height: best.height || null,
+    };
+    vimeoFileCache.set(videoId, { payload, cachedAt: Date.now() });
+    res.json(payload);
+  } catch (error) {
+    console.error("vimeo-file error:", error.message);
+    res.status(500).json({ error: "Failed to resolve video file" });
+  }
+});
+
+/* =========================================================
    /api/check-product-links – Which SKUs still have a live
    product page on eshed.com (used by the PDF catalog export
    to avoid dead "View more" links)
