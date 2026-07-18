@@ -1629,6 +1629,9 @@ app.get("/api/jewelry", async (req, res) => {
         full_description: row.full_description,
         jewelry_size: row.jewelry_size,
         instructions_main: row.instructions_main,
+        // 1 = must not appear on websites, 2 = website-approved, null = not
+        // yet classified (item arrived after the last level list was applied).
+        security_level: row.security_level ?? null,
         first_seen_at: row.first_seen_at || null,
         // Location surface (masked per viewer), mirroring the loose-stone shape.
         branch: showBranch ? branch : null,
