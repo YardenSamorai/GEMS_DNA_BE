@@ -8,7 +8,9 @@
 //
 // This is an UPDATE-by-SKU (no TRUNCATE): it never wipes SOAP-synced columns
 // like category/type/color/clarity. A non-empty CSV value overwrites; an empty
-// CSV cell leaves the existing value intact.
+// CSV cell leaves the existing value intact — EXCEPT holder, where the export
+// is authoritative: an empty Holder means the hold was RELEASED, so it clears
+// the field (keeping the old name showed dead HOLD tags on the site forever).
 //
 // Usage:  node importSalesFields.js ["C:\\path\\to\\export.csv"]
 
@@ -41,6 +43,7 @@ const CHUNK = 300;
     trim: true,
   });
   console.log('Parsed rows:', rows.length);
+  console.log(`${rows[0]}, Location: ${rows[0]['Location']}, Holder: ${rows[0]['Holder']},Holder: ${rows[0]['Holder']}`);
 
   // [sku, cost_per_carat, location, holder]
   const records = [];
@@ -65,7 +68,7 @@ const CHUNK = 300;
       UPDATE soap_stones AS s SET
         cost_per_carat = COALESCE(v.cpc, s.cost_per_carat),
         location       = COALESCE(v.loc, s.location),
-        holder         = COALESCE(v.hold, s.holder)
+        holder         = v.hold
       FROM (VALUES ${ph}) AS v(sku, cpc, loc, hold)
       WHERE s.sku = v.sku`;
     const res = await pool.query(sql, chunk.flat());

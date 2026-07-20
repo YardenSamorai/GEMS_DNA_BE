@@ -52,13 +52,23 @@ async function snapshotPreserved(dbPool) {
 
 /* Re-apply the snapshot AFTER the new rows are inserted. The freshly-imported
  * value wins whenever it is non-empty; otherwise the snapshot value is kept.
- * Returns the number of rows touched. */
-async function restorePreserved(dbPool, rows, chunkSize = 300) {
+ * Returns the number of rows touched.
+ *
+ * `excludeCols` — columns the CURRENT import is authoritative for, i.e. an
+ * empty incoming value MEANS empty (don't fall back to the snapshot). The CSV
+ * export carries a real Holder column, so a blank there means "hold released"
+ * — restoring the old name kept dead HOLD tags alive forever (T9577 bug).
+ * The SOAP feed has no holder at all, so the sync still preserves it. */
+async function restorePreserved(dbPool, rows, chunkSize = 300, excludeCols = []) {
   if (!rows || !rows.length) return 0;
 
   const setClause = [
-    ...PRESERVE_TEXT.map((c) => `${c} = COALESCE(NULLIF(s.${c}, ''), v.${c})`),
-    ...PRESERVE_NUM.map((c) => `${c} = COALESCE(s.${c}, v.${c})`),
+    ...PRESERVE_TEXT.filter((c) => !excludeCols.includes(c)).map(
+      (c) => `${c} = COALESCE(NULLIF(s.${c}, ''), v.${c})`
+    ),
+    ...PRESERVE_NUM.filter((c) => !excludeCols.includes(c)).map(
+      (c) => `${c} = COALESCE(s.${c}, v.${c})`
+    ),
   ].join(',\n           ');
 
   const valCols = ['sku', ...ALL_COLS];

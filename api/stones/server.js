@@ -2697,9 +2697,12 @@ app.post("/api/import-csv", sensitiveLimiter, requireOwner, async (req, res) => 
     }
 
     // 🛟 Restore preserved fields the CSV left empty (CSV value wins otherwise).
+    // EXCEPT holder: the CSV's Holder column is authoritative — a blank there
+    // means the hold was RELEASED in Barak, so restoring the old name would
+    // keep a dead HOLD tag alive forever (the T9577 bug).
     if (preservedFields.length) {
       csvImportProgress = { ...csvImportProgress, phase: 'restoring', progress: 95, detail: 'Restoring preserved fields...' };
-      const restored = await restorePreserved(pool, preservedFields, CHUNK);
+      const restored = await restorePreserved(pool, preservedFields, CHUNK, ['holder']);
       console.log(`🛟 Restored enriched fields on ${restored} stones after CSV import.`);
     }
 

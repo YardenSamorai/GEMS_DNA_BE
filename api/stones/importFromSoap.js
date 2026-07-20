@@ -166,6 +166,13 @@ const runImport = async (options = {}) => {
       stone.GroupingType = stone.Box;
       stone.Box = stone.Stones;
       stone.Stones = null;
+      // The tail fields (cost_per_carat / Holder / JewelryModel) are shifted
+      // too, but their exact displacement is unreliable on corrupted rows —
+      // null them so a location name can never masquerade as a Holder and
+      // paint a false HOLD tag. The preserve/restore pass fills the gaps.
+      stone.cost_per_carat = null;
+      stone.Holder = null;
+      stone.JewelryModel = null;
     };
 
     const values = stoneArray.map((stone) => {
@@ -196,6 +203,15 @@ const runImport = async (options = {}) => {
 
       const stonesStr = String(stone.Stones || '').trim();
       const boxStr = String(stone.Box || '').trim();
+      // On tail-shifted rows the trailing elements (cost_per_carat, Holder,
+      // Location, JewelryModel) are displaced too — a price can land inside
+      // Holder and paint a FALSE HOLD tag. Their exact displacement varies,
+      // so null them and let the preserve/restore pass fill the gaps.
+      const dropShiftedTail = () => {
+        stone.cost_per_carat = null;
+        stone.Holder = null;
+        stone.JewelryModel = null;
+      };
       if (stonesStr && isValidGT(stonesStr)) {
         // Shift by 2: GroupingType is in Stones, TradeShow is in Box, Origin is in GroupingType
         console.warn(`⚠️  Tail shift (2) for ${stone.SKU}: Stones="${stonesStr}" → GroupingType`);
@@ -207,6 +223,7 @@ const runImport = async (options = {}) => {
         stone.GroupingType = realGroupingType;
         if (realTradeShow && !stone.TradeShow) stone.TradeShow = realTradeShow;
         if (realOrigin && !stone.Origin) stone.Origin = realOrigin;
+        dropShiftedTail();
       } else if (boxStr && isValidGT(boxStr) && !isValidGT(String(stone.GroupingType || '').trim())) {
         // Shift by 1: GroupingType is in Box, TradeShow is in GroupingType
         console.warn(`⚠️  Tail shift (1) for ${stone.SKU}: Box="${boxStr}" → GroupingType`);
@@ -216,6 +233,7 @@ const runImport = async (options = {}) => {
         stone.Stones = null;
         stone.GroupingType = realGroupingType;
         if (realTradeShow && !stone.TradeShow) stone.TradeShow = realTradeShow;
+        dropShiftedTail();
       }
 
       // Handle xml2js object values
@@ -228,6 +246,9 @@ const runImport = async (options = {}) => {
       if (gtVal && !isValidGT(gtVal)) {
         console.warn(`⚠️  Invalid GroupingType "${gtVal}" for ${stone.SKU} → set to null`);
         stone.GroupingType = null;
+        // An unrecognizable GroupingType means the row is shifted in a way we
+        // couldn't correct — its tail fields are displaced junk too.
+        dropShiftedTail();
       } else if (gtVal) {
         stone.GroupingType = normalizeGT(gtVal);
       }
@@ -280,6 +301,17 @@ const runImport = async (options = {}) => {
         cleanText(stone.GroupingType),
         cleanText(stone.Box),
         safeNumber(stone.Stones),
+        // Tail fields Barak added to the feed later — Holder especially
+        // matters: it drives the HOLD tag, and the live feed is the source
+        // of truth (empty = hold released; see restorePreserved below).
+        // A purely numeric "Holder" is displaced price data from a corrupted
+        // row, never a person — drop it so it can't paint a false HOLD tag.
+        safeNumber(stone.cost_per_carat),
+        (() => {
+          const h = cleanText(stone.Holder);
+          return h && /^[\d.,\s-]+$/.test(h) ? null : h;
+        })(),
+        cleanText(stone.JewelryModel),
         rawSnapshot,
       ];
     });
@@ -297,7 +329,7 @@ const runImport = async (options = {}) => {
 
       const sku = row[1];
       if (sku && debugSkus.some(d => sku.toUpperCase().includes(d.replace('-', '')))) {
-        const rawData = row[43]; // raw_xml column
+        const rawData = row[46]; // raw_xml column (last)
         let rawParsed;
         try { rawParsed = JSON.parse(rawData); } catch { rawParsed = null; }
         const allGroupingKeys = rawParsed ? Object.keys(rawParsed).filter(k => k.toLowerCase().includes('group')) : [];
@@ -316,7 +348,8 @@ const runImport = async (options = {}) => {
       "depth_percent", "ratio", "measurements", "fancy_intensity",
       "fancy_color", "fancy_overtone", "fancy_color_2", "fancy_overtone_2",
       "pair_stone", "home_page", "trade_show", "comment", "type",
-      "cert_comments", "origin", "grouping_type", "box", "stones", "raw_xml",
+      "cert_comments", "origin", "grouping_type", "box", "stones",
+      "cost_per_carat", "holder", "jewelry_model", "raw_xml",
     ];
 
     // 🛟 Preserve enriched fields across the truncate so a SOAP sync never
@@ -384,9 +417,12 @@ const runImport = async (options = {}) => {
 
     // 🛟 Re-apply the preserved fields. The freshly-synced SOAP value wins
     // whenever it is non-empty; otherwise the snapshot value is restored.
+    // EXCEPT holder: the feed now carries a real Holder element, so an empty
+    // value means the hold was RELEASED in Barak — restoring the old name
+    // would keep a dead HOLD tag alive forever (the T9577 bug).
     if (preservedSalesFields.length) {
       console.log(`🛟 Restoring enriched fields for ${preservedSalesFields.length} stones...`);
-      const restored = await restorePreserved(dbPool, preservedSalesFields, CHUNK_SIZE);
+      const restored = await restorePreserved(dbPool, preservedSalesFields, CHUNK_SIZE, ['holder']);
       console.log(`🛟 Restored enriched fields on ${restored} stones.`);
     }
 
