@@ -149,18 +149,22 @@ async function requireOwner(req, res, next) {
 }
 
 /* =========================================================
-   Single-active-session policy
+   Max concurrent sessions policy (2)
    ---------------------------------------------------------
-   The app enforces one active session per user: signing in
-   on a new device offers to "take over" and sign out every
-   other device. These endpoints are called from the custom
-   login sheet right after authentication, BEFORE the new
-   session is activated on the client (so no bearer token is
-   available yet) — authorization is proven by possession of a
-   freshly-created, still-active Clerk session id, and a caller
-   can only ever see/revoke sessions belonging to that same
-   user.
+   A user may stay signed in on up to two devices at once
+   (e.g. phone + computer). A third sign-in automatically
+   revokes the oldest active session(s) so only the two
+   newest remain — the newly created session is always kept.
+
+   Endpoints are called:
+     - from the login sheet right after auth, BEFORE setActive
+       (no bearer token yet — authorized by possession of a
+       freshly-created, still-active Clerk session id); and
+     - from a signed-in client guard after OAuth (Bearer JWT
+       + session id), so Google sign-in is covered too.
    ========================================================= */
+const MAX_ACTIVE_SESSIONS = 2;
+
 const sessionDeviceLabel = (s) => {
   const a = (s && s.latestActivity) || {};
   const who = [a.browserName, a.deviceType].filter(Boolean).join(' · ');
@@ -172,6 +176,14 @@ const sessionDeviceLabel = (s) => {
 // Returns a Clerk session list as a plain array across SDK shapes.
 const sessionListArray = (list) =>
   Array.isArray(list) ? list : (list && Array.isArray(list.data) ? list.data : []);
+
+const sessionCreatedAtMs = (s) => {
+  const t = s && s.createdAt;
+  if (t == null) return 0;
+  if (typeof t === 'number') return t;
+  const ms = Date.parse(t);
+  return Number.isFinite(ms) ? ms : 0;
+};
 
 // Resolves the owning user for a session id, then returns its sibling active
 // sessions (every active session for that user except the one provided).
@@ -186,25 +198,90 @@ async function otherActiveSessions(sessionId) {
   return { userId: current.userId, others };
 }
 
+// Keep at most MAX_ACTIVE_SESSIONS active sessions for a user. Always keep
+// keepSessionId; fill remaining slots with the newest other sessions; revoke
+// everything else (oldest first by effect).
+async function enforceActiveSessionLimit(userId, keepSessionId) {
+  if (!clerkClient || !userId) return { revoked: 0, kept: [] };
+  const list = await clerkClient.sessions.getSessionList({
+    userId,
+    status: 'active',
+  });
+  const active = sessionListArray(list);
+  if (active.length <= MAX_ACTIVE_SESSIONS) {
+    return { revoked: 0, kept: active.map((s) => s.id) };
+  }
+
+  const newestFirst = [...active].sort(
+    (a, b) => sessionCreatedAtMs(b) - sessionCreatedAtMs(a)
+  );
+  const keep = new Set();
+  if (keepSessionId) keep.add(keepSessionId);
+  for (const s of newestFirst) {
+    if (keep.size >= MAX_ACTIVE_SESSIONS) break;
+    keep.add(s.id);
+  }
+
+  let revoked = 0;
+  for (const s of active) {
+    if (keep.has(s.id)) continue;
+    try {
+      await clerkClient.sessions.revokeSession(s.id);
+      revoked++;
+    } catch (_) {}
+  }
+  return { revoked, kept: [...keep] };
+}
+
 // Peek: does this freshly-signed-in user already have other live sessions?
 app.post('/api/auth/sessions/peers', sensitiveLimiter, async (req, res) => {
   try {
-    if (!clerkClient) return res.json({ count: 0, others: [] });
+    if (!clerkClient) return res.json({ count: 0, others: [], max: MAX_ACTIVE_SESSIONS });
     const sessionId = String(req.body?.sessionId || '').trim();
     if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
     const { others } = await otherActiveSessions(sessionId);
     return res.json({
       count: others.length,
       others: others.map((s) => ({ id: s.id, label: sessionDeviceLabel(s) })),
+      max: MAX_ACTIVE_SESSIONS,
     });
   } catch (e) {
     // Never block sign-in on a session-lookup hiccup — just report "no peers".
-    return res.json({ count: 0, others: [] });
+    return res.json({ count: 0, others: [], max: MAX_ACTIVE_SESSIONS });
   }
 });
 
-// Take over: revoke every OTHER active session for this user, keeping only the
-// one just created on this device.
+// Enforce the 2-session cap: revoke oldest excess sessions, keep the newest
+// two (always including the caller's session). Accepts a raw sessionId
+// (pre-activate login) and/or a Bearer JWT (post-OAuth / already signed in).
+app.post('/api/auth/sessions/enforce-limit', sensitiveLimiter, async (req, res) => {
+  try {
+    if (!clerkClient) return res.json({ ok: true, revoked: 0, kept: [], max: MAX_ACTIVE_SESSIONS });
+
+    let sessionId = String(req.body?.sessionId || '').trim();
+    const sidFromJwt = req.auth?.claims?.sid || req.auth?.claims?.session_id || null;
+    if (!sessionId && sidFromJwt) sessionId = String(sidFromJwt).trim();
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+
+    const current = await clerkClient.sessions.getSession(sessionId);
+    if (!current || !current.userId) {
+      return res.status(400).json({ error: 'Invalid session' });
+    }
+
+    // If a Bearer JWT is present, the session must belong to that user.
+    if (req.auth?.userId && current.userId !== req.auth.userId) {
+      return res.status(403).json({ error: 'Session mismatch' });
+    }
+
+    const result = await enforceActiveSessionLimit(current.userId, sessionId);
+    return res.json({ ok: true, ...result, max: MAX_ACTIVE_SESSIONS });
+  } catch (e) {
+    return res.status(500).json({ error: 'Could not update sessions' });
+  }
+});
+
+// Legacy: revoke every OTHER active session (kept for compatibility). Prefer
+// /enforce-limit for the 2-session policy.
 app.post('/api/auth/sessions/revoke-others', sensitiveLimiter, async (req, res) => {
   try {
     if (!clerkClient) return res.json({ ok: true, revoked: 0 });
@@ -221,8 +298,7 @@ app.post('/api/auth/sessions/revoke-others', sensitiveLimiter, async (req, res) 
   }
 });
 
-// Cancel: drop the just-created session so it doesn't linger when the user
-// chooses not to take over.
+// Revoke a single session by id (e.g. cancel a half-finished sign-in).
 app.post('/api/auth/sessions/revoke', sensitiveLimiter, async (req, res) => {
   try {
     if (!clerkClient) return res.json({ ok: true });
