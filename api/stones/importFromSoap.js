@@ -4,6 +4,7 @@ const { fetchSoapData } = require("../../utils/soapClient");
 const { parseXml } = require("../../utils/xmlParser");
 const { pool } = require("../../db/client");
 const { cleanText, snapshotPreserved, restorePreserved } = require("../../utils/preserveFields");
+const { auditPrices } = require("../../utils/priceIntegrity");
 
 const CHUNK_SIZE = 300; // ⭐ הכי יציב
 
@@ -253,7 +254,10 @@ const runImport = async (options = {}) => {
         stone.GroupingType = normalizeGT(gtVal);
       }
 
-      // 💰 הכפלת מחירים x2
+      // 💰 Prices are stored exactly as the supplier sends them. The importer
+      // used to double them here; that is why display code grew ÷2 workarounds
+      // which later turned into wrong prices. Never scale prices on import —
+      // scaling belongs to the display layer alone (FE src/utils/pricing.js).
       const pricePerCarat = safeNumber(stone.PricePerCarat);
       const totalPrice = safeNumber(stone.TotalPrice);
 
@@ -426,9 +430,19 @@ const runImport = async (options = {}) => {
       console.log(`🛟 Restored enriched fields on ${restored} stones.`);
     }
 
+    // 🔍 Verify the prices we just stored still follow the supplier convention
+    // (see utils/priceIntegrity.js). Never blocks the sync — it only reports.
+    onProgress({ phase: 'verifying', progress: 97, detail: 'Verifying prices...', totalStones: stoneArray.length, processedStones: stoneArray.length });
+    const priceAudit = await auditPrices(dbPool, 'soap');
+
     onProgress({ phase: 'complete', progress: 100, detail: `Successfully synced ${stoneArray.length} stones!`, totalStones: stoneArray.length, processedStones: stoneArray.length });
     console.log(`🎉 DONE! Inserted ${stoneArray.length} stones successfully.`);
-    return { success: true, count: stoneArray.length, message: `Successfully synced ${stoneArray.length} stones` };
+    return {
+      success: true,
+      count: stoneArray.length,
+      message: `Successfully synced ${stoneArray.length} stones`,
+      priceAudit: priceAudit ? { status: priceAudit.status, checks: priceAudit.checks } : null,
+    };
   } catch (err) {
     console.error("❌ Error:", err);
     return { success: false, count: 0, message: err.message || "Unknown error during sync" };

@@ -2285,6 +2285,34 @@ app.get("/api/sync/history", requireOwner, async (req, res) => {
   }
 });
 
+/* GET /api/price-audit — price integrity report.
+ *
+ * `?run=1` re-runs every check against the live catalog right now; otherwise
+ * the stored reports from previous imports are returned. See
+ * utils/priceIntegrity.js for what each check proves. */
+app.get("/api/price-audit", requireOwner, async (req, res) => {
+  try {
+    if (req.query?.run === "1") {
+      const report = await auditPrices(pool, "manual");
+      if (!report) return res.status(500).json({ error: "Price audit could not run" });
+      return res.json({ report });
+    }
+
+    const limit = Math.min(parseInt(req.query?.limit, 10) || 20, 100);
+    const r = await pool.query(
+      `SELECT id, checked_at, source, status, stones_checked, checks
+         FROM price_audit_log ORDER BY id DESC LIMIT $1`,
+      [limit]
+    );
+    res.json({ history: r.rows });
+  } catch (e) {
+    // 42P01 = table doesn't exist yet (no import has run since this shipped)
+    if (e.code === "42P01") return res.json({ history: [] });
+    console.error("GET /api/price-audit error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/api/sync", sensitiveLimiter, requireOwner, async (req, res) => {
   if (syncProgress.active) {
     return res.status(409).json({ 
@@ -2623,6 +2651,7 @@ app.post("/api/check-product-links", async (req, res) => {
    ========================================================= */
 const { parse: parseCsv } = require('csv-parse/sync');
 const { cleanText: cleanCsvText, snapshotPreserved, restorePreserved } = require('../../utils/preserveFields');
+const { auditPrices } = require('../../utils/priceIntegrity');
 
 const CSV_BRANCH_MAP = {
   IL:'Israel',EM:'Israel',JI:'Israel',
@@ -2782,10 +2811,20 @@ app.post("/api/import-csv", sensitiveLimiter, requireOwner, async (req, res) => 
       console.log(`🛟 Restored enriched fields on ${restored} stones after CSV import.`);
     }
 
+    // 🔍 Verify the prices we just stored still follow the supplier convention
+    // (see utils/priceIntegrity.js). Never blocks the import — it only reports.
+    csvImportProgress = { ...csvImportProgress, phase: 'verifying', progress: 97, detail: 'Verifying prices...' };
+    const priceAudit = await auditPrices(pool, 'csv');
+
     csvImportProgress = { active: false, phase: 'complete', progress: 100, detail: `Successfully imported ${values.length} stones!`, totalStones: values.length, processedStones: values.length };
     console.log(`✅ CSV import completed: ${values.length} stones`);
 
-    res.json({ success: true, count: values.length, status: "completed" });
+    res.json({
+      success: true,
+      count: values.length,
+      status: "completed",
+      priceAudit: priceAudit ? { status: priceAudit.status, checks: priceAudit.checks } : null,
+    });
   } catch (error) {
     console.error("❌ CSV import error:", error);
     csvImportProgress = { active: false, phase: 'error', progress: 0, detail: error.message, totalStones: 0, processedStones: 0 };
@@ -3521,7 +3560,10 @@ const crmReadyPromise = (async () => {
             }
           }
           if (snap) {
-            const neto = bruto ? Math.round(bruto / 2) : null;
+            // The stored price IS the Neto figure (see the importers) — the
+            // backfill must not halve it or shared deals get half-price
+            // snapshots that disagree with the inventory screens.
+            const neto = bruto ? Math.round(bruto) : null;
             await pool.query(
               `UPDATE crm_deal_items
                   SET snapshot = $2::jsonb,
@@ -4754,8 +4796,10 @@ app.post("/api/crm/dna-lead", async (req, res) => {
       }
     }
 
-    // Net price (display default — same convention used everywhere else in the app)
-    const netoPrice = brutoPrice ? Math.round(brutoPrice / 2) : 0;
+    // `total_price` / jewelry `price` already hold the real (Neto) figure —
+    // the importers store the supplier value verbatim. Do NOT halve it here:
+    // that used to open every DNA lead at half its true value.
+    const netoPrice = brutoPrice ? Math.round(brutoPrice) : 0;
 
     // ---- Create the deal in 'lead' stage ----
     const dealTitle = cleanSku
