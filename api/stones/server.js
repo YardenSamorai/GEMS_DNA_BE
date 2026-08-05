@@ -5019,6 +5019,46 @@ ${detailsLines}`;
   }
 });
 
+/* =========================================================
+   /api/assistant/query – natural-language inventory slicing
+   ---------------------------------------------------------
+   The model never sees stone rows. It gets the question plus the vocabulary
+   of values that exist in the caller's own inventory right now, and answers
+   with a filter object the browser applies to the list it already holds.
+   That keeps prices, cost and location out of the request entirely, so the
+   per-viewer masking done in /api/soap-stones needs no second implementation.
+
+   requireAuth is deliberate: most data routes still fall back to the
+   spoofable x-actor-id header, and this route must have a verified JWT.
+   Store-portal users are turned away in the handler rather than by the
+   STORE_USER_ALLOWED_PREFIXES gate, which only engages once a request
+   carries an actor header — this one carries a bearer token instead.
+   ========================================================= */
+const { runAssistantQuery } = require("../../utils/assistantQuery");
+
+app.post("/api/assistant/query", sensitiveLimiter, requireAuth, async (req, res) => {
+  try {
+    // Store-portal users have no inventory page; without this they could
+    // still spend our OpenAI budget.
+    try {
+      const ctx = await resolveTeamContext(req);
+      if (ctx?.role === "store_user") {
+        return res.status(403).json({ error: "Not available for store-portal users" });
+      }
+    } catch (_) {
+      /* Same fail-open stance the rest of the file takes on context lookups. */
+    }
+
+    const { message, history, inventoryMode, vocabulary } = req.body || {};
+    const result = await runAssistantQuery({ message, history, inventoryMode, vocabulary });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    res.json(result.body);
+  } catch (error) {
+    console.error("Assistant query error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 /* ---------- Interactions ---------- */
 
 app.post("/api/crm/interactions", async (req, res) => {
