@@ -63,6 +63,25 @@ const supportedFields = (inventoryMode) =>
     ? JEWELRY_SUPPORTED
     : { ranges: RANGE_FIELDS, multi: MULTI_KEYS, text: TEXT_KEYS };
 
+/* Sorting is how "the cheapest" or "the biggest" gets answered without the
+ * model ever ranking rows itself. These are keys on the stone object the
+ * inventory page sorts by directly. */
+const SORT_FIELDS = {
+  stones: ["pricePerCt", "priceTotal", "weightCt", "sku", "color", "clarity", "lab", "shape", "ratio"],
+  jewelry: ["priceTotal", "weightCt", "sku"],
+};
+
+const sortFieldsFor = (inventoryMode) =>
+  inventoryMode === "jewelry" ? SORT_FIELDS.jewelry : SORT_FIELDS.stones;
+
+/** @returns {{field: string, direction: 'asc'|'desc'}|null} */
+const validateSort = (raw, inventoryMode = "diamonds") => {
+  if (!raw || typeof raw !== "object") return null;
+  const field = String(raw.field ?? "").trim();
+  if (!sortFieldsFor(inventoryMode).includes(field)) return null;
+  return { field, direction: raw.direction === "desc" ? "desc" : "asc" };
+};
+
 const rangeDescription = (field) => {
   if (field.includes("PricePerCt")) return "price per carat in USD";
   if (field.includes("Price")) return "total price in USD";
@@ -117,15 +136,80 @@ const buildFilterTool = (vocabulary = {}, inventoryMode = "diamonds") => {
       "Switch tab, but only when the request clearly belongs to another one: diamonds for white and fancy diamonds, gemstones for coloured stones, jewelry for finished pieces. Omit to stay on the current tab.",
   };
 
+  // Superlatives are answered by ordering the list, never by the model
+  // ranking rows in its head.
+  properties.sort = {
+    type: "object",
+    properties: {
+      field: { type: "string", enum: sortFieldsFor(inventoryMode) },
+      direction: { type: "string", enum: ["asc", "desc"] },
+    },
+    required: ["field", "direction"],
+    description:
+      "Order the results. Use for requests like cheapest, most expensive, biggest or heaviest.",
+  };
+
+  properties.wantsRecommendation = {
+    type: "boolean",
+    description:
+      "Set true only when the user wants you to choose, compare or advise on specific stones, rather than just narrow the list. When true you will be shown the matching stones and asked to answer about them.",
+  };
+
   return {
     type: "function",
     function: {
       name: "build_inventory_filter",
       description:
-        "Apply a filter to the user's inventory list. Only include fields the user actually asked for; omit everything else.",
+        "Filter, sort and show the user's inventory list. Only include fields the user actually asked for; omit everything else.",
       parameters: { type: "object", properties, additionalProperties: false },
     },
   };
+};
+
+/**
+ * Tool for sending the user to another page. Targets are supplied per request
+ * from the frontend, which knows which sections this user may open — so the
+ * model can never route someone into a section they are not permitted to see.
+ * @param {Array<{path: string, label: string}>} targets
+ */
+const buildNavigateTool = (targets = []) => {
+  if (!Array.isArray(targets) || targets.length === 0) return null;
+  return {
+    type: "function",
+    function: {
+      name: "navigate_to_page",
+      description:
+        "Send the user to a different page. Use only when the request belongs somewhere else in the app; do not use it to show inventory results, which appear in place.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            enum: targets.map((t) => t.path),
+            description: targets.map((t) => `${t.path} = ${t.label}`).join("; "),
+          },
+        },
+        required: ["path"],
+        additionalProperties: false,
+      },
+    },
+  };
+};
+
+const sanitizeNavTargets = (raw, limit = 20) => {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const t of raw) {
+    const path = String(t?.path ?? "").trim();
+    const label = String(t?.label ?? "").trim();
+    // Relative in-app paths only — an absolute URL here would turn the
+    // assistant into an open redirect.
+    if (!/^\/[\w\-/]*$/.test(path) || !label) continue;
+    if (out.some((o) => o.path === path)) continue;
+    out.push({ path, label: label.slice(0, 60) });
+    if (out.length >= limit) break;
+  }
+  return out;
 };
 
 /**
@@ -226,9 +310,43 @@ const sanitizeVocabulary = (raw, limit = 120) => {
   return out;
 };
 
+/* The only stone fields ever allowed to reach the model, and only once the
+ * user has asked for a recommendation. The rows come from the browser, which
+ * already holds them masked per viewer, so nothing here can be more revealing
+ * than what is on screen. costPerCt is absent deliberately: our buying price
+ * is not needed to compare stones and must not leave the building. */
+const SHORTLIST_FIELDS = [
+  "sku", "category", "shape", "weightCt", "color", "clarity", "treatment",
+  "lab", "origin", "fluorescence", "measurements", "ratio",
+  "pricePerCt", "priceTotal", "location", "certificateNumber",
+  "jewelryType", "style", "collection", "stoneType", "metalType", "title",
+];
+const SHORTLIST_MAX = 20;
+
+const sanitizeShortlist = (raw) => {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const row of raw.slice(0, SHORTLIST_MAX)) {
+    if (!row || typeof row !== "object") continue;
+    const clean = {};
+    for (const field of SHORTLIST_FIELDS) {
+      const v = row[field];
+      if (v === undefined || v === null || v === "") continue;
+      clean[field] = typeof v === "number" ? v : String(v).slice(0, 120);
+    }
+    if (clean.sku) out.push(clean);
+  }
+  return out;
+};
+
 module.exports = {
   INVENTORY_MODES,
+  SHORTLIST_MAX,
   buildFilterTool,
+  buildNavigateTool,
   validateFilters,
+  validateSort,
   sanitizeVocabulary,
+  sanitizeNavTargets,
+  sanitizeShortlist,
 };

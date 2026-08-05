@@ -8,7 +8,21 @@
  * behaviour, so it is a tool you reach for rather than a gate. */
 
 require("dotenv").config();
-const { runAssistantQuery, ASSISTANT_MODEL } = require("./assistantQuery");
+const { runAssistantQuery, runAssistantAdvice, ASSISTANT_MODEL } = require("./assistantQuery");
+
+const navTargets = [
+  { path: "/sales/diamonds", label: "Sales catalog — diamonds" },
+  { path: "/sales/gemstones", label: "Sales catalog — coloured gemstones" },
+  { path: "/sales/jewelry", label: "Sales catalog — jewellery" },
+  { path: "/dashboard", label: "Dashboard overview" },
+];
+
+/* Stand-in for the rows the browser sends back in phase two. */
+const shortlist = [
+  { sku: "K1188", category: "Emerald", weightCt: 5.1, pricePerCt: 12400, priceTotal: 63240, lab: "GRS", origin: "Colombia", treatment: "Minor", location: "New York" },
+  { sku: "K1190", category: "Emerald", weightCt: 5.4, pricePerCt: 21000, priceTotal: 113400, lab: "GRS", origin: "Colombia", treatment: "No Oil", location: "New York" },
+  { sku: "K1204", category: "Emerald", weightCt: 6.2, pricePerCt: 18800, priceTotal: 116560, lab: "SSEF", origin: "Zambia", treatment: "Insignificant", location: "New York" },
+];
 
 /* A realistic slice of the vocabulary the inventory page sends. */
 const stoneVocab = {
@@ -102,16 +116,65 @@ const cases = [
     input: { message: "show me emerald gemstones over 4ct", inventoryMode: "diamonds", vocabulary: stoneVocab },
     expect: (b) => b.inventoryMode === "gemstones",
   },
+  {
+    name: "Superlative becomes a sort, not a guess",
+    input: { message: "\u05d4\u05d0\u05d1\u05e0\u05d9\u05dd \u05d4\u05d6\u05d5\u05dc\u05d5\u05ea \u05d1\u05d9\u05d5\u05ea\u05e8 \u05dc\u05e7\u05e8\u05d0\u05d8", inventoryMode: "gemstones", vocabulary: stoneVocab },
+    expect: (b) => b.sort?.field === "pricePerCt" && b.sort.direction === "asc",
+  },
+  {
+    name: "Biggest sorts by weight descending",
+    input: { message: "show me the biggest rubies", inventoryMode: "gemstones", vocabulary: stoneVocab },
+    expect: (b) => b.filters.category?.includes("Ruby") && b.sort?.field === "weightCt" && b.sort.direction === "desc",
+  },
+  {
+    name: "Asking for advice raises the recommendation flag",
+    input: { message: "\u05d0\u05d9\u05d6\u05d5 \u05d0\u05d6\u05de\u05e8\u05dc\u05d3 \u05d4\u05db\u05d9 \u05de\u05e9\u05ea\u05dc\u05de\u05ea \u05dc\u05dc\u05e7\u05d5\u05d7?", inventoryMode: "gemstones", vocabulary: stoneVocab },
+    expect: (b) => b.wantsRecommendation === true && Object.keys(b.filters).length > 0,
+  },
+  {
+    name: "Plain filtering does not raise it",
+    input: { message: "sapphires in Hong Kong", inventoryMode: "gemstones", vocabulary: stoneVocab },
+    expect: (b) => b.wantsRecommendation === false,
+  },
+  {
+    name: "Routes to another page when the request belongs there",
+    input: { message: "\u05e7\u05d7 \u05d0\u05d5\u05ea\u05d9 \u05dc\u05e7\u05d8\u05dc\u05d5\u05d2 \u05d4\u05de\u05db\u05d9\u05e8\u05d5\u05ea \u05e9\u05dc \u05d4\u05ea\u05db\u05e9\u05d9\u05d8\u05d9\u05dd", inventoryMode: "gemstones", vocabulary: stoneVocab, navTargets },
+    expect: (b) => b.navigateTo?.path === "/sales/jewelry",
+  },
+  {
+    name: "Does not navigate away just to show inventory results",
+    input: { message: "\u05ea\u05e8\u05d0\u05d4 \u05dc\u05d9 \u05d0\u05de\u05e8\u05dc\u05d3\u05d9\u05dd \u05de\u05e2\u05dc 5 \u05e7\u05e8\u05d0\u05d8", inventoryMode: "gemstones", vocabulary: stoneVocab, navTargets },
+    expect: (b) => b.navigateTo === null && b.filters.category?.includes("Emerald"),
+  },
 ];
 
-(async () => {
-  console.log(`\nmodel: ${ASSISTANT_MODEL}\n`);
+/* Phase two runs against the rows the browser sends back. */
+const adviceCases = [
+  {
+    name: "Names a specific SKU from the rows it was given",
+    input: { message: "\u05d0\u05d9\u05d6\u05d5 \u05d4\u05db\u05d9 \u05de\u05e9\u05ea\u05dc\u05de\u05ea?", shortlist, totalCount: 3 },
+    expect: (b) => b.skus.length > 0 && shortlist.some((s) => b.reply.includes(s.sku)),
+  },
+  {
+    name: "Answers in Hebrew when asked in Hebrew",
+    input: { message: "\u05de\u05d4 \u05d4\u05db\u05d9 \u05db\u05d1\u05d3\u05d4 \u05db\u05d0\u05df?", shortlist, totalCount: 3 },
+    expect: (b) => /[\u0590-\u05FF]/.test(b.reply) && b.reply.includes("K1204"),
+  },
+  {
+    name: "Says so plainly when there is nothing to recommend",
+    input: { message: "which is best?", shortlist: [], totalCount: 0 },
+    expect: (b) => b.skus.length === 0 && !!b.reply,
+  },
+];
+
+const runSuite = async (label, list, fn) => {
+  console.log(`\n${label}`);
   let passed = 0;
 
-  for (const c of cases) {
+  for (const c of list) {
     let result;
     try {
-      result = await runAssistantQuery(c.input);
+      result = await fn(c.input);
     } catch (e) {
       console.error(`  FAIL  ${c.name}\n        threw: ${e.message}`);
       process.exitCode = 1;
@@ -134,5 +197,12 @@ const cases = [
     }
   }
 
-  console.log(`\n${passed}/${cases.length} passed\n`);
+  return passed;
+};
+
+(async () => {
+  console.log(`\nmodel: ${ASSISTANT_MODEL}`);
+  const a = await runSuite("phase 1 — filter, sort, navigate", cases, runAssistantQuery);
+  const b = await runSuite("phase 2 — advice on the matched rows", adviceCases, runAssistantAdvice);
+  console.log(`\n${a + b}/${cases.length + adviceCases.length} passed\n`);
 })();

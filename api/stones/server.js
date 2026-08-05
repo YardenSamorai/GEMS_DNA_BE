@@ -5034,27 +5034,53 @@ ${detailsLines}`;
    STORE_USER_ALLOWED_PREFIXES gate, which only engages once a request
    carries an actor header — this one carries a bearer token instead.
    ========================================================= */
-const { runAssistantQuery } = require("../../utils/assistantQuery");
+const { runAssistantQuery, runAssistantAdvice } = require("../../utils/assistantQuery");
+
+// Store-portal users have no inventory page; without this they could still
+// spend our OpenAI budget.
+async function rejectStoreUsers(req, res) {
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (ctx?.role === "store_user") {
+      res.status(403).json({ error: "Not available for store-portal users" });
+      return true;
+    }
+  } catch (_) {
+    /* Same fail-open stance the rest of the file takes on context lookups. */
+  }
+  return false;
+}
 
 app.post("/api/assistant/query", sensitiveLimiter, requireAuth, async (req, res) => {
   try {
-    // Store-portal users have no inventory page; without this they could
-    // still spend our OpenAI budget.
-    try {
-      const ctx = await resolveTeamContext(req);
-      if (ctx?.role === "store_user") {
-        return res.status(403).json({ error: "Not available for store-portal users" });
-      }
-    } catch (_) {
-      /* Same fail-open stance the rest of the file takes on context lookups. */
-    }
+    if (await rejectStoreUsers(req, res)) return;
 
-    const { message, history, inventoryMode, vocabulary } = req.body || {};
-    const result = await runAssistantQuery({ message, history, inventoryMode, vocabulary });
+    const { message, history, inventoryMode, vocabulary, navTargets } = req.body || {};
+    const result = await runAssistantQuery({
+      message, history, inventoryMode, vocabulary, navTargets,
+    });
     if (!result.ok) return res.status(result.status).json({ error: result.error });
     res.json(result.body);
   } catch (error) {
     console.error("Assistant query error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* Second phase, called only when the dealer asked the assistant to choose or
+   compare. The rows come back from the browser rather than the database on
+   purpose: what the browser holds has already been masked for this viewer, so
+   the assistant can never discuss a price or branch its user cannot see. */
+app.post("/api/assistant/advise", sensitiveLimiter, requireAuth, async (req, res) => {
+  try {
+    if (await rejectStoreUsers(req, res)) return;
+
+    const { message, history, shortlist, totalCount } = req.body || {};
+    const result = await runAssistantAdvice({ message, history, shortlist, totalCount });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    res.json(result.body);
+  } catch (error) {
+    console.error("Assistant advise error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });

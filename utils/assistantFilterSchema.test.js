@@ -6,8 +6,12 @@
 const assert = require("assert");
 const {
   buildFilterTool,
+  buildNavigateTool,
   validateFilters,
+  validateSort,
   sanitizeVocabulary,
+  sanitizeNavTargets,
+  sanitizeShortlist,
 } = require("./assistantFilterSchema");
 
 let passed = 0;
@@ -148,6 +152,64 @@ test("caps a runaway list", () => {
   const many = Array.from({ length: 500 }, (_, i) => `tag${i}`);
   const clean = sanitizeVocabulary({ tag: many }, 120);
   assert.strictEqual(clean.tag.length, 120);
+});
+
+console.log("\nvalidateSort");
+
+test("accepts a known field and defaults a bad direction to ascending", () => {
+  assert.deepStrictEqual(validateSort({ field: "pricePerCt", direction: "sideways" }, "gemstones"), {
+    field: "pricePerCt",
+    direction: "asc",
+  });
+});
+
+test("rejects a field that is not sortable, and any junk", () => {
+  assert.strictEqual(validateSort({ field: "costPerCt", direction: "asc" }, "gemstones"), null);
+  assert.strictEqual(validateSort({ field: "pricePerCt" }, "jewelry"), null);
+  assert.strictEqual(validateSort("nonsense", "gemstones"), null);
+});
+
+console.log("\nnavigation");
+
+// An absolute URL here would turn the assistant into an open redirect.
+test("keeps in-app paths and rejects anything that could redirect off-site", () => {
+  const clean = sanitizeNavTargets([
+    { path: "/sales/diamonds", label: "Diamonds" },
+    { path: "https://evil.example.com", label: "Nope" },
+    { path: "//evil.example.com", label: "Nope" },
+    { path: "/sales/diamonds", label: "Duplicate" },
+    { path: "/no-label", label: "" },
+  ]);
+  assert.deepStrictEqual(clean, [{ path: "/sales/diamonds", label: "Diamonds" }]);
+});
+
+test("offers no navigation tool when the user may open nothing", () => {
+  assert.strictEqual(buildNavigateTool([]), null);
+});
+
+test("limits the destination enum to the paths supplied", () => {
+  const tool = buildNavigateTool([{ path: "/inventory", label: "Inventory" }]);
+  assert.deepStrictEqual(tool.function.parameters.properties.path.enum, ["/inventory"]);
+});
+
+console.log("\nsanitizeShortlist");
+
+// Our buying price is not needed to compare stones and must never be sent.
+test("strips cost and any field outside the allow-list", () => {
+  const [row] = sanitizeShortlist([
+    { sku: "T1", weightCt: 2, pricePerCt: 100, costPerCt: 40, holder: "Dan", rawXml: "<x/>" },
+  ]);
+  assert.strictEqual(row.costPerCt, undefined);
+  assert.strictEqual(row.holder, undefined);
+  assert.strictEqual(row.rawXml, undefined);
+  assert.strictEqual(row.pricePerCt, 100);
+});
+
+test("caps the payload and drops rows with no SKU", () => {
+  const many = Array.from({ length: 50 }, (_, i) => ({ sku: `T${i}`, weightCt: 1 }));
+  assert.strictEqual(sanitizeShortlist(many).length, 20);
+  assert.strictEqual(sanitizeShortlist([{ weightCt: 3 }]).length, 0);
+  assert.strictEqual(sanitizeShortlist("nonsense").length, 0);
 });
 
 console.log(`\n${passed} passed\n`);
