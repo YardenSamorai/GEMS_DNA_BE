@@ -149,10 +149,10 @@ const buildFilterTool = (vocabulary = {}, inventoryMode = "diamonds") => {
       "Order the results. Use for requests like cheapest, most expensive, biggest or heaviest.",
   };
 
-  properties.wantsRecommendation = {
+  properties.wantsAnswer = {
     type: "boolean",
     description:
-      "Set true only when the user wants you to choose, compare or advise on specific stones, rather than just narrow the list. When true you will be shown the matching stones and asked to answer about them.",
+      "Set true when the user is asking a QUESTION about the matching stock — to pick, compare, advise, total, average or break down by group — rather than just asking to narrow the list. When true you will be shown the figures for the whole match plus a sample of the items, and asked to answer properly. Questions about the list already on screen (\"what is this lot worth\", \"split it by branch\") set this alone, with no filter fields.",
   };
 
   return {
@@ -160,7 +160,7 @@ const buildFilterTool = (vocabulary = {}, inventoryMode = "diamonds") => {
     function: {
       name: "build_inventory_filter",
       description:
-        "Filter, sort and show the user's inventory list. Only include fields the user actually asked for; omit everything else.",
+        "Filter, sort, or answer a question about the user's inventory list. Only include filter fields the user actually asked for; omit everything else. A question about the list already on screen is a valid call with wantsAnswer alone and no filter fields at all.",
       parameters: { type: "object", properties, additionalProperties: false },
     },
   };
@@ -339,9 +339,53 @@ const sanitizeShortlist = (raw) => {
   return out;
 };
 
+/* Aggregate figures for the WHOLE matched set, computed in the browser and
+ * sent alongside the shortlist. Without this the assistant could only ever
+ * total the 20 rows it can see and would confidently under-report the value
+ * of a 200-stone selection. */
+const SUMMARY_NUMBERS = [
+  "count", "totalValue", "totalCarats",
+  "avgPricePerCt", "minPricePerCt", "maxPricePerCt",
+];
+const SUMMARY_GROUPS = ["byCategory", "byLocation", "byLab"];
+const SUMMARY_GROUP_MAX = 12;
+
+const sanitizeSummary = (raw) => {
+  if (!raw || typeof raw !== "object") return null;
+  const out = {};
+
+  for (const key of SUMMARY_NUMBERS) {
+    const n = Number(raw[key]);
+    if (Number.isFinite(n)) out[key] = Math.round(n * 100) / 100;
+  }
+  if (out.count == null) return null;
+
+  if (raw.priceMode === "neto" || raw.priceMode === "bruto") out.priceMode = raw.priceMode;
+
+  for (const group of SUMMARY_GROUPS) {
+    if (!Array.isArray(raw[group])) continue;
+    const rows = [];
+    for (const row of raw[group].slice(0, SUMMARY_GROUP_MAX)) {
+      const key = String(row?.key ?? "").trim().slice(0, 60);
+      const count = Number(row?.count);
+      if (!key || !Number.isFinite(count)) continue;
+      const clean = { key, count };
+      for (const f of ["totalValue", "totalCarats"]) {
+        const n = Number(row?.[f]);
+        if (Number.isFinite(n)) clean[f] = Math.round(n * 100) / 100;
+      }
+      rows.push(clean);
+    }
+    if (rows.length) out[group] = rows;
+  }
+
+  return out;
+};
+
 module.exports = {
   INVENTORY_MODES,
   SHORTLIST_MAX,
+  sanitizeSummary,
   buildFilterTool,
   buildNavigateTool,
   validateFilters,

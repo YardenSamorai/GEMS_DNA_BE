@@ -23,6 +23,7 @@ const {
   sanitizeVocabulary,
   sanitizeNavTargets,
   sanitizeShortlist,
+  sanitizeSummary,
 } = require("./assistantFilterSchema");
 
 const ASSISTANT_MODEL = process.env.ASSISTANT_MODEL || "gpt-5.6-terra";
@@ -43,23 +44,30 @@ Rules:
 - Only set fields the user actually asked for. Never invent a constraint to be helpful; an unasked-for filter silently hides stock the dealer wanted to see.
 - Choose values only from the enums given. They are the values that exist in this inventory right now.
 - Use sort for superlatives: cheapest is pricePerCt ascending, most expensive descending, biggest is weightCt descending.
-- Set wantsRecommendation true when the dealer asks you to pick, compare, or advise ("which is the best buy", "what would you show a customer looking for X"). You will then be shown the matches and asked to answer properly. Leave it false for plain filtering.
+- Set wantsAnswer true whenever the dealer is asking a question about the stock rather than just asking to see a slice of it — picking or comparing ("which is the best buy"), or totals and breakdowns ("what is it all worth", "average price per carat", "how does it split by branch"). You will then be given the figures for the whole match plus a sample, and asked to answer properly. Leave it false for plain filtering.
+- A question about what is already on screen does not describe a new slice, but you must still call build_inventory_filter with wantsAnswer true and no filter fields — that call is the only way the figures reach you. Answering such a question without it means guessing, which is worse than useless to a dealer. Never state a total, average or count yourself at this stage.
 - Call navigate_to_page only when the request is about a different part of the app. Never use it to show inventory results — those appear in place.
 - If the request is too vague to act on ("show me something nice"), do NOT call a tool. Reply with one short question that would let you filter.
-- If the request names something absent from the enums, do NOT call a tool. Say plainly what is not available.
+- If part of a request can be expressed with the fields and values you were given and part cannot, still filter the part you can and note the rest in one sentence. Only when NOTHING in it is expressible do you skip the tool and say plainly what is unavailable.
 - ${TRADE_NOTES}
 - ${LANGUAGE_NOTE} Keep any reply to one sentence; the interface already shows the applied filters and the result count, so do not list them back or guess how many matched.`;
 
-const advisorSystemPrompt = (total, shown) => `You are advising a gemstone dealer on stones from their own inventory.
+const advisorSystemPrompt = (total, shown, hasSummary, priceMode) => `You are advising a gemstone dealer on stock from their own inventory.
 
-The filter you chose matched ${total} item(s). Below are ${shown} of them as JSON — this is the real stock, and the only stock you may talk about.
+Their filter matched ${total} item(s). You are given two things, and mixing them up is the one mistake you must not make:
+
+${hasSummary
+  ? `- SUMMARY: figures covering all ${total} matches — totals, averages and group breakdowns. Every total, average, count or "how much is it all worth" answer must come from here.`
+  : `- (No summary was provided for this question.)`}
+- SAMPLE: ${shown} individual item(s)${total > shown ? `, the first ${shown} of ${total} in the order the dealer is looking at them` : ""}. Use these only to name and compare specific pieces.
 
 Rules:
-- Recommend specific items and always name them by SKU, so the dealer can find them.
+- NEVER add up the SAMPLE to answer a question about the whole selection. ${total > shown ? `It is ${shown} of ${total} items and any total you compute from it will be wrong.` : ""}
+- When naming an item always give its SKU, so the dealer can find it.
 - Compare on what the data actually shows: weight, price per carat, total price, colour, clarity or treatment, lab, origin. Never invent a property that is not in the JSON.
 - Say why, briefly and concretely ("K1188 is the best value: 5.1ct at $12,400/ct, the lowest per carat of the certified GRS stones here").
-- Recommend at most three items unless asked for more.
-${total > shown ? `- You are seeing only the first ${shown} of ${total} matches, ordered as the dealer sees them. Say so if it matters to the answer.` : ""}
+- Name at most three items unless asked for more.
+- Round money sensibly when speaking: $1.24M or $63,240, not every cent.${priceMode === "bruto" ? "\n- These prices are Bruto (the doubled negotiation figure), so say Bruto when you quote one." : ""}
 - ${TRADE_NOTES}
 - ${LANGUAGE_NOTE} Be brief — a few sentences, no headings, no markdown tables.`;
 
@@ -150,7 +158,7 @@ const runAssistantQuery = async ({ message, history, inventoryMode, vocabulary, 
     inventoryMode: null,
     sort: null,
     navigateTo: null,
-    wantsRecommendation: false,
+    wantsAnswer: false,
     reply: null,
     needsClarification: true,
     dropped: [],
@@ -198,16 +206,18 @@ const runAssistantQuery = async ({ message, history, inventoryMode, vocabulary, 
   const {
     inventoryMode: suggestedMode,
     sort: rawSort,
-    wantsRecommendation,
+    wantsAnswer,
     ...filterArgs
   } = args;
   const { filters, applied, dropped } = validateFilters(filterArgs, vocab, mode);
   const targetMode = INVENTORY_MODES.includes(suggestedMode) ? suggestedMode : mode;
   const sort = validateSort(rawSort, targetMode);
 
-  // Nothing survived validation and there is no ordering to apply either —
-  // report a miss rather than silently doing nothing and looking broken.
-  if (applied.length === 0 && !sort) {
+  // Nothing survived validation, no ordering, and nothing being asked about the
+  // list as it stands — report a miss rather than silently doing nothing and
+  // looking broken. A bare wantsAnswer is not a miss: that is how a question
+  // about what is already on screen arrives.
+  if (applied.length === 0 && !sort && wantsAnswer !== true) {
     return {
       ok: true,
       body: {
@@ -225,7 +235,7 @@ const runAssistantQuery = async ({ message, history, inventoryMode, vocabulary, 
       inventoryMode: targetMode !== mode ? targetMode : null,
       sort,
       navigateTo: null,
-      wantsRecommendation: wantsRecommendation === true,
+      wantsAnswer: wantsAnswer === true,
       reply: choice.content || null,
       needsClarification: false,
       dropped,
@@ -234,34 +244,47 @@ const runAssistantQuery = async ({ message, history, inventoryMode, vocabulary, 
 };
 
 /**
- * Phase 2 — answer about the stones the browser is now showing.
+ * Phase 2 — answer about the stock the browser is now showing.
  *
  * @param {object} input
  * @param {string} input.message      the original question
  * @param {Array}  [input.history]
  * @param {Array}  input.shortlist    rows the browser is displaying, already masked
+ * @param {object} [input.summary]    aggregates over every match, not just the sample
  * @param {number} [input.totalCount] how many matched in full
  * @returns {Promise<{ ok: boolean, status?: number, error?: string, body?: object }>}
  */
-const runAssistantAdvice = async ({ message, history, shortlist, totalCount }) => {
+const runAssistantAdvice = async ({ message, history, shortlist, summary, totalCount }) => {
   const { question, error } = validateQuestion(message);
   if (error) return error;
 
   const rows = sanitizeShortlist(shortlist);
+  const stats = sanitizeSummary(summary);
+
   if (rows.length === 0) {
     return {
       ok: true,
-      body: { reply: "Nothing matched, so there is nothing I can recommend.", skus: [] },
+      body: { reply: "Nothing matched, so there is nothing to report.", skus: [] },
     };
   }
 
-  const total = Number.isFinite(Number(totalCount)) ? Number(totalCount) : rows.length;
+  const total = Number.isFinite(Number(totalCount))
+    ? Number(totalCount)
+    : stats?.count ?? rows.length;
+
+  const payload = [
+    stats ? `SUMMARY (all ${total} matches):\n${JSON.stringify(stats)}` : null,
+    `SAMPLE (${rows.length} item(s)):\n${JSON.stringify(rows)}`,
+  ].filter(Boolean).join("\n\n");
 
   const res = await callOpenAI({
     messages: [
-      { role: "system", content: advisorSystemPrompt(total, rows.length) },
+      {
+        role: "system",
+        content: advisorSystemPrompt(total, rows.length, !!stats, stats?.priceMode),
+      },
       ...trimHistory(history),
-      { role: "user", content: `${question}\n\nMatching stock:\n${JSON.stringify(rows)}` },
+      { role: "user", content: `${question}\n\n${payload}` },
     ],
   });
   if (!res.ok) return res;

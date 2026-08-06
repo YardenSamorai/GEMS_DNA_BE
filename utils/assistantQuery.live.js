@@ -24,6 +24,28 @@ const shortlist = [
   { sku: "K1204", category: "Emerald", weightCt: 6.2, pricePerCt: 18800, priceTotal: 116560, lab: "SSEF", origin: "Zambia", treatment: "Insignificant", location: "New York" },
 ];
 
+/* Aggregates for the whole match. Deliberately far larger than anything the
+ * three sample rows add up to ($293,200), so a reply quoting the sample total
+ * is unmistakable rather than plausible. */
+const summary = {
+  count: 189,
+  totalValue: 24800000,
+  totalCarats: 1240.5,
+  avgPricePerCt: 19992,
+  minPricePerCt: 4100,
+  maxPricePerCt: 88000,
+  priceMode: "neto",
+  byCategory: [
+    { key: "Emerald", count: 96, totalValue: 14100000, totalCarats: 700.2 },
+    { key: "Sapphire", count: 61, totalValue: 7300000, totalCarats: 380.1 },
+    { key: "Ruby", count: 32, totalValue: 3400000, totalCarats: 160.2 },
+  ],
+  byLocation: [
+    { key: "New York", count: 120, totalValue: 16200000, totalCarats: 800.0 },
+    { key: "Hong Kong", count: 69, totalValue: 8600000, totalCarats: 440.5 },
+  ],
+};
+
 /* A realistic slice of the vocabulary the inventory page sends. */
 const stoneVocab = {
   shape: ["Round", "Oval", "Cushion", "Emerald", "Pear", "Sugarloaf"],
@@ -129,12 +151,22 @@ const cases = [
   {
     name: "Asking for advice raises the recommendation flag",
     input: { message: "\u05d0\u05d9\u05d6\u05d5 \u05d0\u05d6\u05de\u05e8\u05dc\u05d3 \u05d4\u05db\u05d9 \u05de\u05e9\u05ea\u05dc\u05de\u05ea \u05dc\u05dc\u05e7\u05d5\u05d7?", inventoryMode: "gemstones", vocabulary: stoneVocab },
-    expect: (b) => b.wantsRecommendation === true && Object.keys(b.filters).length > 0,
+    expect: (b) => b.wantsAnswer === true && Object.keys(b.filters).length > 0,
   },
   {
     name: "Plain filtering does not raise it",
     input: { message: "sapphires in Hong Kong", inventoryMode: "gemstones", vocabulary: stoneVocab },
-    expect: (b) => b.wantsRecommendation === false,
+    expect: (b) => b.wantsAnswer === false,
+  },
+  {
+    name: "A question about total value also raises the flag",
+    input: { message: "כמה שווה כל המלאי בניו יורק?", inventoryMode: "gemstones", vocabulary: stoneVocab },
+    expect: (b) => b.wantsAnswer === true && b.filters.location?.includes("New York"),
+  },
+  {
+    name: "A breakdown request raises the flag without inventing a filter",
+    input: { message: "מה הפילוח של המלאי לפי קטגוריה?", inventoryMode: "gemstones", vocabulary: stoneVocab },
+    expect: (b) => b.wantsAnswer === true,
   },
   {
     name: "Routes to another page when the request belongs there",
@@ -164,6 +196,27 @@ const adviceCases = [
     name: "Says so plainly when there is nothing to recommend",
     input: { message: "which is best?", shortlist: [], totalCount: 0 },
     expect: (b) => b.skus.length === 0 && !!b.reply,
+  },
+  {
+    name: "Totals the whole match, not the three rows it can see",
+    input: { message: "מה השווי הכולל של המלאי הזה?", shortlist, summary, totalCount: 189 },
+    // 24.8M in any spoken form; must not be the $293,200 sample total.
+    expect: (b) => /24[.,]8|24,800,000|24800000/.test(b.reply) && !/293/.test(b.reply),
+  },
+  {
+    name: "Reads the average per carat off the summary",
+    input: { message: "what is the average price per carat here?", shortlist, summary, totalCount: 189 },
+    expect: (b) => /19,?9\d\d|20k|~?\$?20,000/i.test(b.reply),
+  },
+  {
+    name: "Breaks down by category from the summary groups",
+    input: { message: "מה הפילוח לפי קטגוריה?", shortlist, summary, totalCount: 189 },
+    expect: (b) => /96/.test(b.reply) && /61/.test(b.reply) && /Emerald|אמרלד|ברקת/i.test(b.reply),
+  },
+  {
+    name: "Still names individual stones from the sample when asked to pick",
+    input: { message: "איזו אבן הכי משתלמת מהאלה?", shortlist, summary, totalCount: 189 },
+    expect: (b) => b.skus.length > 0 && shortlist.some((s) => b.reply.includes(s.sku)),
   },
 ];
 

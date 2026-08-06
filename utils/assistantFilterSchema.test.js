@@ -12,6 +12,7 @@ const {
   sanitizeVocabulary,
   sanitizeNavTargets,
   sanitizeShortlist,
+  sanitizeSummary,
 } = require("./assistantFilterSchema");
 
 let passed = 0;
@@ -210,6 +211,46 @@ test("caps the payload and drops rows with no SKU", () => {
   assert.strictEqual(sanitizeShortlist(many).length, 20);
   assert.strictEqual(sanitizeShortlist([{ weightCt: 3 }]).length, 0);
   assert.strictEqual(sanitizeShortlist("nonsense").length, 0);
+});
+
+console.log("\nsanitizeSummary");
+
+test("keeps the figures and the group breakdowns", () => {
+  const s = sanitizeSummary({
+    count: 189, totalValue: 4200000, totalCarats: 512.5, avgPricePerCt: 8195,
+    priceMode: "neto",
+    byCategory: [{ key: "Emerald", count: 120, totalValue: 3000000, totalCarats: 400 }],
+  });
+  assert.strictEqual(s.count, 189);
+  assert.strictEqual(s.totalCarats, 512.5);
+  assert.strictEqual(s.priceMode, "neto");
+  assert.deepStrictEqual(s.byCategory[0].key, "Emerald");
+});
+
+// count is what tells the model how much it is NOT seeing in the sample.
+test("refuses a summary with no count, and any junk", () => {
+  assert.strictEqual(sanitizeSummary({ totalValue: 100 }), null);
+  assert.strictEqual(sanitizeSummary(null), null);
+  assert.strictEqual(sanitizeSummary("nonsense"), null);
+});
+
+test("drops unknown fields, bad numbers and a spoofed price mode", () => {
+  const s = sanitizeSummary({
+    count: 5, totalValue: "abc", costTotal: 999, priceMode: "wholesale",
+  });
+  assert.strictEqual(s.totalValue, undefined);
+  assert.strictEqual(s.costTotal, undefined);
+  assert.strictEqual(s.priceMode, undefined);
+});
+
+test("caps a runaway group and skips rows missing a key or count", () => {
+  const many = Array.from({ length: 40 }, (_, i) => ({ key: `c${i}`, count: i + 1 }));
+  const s = sanitizeSummary({
+    count: 1,
+    byLocation: [...many, { key: "", count: 3 }, { key: "ok", count: "many" }],
+  });
+  assert.strictEqual(s.byLocation.length, 12);
+  assert.ok(s.byLocation.every((r) => r.key && Number.isFinite(r.count)));
 });
 
 console.log(`\n${passed} passed\n`);

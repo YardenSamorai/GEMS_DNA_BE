@@ -5075,8 +5075,8 @@ app.post("/api/assistant/advise", sensitiveLimiter, requireAuth, async (req, res
   try {
     if (await rejectStoreUsers(req, res)) return;
 
-    const { message, history, shortlist, totalCount } = req.body || {};
-    const result = await runAssistantAdvice({ message, history, shortlist, totalCount });
+    const { message, history, shortlist, summary, totalCount } = req.body || {};
+    const result = await runAssistantAdvice({ message, history, shortlist, summary, totalCount });
     if (!result.ok) return res.status(result.status).json({ error: result.error });
     res.json(result.body);
   } catch (error) {
