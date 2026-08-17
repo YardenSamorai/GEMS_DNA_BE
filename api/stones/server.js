@@ -1377,6 +1377,107 @@ app.get("/api/stones/inventory-status", async (req, res) => {
 /* =========================================================
    /api/stones/:stone_id – אבן ספציפית (מ-soap_stones)
    ========================================================= */
+/* Shape one soap_stones row into the public DNA payload, prices encrypted.
+ * Extracted so the pair partner below comes back in exactly the same shape as
+ * the stone that was asked for — the pair screen renders both through one
+ * code path and must not have two notions of what a stone looks like. */
+const mapPublicStoneRow = (row) => {
+  // Select main image
+  let imageUrl = row.image;
+  if (!imageUrl && row.additional_pictures) {
+    const first = row.additional_pictures.split(";")[0];
+    imageUrl = first ? first.trim() : null;
+  }
+
+  // Extract certificate number from URL if not provided
+  let certNumber = row.certificate_number || null;
+  if (!certNumber && row.certificate_image) {
+    // Extract from URL like: https://app.barakdiamonds.com/Gemstones/output/Certificates/2023-107020.pdf
+    const match = row.certificate_image.match(/\/([^\/]+)\.pdf$/i);
+    if (match) {
+      certNumber = match[1];
+    }
+  }
+
+  // Map to frontend format (compatible with old format)
+  const stone = {
+    id: row.id,
+    stone_id: row.sku,
+    sku: row.sku,
+    category: row.category || null, // For determining stone type
+    shape: row.shape || null,
+    carat: row.weight ? parseFloat(row.weight) : null,
+    clarity: row.clarity || null,
+    color: row.color || null,
+    lab: row.lab || null,
+    origin: row.origin || null,
+    ratio: row.ratio ? parseFloat(row.ratio) : null,
+    measurements1: row.measurements || null,
+    picture: imageUrl,
+    video: row.video || null,
+    certificate_number: certNumber,
+    certificate_url: row.certificate_image || null,
+    treatment: row.comment || null, // For emeralds
+
+    // Diamond-specific fields
+    cut: row.cut || null,
+    polish: row.polish || null,
+    symmetry: row.symmetry || null,
+    table_percent: row.table_percent ? parseFloat(row.table_percent) : null,
+    depth_percent: row.depth_percent ? parseFloat(row.depth_percent) : null,
+    fluorescence: row.fluorescence || null,
+    rap_price: row.rap_price ? parseFloat(row.rap_price) : null,
+
+    // Fancy-specific fields
+    fancy_intensity: row.fancy_intensity || null,
+    fancy_color: row.fancy_color || null,
+    fancy_overtone: row.fancy_overtone || null,
+    fancy_color_2: row.fancy_color_2 || null,
+    fancy_overtone_2: row.fancy_overtone_2 || null,
+
+    // Pair stone
+    pair_stone: row.pair_stone || null,
+
+    // Prices (will be encrypted below)
+    price_per_carat: row.price_per_carat ? parseFloat(row.price_per_carat) : null,
+    total_price: row.total_price ? parseFloat(row.total_price) : null,
+  };
+
+  // Encrypt prices
+  if (stone.price_per_carat !== null && stone.price_per_carat !== undefined) {
+    const raw = stone.price_per_carat;
+    stone.price_per_carat = encrypt(raw.toString());
+  }
+
+  if (stone.total_price !== null && stone.total_price !== undefined) {
+    const raw = stone.total_price;
+    stone.total_price = encrypt(raw.toString());
+  }
+
+  return stone;
+};
+
+/* Barak's pair_stone column is a free-text SKU with nothing enforcing it, and
+ * a survey of live data found 28 links to stones that have left the inventory
+ * and 25 one-way links — some of them chains (A→B while B→C) rather than
+ * pairs. Presenting a chain link as a matched pair would show a customer two
+ * stones that were never sold together, so a pair is only reported when
+ * nothing contradicts it: the partner exists and either points back or points
+ * nowhere. Anything else falls back to the plain single-stone page. */
+const resolvePairPartner = async (stone) => {
+  const mySku = String(stone.sku || "").trim();
+  const partnerSku = String(stone.pair_stone || "").trim();
+  if (!mySku || !partnerSku || partnerSku === mySku) return null;
+
+  const { rows } = await pool.query("SELECT * FROM soap_stones WHERE sku = $1", [partnerSku]);
+  if (rows.length === 0) return null;
+
+  const partnerPointsAt = String(rows[0].pair_stone || "").trim();
+  if (partnerPointsAt && partnerPointsAt !== mySku) return null;
+
+  return mapPublicStoneRow(rows[0]);
+};
+
 app.get("/api/stones/:stone_id", async (req, res) => {
   console.log("🚨 /api/stones/:stone_id CALLED");
   try {
@@ -1390,79 +1491,10 @@ app.get("/api/stones/:stone_id", async (req, res) => {
       return res.status(404).json({ error: "Stone not found" });
     }
 
-    const row = result.rows[0];
-    
-    // Select main image
-    let imageUrl = row.image;
-    if (!imageUrl && row.additional_pictures) {
-      const first = row.additional_pictures.split(";")[0];
-      imageUrl = first ? first.trim() : null;
-    }
+    const stone = mapPublicStoneRow(result.rows[0]);
 
-    // Extract certificate number from URL if not provided
-    let certNumber = row.certificate_number || null;
-    if (!certNumber && row.certificate_image) {
-      // Extract from URL like: https://app.barakdiamonds.com/Gemstones/output/Certificates/2023-107020.pdf
-      const match = row.certificate_image.match(/\/([^\/]+)\.pdf$/i);
-      if (match) {
-        certNumber = match[1];
-      }
-    }
-
-    // Map to frontend format (compatible with old format)
-    const stone = {
-      id: row.id,
-      stone_id: row.sku,
-      sku: row.sku,
-      category: row.category || null, // For determining stone type
-      shape: row.shape || null,
-      carat: row.weight ? parseFloat(row.weight) : null,
-      clarity: row.clarity || null,
-      color: row.color || null,
-      lab: row.lab || null,
-      origin: row.origin || null,
-      ratio: row.ratio ? parseFloat(row.ratio) : null,
-      measurements1: row.measurements || null,
-      picture: imageUrl,
-      video: row.video || null,
-      certificate_number: certNumber,
-      certificate_url: row.certificate_image || null,
-      treatment: row.comment || null, // For emeralds
-      
-      // Diamond-specific fields
-      cut: row.cut || null,
-      polish: row.polish || null,
-      symmetry: row.symmetry || null,
-      table_percent: row.table_percent ? parseFloat(row.table_percent) : null,
-      depth_percent: row.depth_percent ? parseFloat(row.depth_percent) : null,
-      fluorescence: row.fluorescence || null,
-      rap_price: row.rap_price ? parseFloat(row.rap_price) : null,
-      
-      // Fancy-specific fields
-      fancy_intensity: row.fancy_intensity || null,
-      fancy_color: row.fancy_color || null,
-      fancy_overtone: row.fancy_overtone || null,
-      fancy_color_2: row.fancy_color_2 || null,
-      fancy_overtone_2: row.fancy_overtone_2 || null,
-      
-      // Pair stone
-      pair_stone: row.pair_stone || null,
-      
-      // Prices (will be encrypted below)
-      price_per_carat: row.price_per_carat ? parseFloat(row.price_per_carat) : null,
-      total_price: row.total_price ? parseFloat(row.total_price) : null,
-    };
-
-    // Encrypt prices
-    if (stone.price_per_carat !== null && stone.price_per_carat !== undefined) {
-      const raw = stone.price_per_carat;
-      stone.price_per_carat = encrypt(raw.toString());
-    }
-
-    if (stone.total_price !== null && stone.total_price !== undefined) {
-      const raw = stone.total_price;
-      stone.total_price = encrypt(raw.toString());
-    }
+    // pair_stone stays as it was for older clients that only render a link.
+    stone.pair = await resolvePairPartner(result.rows[0]);
 
     res.json(stone);
   } catch (error) {
