@@ -1464,6 +1464,67 @@ const mapPublicStoneRow = (row) => {
  * stones that were never sold together, so a pair is only reported when
  * nothing contradicts it: the partner exists and either points back or points
  * nowhere. Anything else falls back to the plain single-stone page. */
+/* A Set is not a group of linked records the way a pair is. Barak's feed puts
+ * a whole lot on ONE row: `stones` counts the stones in it, `weight` and
+ * `total_price` describe the lot as a whole, and nothing anywhere describes an
+ * individual stone in it — no per-stone weight, photo or certificate exists to
+ * be shown. Without this the public page renders a 27-stone, 164 ct lot as a
+ * single impossibly large emerald, which is what it did until now.
+ *
+ * A row is only reported as a set when it actually holds more than one stone:
+ * 126 rows are typed "Set" while carrying a single stone, and those are plain
+ * stones (often one half of a pair) that must keep behaving as they always
+ * have. */
+const SET_GROUPING = "set";
+
+const isSetRow = (row) =>
+  String(row?.grouping_type || "").trim().toLowerCase() === SET_GROUPING &&
+  Number(row?.stones) > 1;
+
+/* Some sets are sold alongside a second set — a lot of 8 centre stones next to
+ * its lot of 32 side stones, say — linked through the same free-text
+ * `pair_stone` column pairs use. It gets the same treatment: the companion is
+ * only reported when nothing contradicts it, so a stale or one-way link is
+ * left off the page rather than promising a lot that isn't there. */
+const resolveSetCompanion = async (row) => {
+  const mySku = String(row.sku || "").trim();
+  const partnerSku = String(row.pair_stone || "").trim();
+  if (!mySku || !partnerSku || partnerSku === mySku) return null;
+
+  const { rows } = await pool.query(
+    "SELECT sku, grouping_type, stones, weight, pair_stone FROM soap_stones WHERE sku = $1",
+    [partnerSku]
+  );
+  if (rows.length === 0) return null;
+
+  const partner = rows[0];
+  if (!isSetRow(partner)) return null;
+
+  const pointsAt = String(partner.pair_stone || "").trim();
+  if (pointsAt && pointsAt !== mySku) return null;
+
+  return {
+    sku: partner.sku,
+    stones: Number(partner.stones),
+    total_carat: partner.weight != null ? parseFloat(partner.weight) : null,
+  };
+};
+
+const resolveSetInfo = async (row) => {
+  if (!isSetRow(row)) return null;
+
+  const stones = Number(row.stones);
+  const totalCarat = row.weight != null ? parseFloat(row.weight) : null;
+
+  return {
+    stones,
+    total_carat: totalCarat,
+    // Average size, not a stone that exists — the lot holds no per-stone data.
+    avg_carat: totalCarat && stones ? totalCarat / stones : null,
+    companion: await resolveSetCompanion(row),
+  };
+};
+
 const resolvePairPartner = async (stone) => {
   const mySku = String(stone.sku || "").trim();
   const partnerSku = String(stone.pair_stone || "").trim();
@@ -1493,8 +1554,13 @@ app.get("/api/stones/:stone_id", async (req, res) => {
 
     const stone = mapPublicStoneRow(result.rows[0]);
 
+    // A multi-stone lot is a set first: its pair_stone link points at a
+    // companion lot, not at a matching stone, so the pair view must not claim
+    // it. Single-stone rows are unaffected and still resolve as pairs.
+    stone.set = await resolveSetInfo(result.rows[0]);
+
     // pair_stone stays as it was for older clients that only render a link.
-    stone.pair = await resolvePairPartner(result.rows[0]);
+    stone.pair = stone.set ? null : await resolvePairPartner(result.rows[0]);
 
     res.json(stone);
   } catch (error) {
