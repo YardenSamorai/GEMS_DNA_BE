@@ -8,6 +8,14 @@ const path = require("path");
 const crypto = require("crypto");
 const CryptoJS = require("crypto-js");
 const { verifyToken, createClerkClient } = require("@clerk/backend");
+const {
+  PROXY_PREFIX: MEDIA_PROXY_PREFIX,
+  proxyBaseFor,
+  resolveSupplierUrl,
+  rewriteToProxy,
+  rewriteToSupplier,
+  isAllowedContentType,
+} = require("../../utils/supplierMedia");
 
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -81,6 +89,58 @@ app.use(express.json({ limit: '50mb' }));
 // body to dodge a CORS preflight it can't perform. Parse those as raw text;
 // the activity handlers JSON.parse the string into req.body.
 app.use(express.text({ type: 'text/plain', limit: '1mb' }));
+
+/* =========================================================
+   Supplier media rewriting (see utils/supplierMedia.js)
+   ---------------------------------------------------------
+   Every stone photo and certificate URL leaving this server is
+   pointed at our own /api/barak/ mirror, because the supplier
+   now forbids browsers from displaying those files on any
+   other origin. Doing it once here, rather than at each of the
+   fifty-odd places the frontend renders one, covers the
+   screens nobody would think to change — CRM snapshots, the
+   store portal, memo line items — including rows written
+   months ago.
+
+   Request bodies travel the other way, so a snapshot the
+   frontend echoes back is stored under the supplier's own URL.
+   Our hostname never reaches the database, which keeps this
+   whole mirror a display-time concern that can be deleted
+   without a migration once the supplier relaxes the header.
+   ========================================================= */
+const MAX_NORMALISED_BODY = 512 * 1024;
+
+app.use((req, res, next) => {
+  const size = Number(req.headers['content-length'] || 0);
+  if (req.body && size > 0 && size <= MAX_NORMALISED_BODY) {
+    try {
+      const raw = JSON.stringify(req.body);
+      if (raw && raw.includes(MEDIA_PROXY_PREFIX)) {
+        req.body = JSON.parse(rewriteToSupplier(raw));
+      }
+    } catch (_) {
+      // Not JSON-shaped (the text/plain beacons) — leave it as it arrived.
+    }
+  }
+
+  const sendJson = res.json.bind(res);
+  res.json = (body) => {
+    let raw;
+    try {
+      raw = JSON.stringify(body);
+    } catch (_) {
+      raw = undefined;
+    }
+    // Circular or otherwise unserialisable: hand it back to express so the
+    // failure looks the same as it always did.
+    if (raw === undefined) return sendJson(body);
+
+    res.set('Content-Type', 'application/json; charset=utf-8');
+    return res.send(rewriteToProxy(raw, proxyBaseFor(req)));
+  };
+
+  next();
+});
 
 /* =========================================================
    Clerk session verification (Phase 1 — identity foundation)
@@ -2581,16 +2641,21 @@ app.get("/api/image-proxy", async (req, res) => {
       return res.status(400).json({ error: "URL parameter required" });
     }
 
+    /* The PDF builders read image URLs straight off a stone, and those now
+     * point at our own /api/barak/ mirror. Unwrapping them here fetches the
+     * supplier once instead of making this server call itself. */
+    const target = rewriteToSupplier(url);
+
     try {
-      await assertPublicHttpUrl(url);
+      await assertPublicHttpUrl(target);
     } catch (e) {
       return res.status(400).json({ error: "Invalid or disallowed image URL" });
     }
 
-    console.log("📷 Proxying image:", url);
+    console.log("📷 Proxying image:", target);
 
     // Fetch the image from the external URL
-    const response = await fetch(url, {
+    const response = await fetch(target, {
       timeout: 15000,
       follow: 2,
       size: 25 * 1024 * 1024,
@@ -2621,6 +2686,79 @@ app.get("/api/image-proxy", async (req, res) => {
   } catch (error) {
     console.error("❌ Error proxying image:", error.message);
     res.status(500).json({ error: "Failed to proxy image: " + error.message });
+  }
+});
+
+/* =========================================================
+   /api/barak/* – Mirror for supplier photos and certificates
+   ---------------------------------------------------------
+   Barak's IIS answers every file with
+   `Cross-Origin-Resource-Policy: same-origin`: the browser
+   downloads the bytes, sees that gems-dna.com is a different
+   origin, and throws them away. The request succeeds with a
+   200 and the <img> still renders broken, which is how the
+   sales grid, the DNA pages and every certificate preview went
+   blank while the PDF export — already pulling through this
+   server — carried on working.
+
+   Relaying the same bytes from this origin removes the
+   cross-origin question. Locked to their media folder and to
+   image/PDF responses, so this origin can never be talked into
+   serving their HTML.
+   ========================================================= */
+app.get(`${MEDIA_PROXY_PREFIX}*`, async (req, res) => {
+  // originalUrl keeps the percent-encoding and any query string; req.params
+  // hands back a decoded path, which mangles the filenames that contain a
+  // literal space, '%' or '#'.
+  const tail = req.originalUrl.slice(MEDIA_PROXY_PREFIX.length);
+  const target = resolveSupplierUrl(tail);
+  if (!target) return res.status(400).json({ error: "Unsupported media path" });
+
+  try {
+    // Forwarded so a second look at the same stone comes back as a bare 304
+    // rather than another download.
+    const conditional = {};
+    if (req.headers["if-none-match"]) conditional["If-None-Match"] = req.headers["if-none-match"];
+    if (req.headers["if-modified-since"]) conditional["If-Modified-Since"] = req.headers["if-modified-since"];
+
+    const upstream = await fetch(target, {
+      timeout: 15000,
+      follow: 2,
+      size: 25 * 1024 * 1024,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept: "image/*,application/pdf;q=0.9,*/*;q=0.8",
+        ...conditional,
+      },
+    });
+
+    if (upstream.status === 304) return res.status(304).end();
+    if (!upstream.ok) {
+      return res.status(upstream.status === 404 ? 404 : 502).json({ error: "Media unavailable" });
+    }
+
+    const contentType = upstream.headers.get("content-type");
+    if (!isAllowedContentType(contentType)) {
+      return res.status(415).json({ error: "Unsupported media type" });
+    }
+
+    res.set("Content-Type", contentType);
+    res.set("Content-Disposition", "inline");
+    res.set("Cross-Origin-Resource-Policy", "cross-origin");
+    /* These files are immutable in practice — the photo that started this
+     * was last written in 2021 — so a long cache keeps a scrolling grid of
+     * thumbnails off this server after the first view. */
+    res.set("Cache-Control", "public, max-age=86400, stale-while-revalidate=604800");
+    for (const header of ["etag", "last-modified", "content-length"]) {
+      const value = upstream.headers.get(header);
+      if (value) res.set(header, value);
+    }
+
+    upstream.body.on("error", () => res.destroy());
+    upstream.body.pipe(res);
+  } catch (error) {
+    console.error("❌ Supplier media failed:", target, error.message);
+    if (!res.headersSent) res.status(502).json({ error: "Failed to load media" });
   }
 });
 
