@@ -3,7 +3,7 @@
 const { fetchSoapData } = require("../../utils/soapClient");
 const { parseXml } = require("../../utils/xmlParser");
 const { pool } = require("../../db/client");
-const { cleanText, snapshotPreserved, restorePreserved } = require("../../utils/preserveFields");
+const { cleanText } = require("../../utils/preserveFields");
 const { auditPrices } = require("../../utils/priceIntegrity");
 
 const CHUNK_SIZE = 300; // ⭐ הכי יציב
@@ -306,8 +306,8 @@ const runImport = async (options = {}) => {
         cleanText(stone.Box),
         safeNumber(stone.Stones),
         // Tail fields Barak added to the feed later — Holder especially
-        // matters: it drives the HOLD tag, and the live feed is the source
-        // of truth (empty = hold released; see restorePreserved below).
+        // matters: it drives the HOLD tag, and the live feed is the source of
+        // truth (empty = hold released).
         // A purely numeric "Holder" is displaced price data from a corrupted
         // row, never a person — drop it so it can't paint a false HOLD tag.
         safeNumber(stone.cost_per_carat),
@@ -356,19 +356,10 @@ const runImport = async (options = {}) => {
       "cost_per_carat", "holder", "jewelry_model", "raw_xml",
     ];
 
-    // 🛟 Preserve enriched fields across the truncate so a SOAP sync never
-    // wipes data that a CSV import (or a prior sync) carried but the live SOAP
-    // feed lacks — e.g. colour/clarity on older stones, cost_per_carat, holder,
-    // jewelry_model. SOAP still WINS for any field it actually provides; the
-    // snapshot only fills the gaps. Shared with the CSV importer so both paths
-    // behave identically.
-    let preservedSalesFields = [];
-    try {
-      preservedSalesFields = await snapshotPreserved(dbPool);
-      console.log(`🛟 Preserving enriched fields for ${preservedSalesFields.length} stones across sync`);
-    } catch (e) {
-      console.warn('⚠️  Could not snapshot preserved fields (continuing):', e.message);
-    }
+    // The feed carries every column this table stores, so nothing is snapshotted
+    // across the truncate: an empty element means Barak cleared the field, and
+    // this sync is what makes that true here too. Restoring the old value used
+    // to make deletion impossible — see utils/preserveFields.js.
 
     onProgress({ phase: 'clearing', progress: 35, detail: 'Clearing old data...', totalStones: stoneArray.length, processedStones: 0 });
     console.log("🧹 [4/6] Clearing soap_stones table...");
@@ -417,17 +408,6 @@ const runImport = async (options = {}) => {
         totalStones: stoneArray.length, 
         processedStones 
       });
-    }
-
-    // 🛟 Re-apply the preserved fields. The freshly-synced SOAP value wins
-    // whenever it is non-empty; otherwise the snapshot value is restored.
-    // EXCEPT holder: the feed now carries a real Holder element, so an empty
-    // value means the hold was RELEASED in Barak — restoring the old name
-    // would keep a dead HOLD tag alive forever (the T9577 bug).
-    if (preservedSalesFields.length) {
-      console.log(`🛟 Restoring enriched fields for ${preservedSalesFields.length} stones...`);
-      const restored = await restorePreserved(dbPool, preservedSalesFields, CHUNK_SIZE, ['holder']);
-      console.log(`🛟 Restored enriched fields on ${restored} stones.`);
     }
 
     // 🔍 Verify the prices we just stored still follow the supplier convention

@@ -1,19 +1,25 @@
-// Shared field-preservation logic used by BOTH stone importers
-// (SOAP sync in importFromSoap.js and the CSV upload in /api/import-csv).
+// Import-time value handling shared by BOTH stone importers (the SOAP sync in
+// importFromSoap.js and the CSV upload in /api/import-csv). Both TRUNCATE
+// soap_stones and re-insert the whole table.
 //
-// Both importers TRUNCATE soap_stones and re-insert the whole table, and both
-// feed the same /api/soap-stones endpoint (regular inventory AND sales
-// inventory). To make them behave identically and never drop data:
+// This module used to snapshot every value-bearing column and restore any one
+// the incoming import left empty, so that no data was ever dropped. The cost
+// was that deletion became impossible to express: Barak clearing a stone's
+// video, or a rep releasing a hold, was undone on the very next import — the
+// old value came straight back out of the snapshot. The hold case was patched
+// by hand (the T9577 bug) and the video case surfaced the same way months
+// later, which is the shape of a rule that is wrong rather than incomplete.
 //
-//   • Snapshot the value-bearing fields BEFORE the truncate.
-//   • After re-inserting, restore any field the new import left empty.
+// Both feeds carry every one of these columns today, so an empty value is a
+// statement and not a gap: the inventory system is saying there is nothing
+// there. Each importer is therefore authoritative for every column it carries.
 //
-// The incoming import always WINS when it provides a non-empty value; the
-// snapshot only fills the gaps. This means a CSV that carries data the live
-// SOAP feed lacks (e.g. the "U-V" colour) survives the next SOAP sync, and a
-// SOAP sync that carries data a partial CSV lacks survives the next CSV import.
+// One case survives, and it is the case where empty genuinely means "no
+// opinion": a CSV export that does not contain the column at all. There is
+// nothing to be authoritative with, so the stored value is kept. That keeps a
+// truncated or older export from silently emptying half the table.
 
-// Text columns: a blank/empty incoming value falls back to the snapshot.
+// Text columns: the ones an import can carry a value for.
 const PRESERVE_TEXT = [
   'color', 'clarity', 'lab', 'fluorescence', 'cut', 'polish', 'symmetry',
   'measurements', 'origin', 'comment', 'type', 'cert_comments',
@@ -24,7 +30,9 @@ const PRESERVE_TEXT = [
   'holder', 'jewelry_model',
 ];
 
-// Numeric columns: a NULL incoming value falls back to the snapshot.
+// Numeric columns. Note that these never round-tripped through the old
+// restore anyway: the feed writes "0.00" for an absent measurement and
+// parseFloat turns that into 0, which is a value, not a gap.
 const PRESERVE_NUM = ['ratio', 'table_percent', 'depth_percent', 'cost_per_carat'];
 
 const ALL_COLS = [...PRESERVE_TEXT, ...PRESERVE_NUM];
@@ -39,39 +47,31 @@ const cleanText = (v) => {
   return s === '' ? null : s;
 };
 
-/* Snapshot the preserved fields for every stone that has at least one of them
+/* Snapshot the given columns for every stone that has at least one of them
  * set, keyed by SKU. Call this BEFORE the TRUNCATE. */
-async function snapshotPreserved(dbPool) {
-  const cols = ['sku', ...ALL_COLS].join(', ');
-  const conds = ALL_COLS.map((c) => `${c} IS NOT NULL`).join(' OR ');
+async function snapshotColumns(dbPool, cols) {
+  if (!cols || !cols.length) return [];
+  const conds = cols.map((c) => `${c} IS NOT NULL`).join(' OR ');
   const { rows } = await dbPool.query(
-    `SELECT ${cols} FROM soap_stones WHERE ${conds}`
+    `SELECT sku, ${cols.join(', ')} FROM soap_stones WHERE ${conds}`
   );
   return rows;
 }
 
-/* Re-apply the snapshot AFTER the new rows are inserted. The freshly-imported
- * value wins whenever it is non-empty; otherwise the snapshot value is kept.
- * Returns the number of rows touched.
- *
- * `excludeCols` — columns the CURRENT import is authoritative for, i.e. an
- * empty incoming value MEANS empty (don't fall back to the snapshot). The CSV
- * export carries a real Holder column, so a blank there means "hold released"
- * — restoring the old name kept dead HOLD tags alive forever (T9577 bug).
- * The SOAP feed has no holder at all, so the sync still preserves it. */
-async function restorePreserved(dbPool, rows, chunkSize = 300, excludeCols = []) {
-  if (!rows || !rows.length) return 0;
+/* Re-apply the snapshot AFTER the new rows are inserted, for the columns the
+ * import could say nothing about. Returns the number of rows touched. */
+async function restoreColumns(dbPool, rows, cols, chunkSize = 300) {
+  if (!rows || !rows.length || !cols || !cols.length) return 0;
 
-  const setClause = [
-    ...PRESERVE_TEXT.filter((c) => !excludeCols.includes(c)).map(
-      (c) => `${c} = COALESCE(NULLIF(s.${c}, ''), v.${c})`
-    ),
-    ...PRESERVE_NUM.filter((c) => !excludeCols.includes(c)).map(
-      (c) => `${c} = COALESCE(s.${c}, v.${c})`
-    ),
-  ].join(',\n           ');
+  const setClause = cols
+    .map((c) =>
+      PRESERVE_NUM.includes(c)
+        ? `${c} = COALESCE(s.${c}, v.${c})`
+        : `${c} = COALESCE(NULLIF(s.${c}, ''), v.${c})`
+    )
+    .join(',\n           ');
 
-  const valCols = ['sku', ...ALL_COLS];
+  const valCols = ['sku', ...cols];
   const castFor = (col, idx) => {
     if (idx === 0) return '::text'; // sku
     return PRESERVE_NUM.includes(col) ? '::numeric' : '::text';
@@ -109,6 +109,6 @@ module.exports = {
   PRESERVE_NUM,
   ALL_COLS,
   cleanText,
-  snapshotPreserved,
-  restorePreserved,
+  snapshotColumns,
+  restoreColumns,
 };

@@ -2893,7 +2893,33 @@ app.post("/api/check-product-links", async (req, res) => {
    /api/import-csv – Import stones from CSV file upload
    ========================================================= */
 const { parse: parseCsv } = require('csv-parse/sync');
-const { cleanText: cleanCsvText, snapshotPreserved, restorePreserved } = require('../../utils/preserveFields');
+const {
+  cleanText: cleanCsvText,
+  ALL_COLS: PRESERVABLE_COLS,
+  snapshotColumns,
+  restoreColumns,
+} = require('../../utils/preserveFields');
+
+/* Which CSV header feeds each stored column. Used to tell "the export says
+ * this field is empty" (honour it — the stone really has no video now) from
+ * "the export doesn't have this field at all" (say nothing, keep what we
+ * hold). Only the columns worth keeping across a truncate are listed. */
+const CSV_HEADER_FOR = {
+  color: 'Color', clarity: 'Clarity', lab: 'Lab', fluorescence: 'Fluorescence',
+  cut: 'Cut', polish: 'Polish', symmetry: 'Symmetry',
+  measurements: 'Measurements (- delimiter)', origin: 'Origin',
+  comment: 'Comment', type: 'Type', cert_comments: 'Cert. Comments',
+  certificate_number: 'Certificate Number', certificate_image: 'Certificate image',
+  certificate_image_jpg: 'certificateImageJPG', image: 'Image',
+  additional_pictures: 'additional_pictures', video: 'Video',
+  additional_videos: 'additional_videos', fancy_intensity: 'fancy_intensity',
+  fancy_color: 'fancy_color', fancy_overtone: 'fancy_overtone',
+  fancy_color_2: 'fancy_color_2', fancy_overtone_2: 'fancy_overtone_2',
+  trade_show: 'TradeShow', grouping_type: 'Grouping Type', location: 'Location',
+  branch: 'Branch', holder: 'Holder', jewelry_model: 'Jewelry Model',
+  ratio: 'ratio', table_percent: 'Table', depth_percent: 'Depth',
+  cost_per_carat: 'cost_per_carat',
+};
 const { auditPrices } = require('../../utils/priceIntegrity');
 
 const CSV_BRANCH_MAP = {
@@ -3015,16 +3041,24 @@ app.post("/api/import-csv", sensitiveLimiter, requireOwner, async (req, res) => 
       ];
     });
 
-    // 🛟 Snapshot enriched fields before the truncate so a CSV that omits some
-    // data (e.g. cost_per_carat / holder added in-app, or fields only the SOAP
-    // feed carries) isn't wiped. The incoming CSV value wins when present.
-    // Shared with the SOAP importer so both paths behave identically.
+    /* An empty cell means the field was cleared in Barak and this import is
+     * what makes that true here. A header the export doesn't have at all is a
+     * different thing — the file has no opinion, so those columns alone are
+     * carried across the truncate. Guards against an older or truncated
+     * export quietly emptying half the table. */
+    const csvHeaders = new Set(rows.length ? Object.keys(rows[0]) : []);
+    const absentCols = PRESERVABLE_COLS.filter((c) => !csvHeaders.has(CSV_HEADER_FOR[c]));
+
     let preservedFields = [];
-    try {
-      preservedFields = await snapshotPreserved(pool);
-      console.log(`🛟 Preserving enriched fields for ${preservedFields.length} stones across CSV import`);
-    } catch (e) {
-      console.warn('⚠️  Could not snapshot preserved fields (continuing):', e.message);
+    if (absentCols.length) {
+      try {
+        preservedFields = await snapshotColumns(pool, absentCols);
+        console.log(
+          `🛟 CSV has no ${absentCols.join(', ')} column — keeping those for ${preservedFields.length} stones`
+        );
+      } catch (e) {
+        console.warn('⚠️  Could not snapshot absent columns (continuing):', e.message);
+      }
     }
 
     csvImportProgress = { ...csvImportProgress, phase: 'clearing', progress: 40, detail: 'Preparing database...' };
@@ -3044,14 +3078,11 @@ app.post("/api/import-csv", sensitiveLimiter, requireOwner, async (req, res) => 
       csvImportProgress = { ...csvImportProgress, progress: pct, processedStones: Math.min(i + CHUNK, values.length), detail: `Inserted ${Math.min(i + CHUNK, values.length)} / ${values.length} stones` };
     }
 
-    // 🛟 Restore preserved fields the CSV left empty (CSV value wins otherwise).
-    // EXCEPT holder: the CSV's Holder column is authoritative — a blank there
-    // means the hold was RELEASED in Barak, so restoring the old name would
-    // keep a dead HOLD tag alive forever (the T9577 bug).
+    // Put back only the columns this export could say nothing about.
     if (preservedFields.length) {
-      csvImportProgress = { ...csvImportProgress, phase: 'restoring', progress: 95, detail: 'Restoring preserved fields...' };
-      const restored = await restorePreserved(pool, preservedFields, CHUNK, ['holder']);
-      console.log(`🛟 Restored enriched fields on ${restored} stones after CSV import.`);
+      csvImportProgress = { ...csvImportProgress, phase: 'restoring', progress: 95, detail: 'Restoring fields the file did not carry...' };
+      const restored = await restoreColumns(pool, preservedFields, absentCols, CHUNK);
+      console.log(`🛟 Kept ${absentCols.length} untouched column(s) on ${restored} stones.`);
     }
 
     // 🔍 Verify the prices we just stored still follow the supplier convention
