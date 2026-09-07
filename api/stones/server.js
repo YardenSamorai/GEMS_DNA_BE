@@ -2745,6 +2745,13 @@ app.get(`${MEDIA_PROXY_PREFIX}*`, async (req, res) => {
     res.set("Content-Type", contentType);
     res.set("Content-Disposition", "inline");
     res.set("Cross-Origin-Resource-Policy", "cross-origin");
+    /* Helmet stamps X-Frame-Options: SAMEORIGIN on everything this server
+     * sends, which is right for our own pages and wrong here: the DNA page
+     * shows a certificate through an <embed>, and a browser reads that as
+     * framing a document from another origin and refuses. There is nothing
+     * to clickjack in a static photo or PDF — no controls, no session — so
+     * the header only costs us the certificate previews. */
+    res.removeHeader("X-Frame-Options");
     /* These files are immutable in practice — the photo that started this
      * was last written in 2021 — so a long cache keeps a scrolling grid of
      * thumbnails off this server after the first view. */
