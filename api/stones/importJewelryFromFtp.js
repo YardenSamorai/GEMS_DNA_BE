@@ -55,6 +55,15 @@ const COLUMNS = [
   "real_unit_cost",
 ];
 
+/* The feed declares real_unit_cost but sends it empty on every row, and the
+ * figures we do hold were loaded separately. A blank from the feed therefore
+ * leaves the stored cost alone instead of wiping it on the nightly sync; if
+ * Barak ever starts filling the column, a real value still takes over. */
+const upsertAssignment = (c) =>
+  c === "real_unit_cost"
+    ? `${c} = COALESCE(EXCLUDED.${c}, jewelry_products.${c})`
+    : `${c} = EXCLUDED.${c}`;
+
 const rowToValues = (r) => [
   txt(r["Model Number"]),
   txt(r["Stock Number"]),
@@ -146,7 +155,7 @@ const runImport = async (options = {}) => {
       await dbPool.query(
         "INSERT INTO jewelry_products (" + COLUMNS.join(",") + ") VALUES " + ph +
           " ON CONFLICT (model_number) DO UPDATE SET " +
-          COLUMNS.slice(1).map((c) => `${c} = EXCLUDED.${c}`).join(", "),
+          COLUMNS.slice(1).map(upsertAssignment).join(", "),
         chunk.flat()
       );
     }

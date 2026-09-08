@@ -2054,7 +2054,13 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
         '(' + columns.map((_, ci) => '$' + (ri * columns.length + ci + 1)).join(',') + ')'
       ).join(',');
       await pool.query('INSERT INTO jewelry_products (' + columns.join(',') + ') VALUES ' + ph + ' ON CONFLICT (model_number) DO UPDATE SET ' +
-        columns.slice(1).map(c => `${c} = EXCLUDED.${c}`).join(', '),
+        // real_unit_cost arrives empty on every feed row and is loaded from a
+        // separate file, so a blank must not overwrite what we already hold.
+        columns.slice(1).map(c => (
+          c === 'real_unit_cost'
+            ? `${c} = COALESCE(EXCLUDED.${c}, jewelry_products.${c})`
+            : `${c} = EXCLUDED.${c}`
+        )).join(', '),
         chunk.flat()
       );
       const pct = 50 + Math.round((chunkIdx / totalChunks) * 45);
