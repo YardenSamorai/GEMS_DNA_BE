@@ -49,22 +49,38 @@ const detectModelColumn = (rows, headers, known) => {
   return best;
 };
 
+/* Headers out of the reporting tool wrap: the cost column is literally
+ * "Jewelry\r\nCost". Collapse all whitespace before matching so the wrapped
+ * header reads the same as a typed one, here and for --cost=/--model=. */
+const normHeader = (h) => String(h ?? "").replace(/\s+/g, " ").trim();
+
 /* The cost column is chosen by name — there is nothing in the values that
  * distinguishes a cost from a price, so guessing from the numbers would be a
- * good way to import the wrong figure. Most specific name wins. */
+ * good way to import the wrong figure. Order matters: the same sheet also
+ * carries "Labor Total Cost", which is a component of the cost and not the
+ * cost, so the exact names have to be tried before the loose \bcost\b. */
 const COST_PATTERNS = [
-  /^real[_ ]?unit[_ ]?cost$/i,
-  /^jewelry[_ ]?cost$/i,
-  /^unit[_ ]?cost$/i,
-  /^total[_ ]?cost$/i,
+  /^real[ _]?unit[ _]?cost$/i,
+  /^jewelry[ _]?cost$/i,
+  /^unit[ _]?cost$/i,
+  /^total[ _]?cost$/i,
+  /^cost$/i,
   /\bcost\b/i,
 ];
 const detectCostColumn = (headers) => {
   for (const pattern of COST_PATTERNS) {
-    const hit = headers.find((h) => pattern.test(String(h).trim()));
+    const hit = headers.find((h) => pattern.test(normHeader(h)));
     if (hit) return hit;
   }
   return null;
+};
+
+/* Match a --model=/--cost= argument against the real headers, so the caller
+ * can type "Jewelry Cost" for a header that actually contains a line break. */
+const resolveHeader = (headers, wanted) => {
+  if (!wanted) return null;
+  const target = normHeader(wanted).toLowerCase();
+  return headers.find((h) => normHeader(h).toLowerCase() === target) || null;
 };
 
 const flagValue = (name) => {
@@ -110,8 +126,16 @@ const main = async () => {
   const byModel = new Map(catalog.rows.map((r) => [norm(r.model_number), r]));
   console.log(`Catalog holds ${catalog.rows.length} pieces\n`);
 
-  const forcedModel = flagValue("model");
-  const forcedCost = flagValue("cost");
+  const askedModel = flagValue("model");
+  const askedCost = flagValue("cost");
+  for (const [flag, wanted] of [["model", askedModel], ["cost", askedCost]]) {
+    if (wanted && !resolveHeader(headers, wanted)) {
+      console.error(`--${flag}=${JSON.stringify(wanted)} matches no column in this file.`);
+      process.exit(1);
+    }
+  }
+  const forcedModel = resolveHeader(headers, askedModel);
+  const forcedCost = resolveHeader(headers, askedCost);
 
   const modelCol = forcedModel || detectModelColumn(rows, headers, byModel).header;
   const costCol = forcedCost || detectCostColumn(headers);
@@ -125,8 +149,8 @@ const main = async () => {
     console.error(`No cost column found. Pass one with --cost=<header>.`);
     process.exit(1);
   }
-  console.log(`Model number ← "${modelCol}"${forcedModel ? " (forced)" : ""}`);
-  console.log(`Cost         ← "${costCol}"${forcedCost ? " (forced)" : ""}\n`);
+  console.log(`Model number ← "${normHeader(modelCol)}"${forcedModel ? " (forced)" : ""}`);
+  console.log(`Cost         ← "${normHeader(costCol)}"${forcedCost ? " (forced)" : ""}\n`);
 
   const updates = new Map(); // model_number → cost
   const unmatched = [];
