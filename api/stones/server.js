@@ -598,6 +598,16 @@ const resolveJewelryBranch = (location, shippingFrom) => {
   return JEWELRY_SHIP_BRANCH[sf] || (shippingFrom ? String(shippingFrom).trim() : null);
 };
 
+// Internal cost / margin. Owner always; otherwise the per-user override wins,
+// and if it's absent we fall back to the historic role default (managers see
+// cost, salesmen never do). Stones and jewelry must answer this the same way —
+// a rep who can't see an emerald's cost mustn't see it again through the ring
+// that emerald is set in.
+const viewerCanSeeCost = (ctx) => {
+  const perm = ctx?.permissions?.canViewCost;
+  return !!ctx?.isOwner || perm === true || (perm !== false && ctx?.role === 'manager');
+};
+
 async function resolveTeamContext(req) {
   // Identity comes from the cryptographically-verified Clerk session first.
   // The x-actor-*/userId values are client-controlled and only used as a
@@ -1173,13 +1183,7 @@ app.get("/api/soap-stones", async (req, res) => {
     const showHolder = locView === 'full' || locView === 'memo_branch';
     const showBranch = locView === 'full' || locView === 'memo_branch' || locView === 'branch_only';
     const showStatus = locView !== 'hidden';
-    // Internal cost / margin. Owner always; otherwise the per-user override wins,
-    // and if it's absent we fall back to the historic role default (managers see
-    // cost, salesmen never do).
-    const permCost = ctx.permissions?.canViewCost;
-    const canSeeCost = !!ctx.isOwner
-      || permCost === true
-      || (permCost !== false && ctx.role === 'manager');
+    const canSeeCost = viewerCanSeeCost(ctx);
 
     const whereClauses = [`s.sku IS NOT NULL`];
     const params = [];
@@ -1803,6 +1807,7 @@ app.get("/api/jewelry", async (req, res) => {
     const showHolder = locView === 'full' || locView === 'memo_branch';
     const showBranch = locView === 'full' || locView === 'memo_branch' || locView === 'branch_only';
     const showStatus = locView !== 'hidden';
+    const canSeeCost = viewerCanSeeCost(ctx);
 
     // The piece's physical place now comes straight from jewelry_products.location
     // (the CSV's trailing "Location" column). The linked centre stone is still
@@ -1867,6 +1872,12 @@ app.get("/api/jewelry", async (req, res) => {
         // yet classified (item arrived after the last level list was applied).
         security_level: row.security_level ?? null,
         first_seen_at: row.first_seen_at || null,
+        // What the piece cost us — owner/manager only. Nulled for every other
+        // viewer so the figure never leaves the API.
+        real_unit_cost:
+          canSeeCost && row.real_unit_cost !== null && row.real_unit_cost !== undefined
+            ? parseFloat(row.real_unit_cost)
+            : null,
         // Location surface (masked per viewer), mirroring the loose-stone shape.
         branch: showBranch ? branch : null,
         exact_location: showExact ? exact : null,
@@ -1915,7 +1926,7 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
       'title','description','jewelry_weight','total_carat','stone_type',
       'center_stone_carat','center_stone_shape','center_stone_color','center_stone_clarity',
       'metal_type','currency','availability','shipping_from','category',
-      'full_description','jewelry_size','instructions_main','location'
+      'full_description','jewelry_size','instructions_main','location','real_unit_cost'
     ];
 
     const rawValues = rows.map(r => [
@@ -1949,6 +1960,7 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
       // New trailing column: the piece's physical location (exact place), same
       // vocabulary as soap_stones.location (in-house branch or third-party store).
       (r['Location'] || '').trim() || null,
+      csvSafeNum(r['real_unit_cost']),
     ]).filter(v => v[0] !== null && String(v[0]).trim() !== '');
 
     // De-duplicate by model_number BEFORE issuing the upsert. If a single
@@ -2010,6 +2022,9 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
         jewelry_size VARCHAR(50),
         instructions_main TEXT,
         location VARCHAR(150),
+        -- What the piece cost us, straight from the feed's trailing column.
+        -- Internal: /api/jewelry withholds it from anyone not cleared for cost.
+        real_unit_cost NUMERIC(14,2),
         -- When this model_number was first imported. Set once on INSERT and
         -- never overwritten (see the ON CONFLICT below) so the catalog can be
         -- ordered newest-first even though the CSV is re-imported wholesale.
@@ -2022,6 +2037,7 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
     // migration timestamp; genuinely new model_numbers get their real insert
     // time going forward.
     await pool.query(`ALTER TABLE jewelry_products ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP DEFAULT NOW()`);
+    await pool.query(`ALTER TABLE jewelry_products ADD COLUMN IF NOT EXISTS real_unit_cost NUMERIC(14,2)`);
 
     // NOTE: we intentionally no longer wipe the table. A full DELETE would
     // reset every first_seen_at on each import, losing all recency history.
@@ -2097,6 +2113,10 @@ app.get("/api/jewelry/:modelNumber", async (req, res) => {
     }
 
     const item = result.rows[0];
+
+    // This is the public DNA endpoint — anyone with the model number can call
+    // it, so what we paid for the piece must not ride along in the SELECT *.
+    delete item.real_unit_cost;
 
     const numericFields = [
       "jewelry_weight",

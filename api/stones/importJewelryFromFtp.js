@@ -50,6 +50,9 @@ const COLUMNS = [
   "center_stone_carat", "center_stone_shape", "center_stone_color", "center_stone_clarity",
   "metal_type", "currency", "availability", "shipping_from", "category",
   "full_description", "jewelry_size", "instructions_main", "location",
+  // What the piece cost us. Internal — never leaves the API for a viewer who
+  // isn't cleared to see cost (see /api/jewelry).
+  "real_unit_cost",
 ];
 
 const rowToValues = (r) => [
@@ -81,6 +84,7 @@ const rowToValues = (r) => [
   txt(r["jewelry_size"]),
   txt(r["Instructions_main"]),
   txt(r["Location"]),
+  safeNum(r["real_unit_cost"]),
 ];
 
 /**
@@ -131,6 +135,7 @@ const runImport = async (options = {}) => {
     // Keep parity with the manual import: make sure trailing columns exist.
     await dbPool.query(`ALTER TABLE jewelry_products ADD COLUMN IF NOT EXISTS location VARCHAR(150)`);
     await dbPool.query(`ALTER TABLE jewelry_products ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP DEFAULT NOW()`);
+    await dbPool.query(`ALTER TABLE jewelry_products ADD COLUMN IF NOT EXISTS real_unit_cost NUMERIC(14,2)`);
 
     const CHUNK = 100;
     for (let i = 0; i < values.length; i += CHUNK) {
