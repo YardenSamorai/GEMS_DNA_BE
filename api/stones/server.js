@@ -515,7 +515,7 @@ function diffRows(before, after, keys) {
 //     status_only -> memo/hold status flags ONLY (no branch, holder or exact)
 //     hidden       -> nothing: no location data at all
 // ---------------------------------------------------------------------------
-const NAV_SECTION_KEYS = ['dashboard', 'inventory', 'crm', 'sales', 'team', 'tools'];
+const NAV_SECTION_KEYS = ['dashboard', 'inventory', 'crm', 'sales', 'team', 'tools', 'photos'];
 const LOCATION_VIEWS = ['full', 'memo_branch', 'branch_only', 'status_only', 'hidden'];
 
 // Defaults for a freshly-invited member; the admin tweaks these afterwards.
@@ -13865,6 +13865,10 @@ app.post('/api/blob/upload', sensitiveLimiter, requireAuth, blobUpload.single('f
     console.error('Blob upload error:', e);
     res.status(500).json({ error: e.message });
   }
+});
+
+require('../photos/photoStation')(app, {
+  pool, requireAuth, resolveTeamContext, computeOnMemo, blobPut, limiter: sensitiveLimiter,
 });
 
 /* =========================================================
