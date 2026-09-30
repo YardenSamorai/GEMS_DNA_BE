@@ -224,13 +224,12 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       if (!found.rows.length) return res.status(404).json({ error: 'Stone not found' });
       const sku = found.rows[0].sku;
 
-      const [clean, cutout] = await Promise.all([
-        processClean(req.file.buffer),
-        processCutout(req.file.buffer, process.env.REMOVE_BG_API_KEY).catch((e) => ({ image: null, error: e.message })),
-      ]);
+      const clean = await processClean(req.file.buffer);
       if (!clean.image) {
         return res.status(422).json({ error: 'No stone found in the photo', quality: clean.quality });
       }
+      const cutout = await processCutout(req.file.buffer, process.env.REMOVE_BG_API_KEY, clean.geometry)
+        .catch((e) => ({ image: null, error: e.message }));
 
       const [originalUrl, cleanUrl, cutoutUrl] = await Promise.all([
         putBlob(sku, 'original', req.file.buffer),

@@ -763,19 +763,40 @@ async function processClean(buffer) {
     protectedOutlines: a.protectedObjects || 0,
   };
   if (!a.groups.length) return { image: null, quality };
-  const image = await frame(composeOnWhite(img, a.mask), unionBox(a.groups));
-  return { image, quality };
+  const box = unionBox(a.groups);
+  const image = await frame(composeOnWhite(img, a.mask), box);
+  return { image, quality, geometry: { rotateBy: skew, fill: bg.color, box } };
 }
 
-// remove.bg path. The stone's pixels come back from the service untouched;
-// only its alpha mask is used, and we composite onto white ourselves.
-async function processCutout(buffer, apiKey) {
+// Share of the stone's size kept around it in the crop sent to remove.bg.
+const CUTOUT_MARGIN = 0.15;
+
+// remove.bg path. Only the outline comes from the service; the pixels are
+// the photo's own, at full resolution. That matters twice: a translucent
+// stone must never come back partly see-through, and without paid credits
+// the service answers with a quarter-megapixel preview, far too small to
+// show. Sending just the stone (the `geometry` found by processClean, same
+// straightening) spends even that preview's pixels on the outline.
+async function processCutout(buffer, apiKey, geometry) {
   if (!apiKey) return { image: null, error: 'REMOVE_BG_API_KEY is not configured' };
-  const input = await sharp(buffer, { failOn: 'none' })
-    .rotate()
-    .resize({ width: WORK_SIDE, height: WORK_SIDE, fit: 'inside', withoutEnlargement: true })
-    .jpeg({ quality: 95 })
-    .toBuffer();
+  const img = await toWorking(buffer, geometry ? geometry.rotateBy : 0, geometry ? geometry.fill : WHITE);
+  let crop = { left: 0, top: 0, width: img.width, height: img.height };
+  if (geometry) {
+    const { box } = geometry;
+    const pad = Math.round(Math.max(box.x1 - box.x0, box.y1 - box.y0) * CUTOUT_MARGIN);
+    const left = Math.max(0, box.x0 - pad);
+    const top = Math.max(0, box.y0 - pad);
+    crop = {
+      left, top,
+      width: Math.min(img.width, box.x1 + pad + 1) - left,
+      height: Math.min(img.height, box.y1 + pad + 1) - top,
+    };
+  }
+  const raw = { raw: { width: img.width, height: img.height, channels: 3 } };
+  const { data, info } = await sharp(img.data, raw).extract(crop).raw().toBuffer({ resolveWithObject: true });
+  const cw = info.width, ch = info.height;
+  const input = await sharp(data, { raw: { width: cw, height: ch, channels: 3 } }).jpeg({ quality: 95 }).toBuffer();
+
   const form = new FormData();
   form.append('image_file', new Blob([input], { type: 'image/jpeg' }), 'stone.jpg');
   form.append('size', 'auto');
@@ -791,15 +812,38 @@ async function processCutout(buffer, apiKey) {
     return { image: null, error: `remove.bg ${res.status}: ${text.slice(0, 200)}` };
   }
   const png = Buffer.from(await res.arrayBuffer());
-  const { data: alpha, info } = await sharp(png).ensureAlpha().extractChannel(3).raw()
-    .toBuffer({ resolveWithObject: true });
-  const mask = new Uint8Array(alpha.length);
-  for (let p = 0; p < alpha.length; p++) mask[p] = alpha[p] > 16 ? 1 : 0;
-  const { kept } = components(mask, info.width, info.height);
+  const small = await sharp(png).metadata();
+  const upscale = cw / (small.width || cw);
+  const alpha = await sharp(png).ensureAlpha().extractChannel(3)
+    .resize(cw, ch, { fit: 'fill', kernel: 'cubic' })
+    .raw()
+    .toBuffer();
+
+  const n = cw * ch;
+  const solid = new Uint8Array(n);
+  for (let p = 0; p < n; p++) solid[p] = alpha[p] >= 128 ? 1 : 0;
+  const { kept, label } = components(solid, cw, ch);
   if (!kept.length) return { image: null, error: 'remove.bg found no object' };
-  const { data, info: flatInfo } = await sharp(png).flatten({ background: WHITE }).removeAlpha().raw()
-    .toBuffer({ resolveWithObject: true });
-  const image = await frame({ data, width: flatInfo.width, height: flatInfo.height }, unionBox(kept));
+  const keptIds = new Set(kept.map((c) => c.id));
+  for (let p = 0; p < n; p++) solid[p] = keptIds.has(label[p]) ? 1 : 0;
+  // Everything inside the outline is stone, whatever the service thought of
+  // a pale facet. Only the band at the edge keeps a soft alpha.
+  const core = morph(fillHoles(solid, cw, ch), cw, ch, Math.max(2, Math.round(upscale)), true);
+  // An enlarged preview mask has an edge several pixels wide; steepening it
+  // brings it back to the one or two pixels a real edge spans.
+  const steep = Math.max(1, Math.min(4, upscale / 1.5));
+
+  const out = Buffer.alloc(n * 3, 255);
+  for (let p = 0; p < n; p++) {
+    let a = core[p] ? 1 : Math.min(1, Math.max(0, (alpha[p] / 255 - 0.5) * steep + 0.5));
+    if (!keptIds.has(label[p]) && !core[p] && alpha[p] >= 128) a = 0;
+    if (a <= 0) continue;
+    const i = p * 3;
+    out[i] = Math.round(data[i] * a + 255 * (1 - a));
+    out[i + 1] = Math.round(data[i + 1] * a + 255 * (1 - a));
+    out[i + 2] = Math.round(data[i + 2] * a + 255 * (1 - a));
+  }
+  const image = await frame({ data: out, width: cw, height: ch }, unionBox(kept));
   return { image, error: null };
 }
 
