@@ -16,6 +16,8 @@ const {
   rewriteToSupplier,
   isAllowedContentType,
 } = require("../../utils/supplierMedia");
+const registerPublicApi = require("../public/publicApi");
+const { looksLikeApiKey } = registerPublicApi;
 
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -163,7 +165,8 @@ app.use(async (req, res, next) => {
     const header = req.headers['authorization'] || req.headers['Authorization'];
     if (header && /^Bearer\s+/i.test(header) && CLERK_SECRET_KEY) {
       const token = header.replace(/^Bearer\s+/i, '').trim();
-      if (token) {
+      // API keys (gdna_…) are checked by the /api/v1 and /mcp routes, not Clerk.
+      if (token && !looksLikeApiKey(token)) {
         const claims = await verifyToken(token, { secretKey: CLERK_SECRET_KEY });
         if (claims && claims.sub) {
           req.auth = {
@@ -1165,12 +1168,23 @@ app.get('/api/team/rep/:actorId', async (req, res) => {
 app.get("/api/soap-stones", async (req, res) => {
   try {
     const ctx = await resolveTeamContext(req);
+    const stones = await listSoapStonesFor(ctx, { assignedTo: req.query?.assignedTo });
+    res.json({ stones });
+  } catch (error) {
+    console.error("❌ Error fetching soap stones:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// The stone catalog exactly as `ctx` may see it. Shared by /api/soap-stones
+// and the API-key surface (/api/v1, MCP) so both mask identically.
+async function listSoapStonesFor(ctx, { assignedTo } = {}) {
     const ownerId = ctx.tenantUserId || ctx.actorUserId || null;
 
     // The sales catalog is shared — every signed-in user sees every stone.
     // Per-user limits govern which *pages* they can open and how much *location
     // detail* they see (below), not which stones exist.
-    let assignedFilter = req.query?.assignedTo ? String(req.query.assignedTo) : null;
+    let assignedFilter = assignedTo ? String(assignedTo) : null;
     if (assignedFilter === 'me') assignedFilter = ctx.actorUserId;
     if (assignedFilter === 'all') assignedFilter = null; // 'all' == no explicit filter
 
@@ -1383,12 +1397,8 @@ app.get("/api/soap-stones", async (req, res) => {
       };
     });
 
-    res.json({ stones });
-  } catch (error) {
-    console.error("❌ Error fetching soap stones:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
+    return stones;
+}
 
 /* =========================================================
    /api/stones/inventory-status – bulk status map
@@ -1796,12 +1806,20 @@ app.get("/api/stones/:sku/usage", async (req, res) => {
    ========================================================= */
 app.get("/api/jewelry", async (req, res) => {
   try {
+    const ctx = await resolveTeamContext(req);
+    res.json({ jewelry: await listJewelryFor(ctx) });
+  } catch (error) {
+    console.error("Error fetching jewelry:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+async function listJewelryFor(ctx) {
     // Same per-viewer location masking as /api/soap-stones. A finished piece's
     // physical place lives on its component stone(s) in soap_stones (linked by
     // jewelry_model), so we surface the exact location / branch / memo + hold
     // status from the representative (heaviest = centre) linked stone — gated by
     // the viewer's locationView tier exactly like loose stones.
-    const ctx = await resolveTeamContext(req);
     const locView = ctx.permissions?.locationView || 'full';
     const showExact  = locView === 'full';
     const showHolder = locView === 'full' || locView === 'memo_branch';
@@ -1886,12 +1904,8 @@ app.get("/api/jewelry", async (req, res) => {
         on_hold: showStatus ? !!(row.stone_holder && String(row.stone_holder).trim()) : false,
       };
     });
-    res.json({ jewelry: items });
-  } catch (error) {
-    console.error("Error fetching jewelry:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
+    return items;
+}
 
 /* =========================================================
    /api/jewelry/import-csv – Upload jewelry CSV
@@ -13869,6 +13883,17 @@ app.post('/api/blob/upload', sensitiveLimiter, requireAuth, blobUpload.single('f
 
 require('../photos/photoStation')(app, {
   pool, requireAuth, resolveTeamContext, computeOnMemo, blobPut, limiter: sensitiveLimiter,
+});
+
+registerPublicApi(app, {
+  pool,
+  requireAuth,
+  resolveTeamContext,
+  viewerCanSeeCost,
+  listSoapStonesFor,
+  listJewelryFor,
+  limiter: sensitiveLimiter,
+  rewriteMedia: (data, req) => JSON.parse(rewriteToProxy(JSON.stringify(data), proxyBaseFor(req))),
 });
 
 /* =========================================================
