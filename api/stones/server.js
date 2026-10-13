@@ -228,6 +228,35 @@ app.use((req, res, next) => {
   next();
 });
 
+// Signing up with Clerk is open, so a verified session alone isn't enough:
+// private routes also need an active team_members row (an admin invite). The
+// shared catalog carries costs and memo holders, so a stranger who signs up
+// must get nothing. Positive results are cached briefly; a deactivated member
+// keeps access for at most MEMBER_CACHE_MS.
+const MEMBER_CACHE_MS = 60 * 1000;
+const memberCache = new Map();
+app.use(async (req, res, next) => {
+  const uid = req.auth?.userId;
+  if (req.method === 'OPTIONS' || !uid || !req.path.startsWith('/api/')) return next();
+  const method = req.method === 'HEAD' ? 'GET' : req.method;
+  if (isPublicApiRoute(method, req.path)) return next();
+  const hit = memberCache.get(uid);
+  if (hit && hit > Date.now()) return next();
+  try {
+    const ctx = await resolveTeamContext(req);
+    if (ctx.memberId) {
+      memberCache.set(uid, Date.now() + MEMBER_CACHE_MS);
+      return next();
+    }
+    if (ctx.lookupFailed) return res.status(503).json({ error: 'Could not verify workspace membership' });
+  } catch (e) {
+    console.warn('membership gate warn:', e.message);
+    return res.status(503).json({ error: 'Could not verify workspace membership' });
+  }
+  memberCache.delete(uid);
+  return res.status(403).json({ error: 'Your account is not a member of this workspace', code: 'not_a_member' });
+});
+
 // Guard for internal (non-public) endpoints: requires a verified Clerk
 // session. Use on routes that must never be reachable anonymously.
 function requireAuth(req, res, next) {
@@ -739,7 +768,7 @@ async function resolveTeamContext(req) {
     // A DB hiccup must not fall through to the unknown-user branch below,
     // which grants owner access. Fail closed.
     console.warn('resolveTeamContext lookup warn:', e.message);
-    return NO_ACCESS_CONTEXT(headerActorName);
+    return { ...NO_ACCESS_CONTEXT(headerActorName), lookupFailed: true };
   }
 
   if (rows.length) {
@@ -768,19 +797,10 @@ async function resolveTeamContext(req) {
     };
   }
 
-  // Backward compat: unrecognised user = their own one-person team.
-  return {
-    tenantUserId: actorId,
-    actorUserId:  actorId,
-    role:         'owner',
-    memberId:     null,
-    memberName:   null,
-    permissions:  ADMIN_PERMISSIONS,
-    isOwner:      true,
-    isWorkshopOwner: true,
-    isAuthenticated,
-    actorName:    headerActorName,
-  };
+  // Not invited to any workspace. Sign-up is open, so this used to hand every
+  // stranger an owner workspace (with the shared catalog's costs and memo
+  // holders); now they get nothing until an admin invites them.
+  return NO_ACCESS_CONTEXT(headerActorName);
 }
 
 // Whether a team context can read a row that was assigned to `assignedTo`.
@@ -14444,55 +14464,13 @@ async function sendTeamInviteEmail({ rep, inviter, workspaceName, ctaUrl, varian
   }
 }
 
-// Make sure the workspace owner exists in team_members. Idempotent — safe
-// to call on every /api/team/me hit. We can't auto-create reps (we don't
-// know their emails), but we can guarantee the owner row is always there.
-async function ensureOwnerRow(ctx) {
-  if (!ctx?.actorUserId) return null;
-  // If we already resolved a real member row, nothing to do.
-  if (ctx.memberId) return ctx;
-  try {
-    const existing = await pool.query(
-      `SELECT * FROM team_members
-        WHERE team_owner_id = $1 AND role = 'owner'
-        LIMIT 1`,
-      [ctx.actorUserId]
-    );
-    if (existing.rows.length) {
-      // Backfill clerk_user_id if missing (legacy seed rows).
-      if (!existing.rows[0].clerk_user_id) {
-        await pool.query(
-          `UPDATE team_members SET clerk_user_id = $1, updated_at = NOW() WHERE id = $2`,
-          [ctx.actorUserId, existing.rows[0].id]
-        );
-      }
-      return { ...ctx, memberId: existing.rows[0].id, role: 'owner', isOwner: true };
-    }
-    const email =
-      (ctx.actorEmail && String(ctx.actorEmail).trim()) || `owner-${ctx.actorUserId}@local`;
-    const name = ctx.actorName || 'Workshop Owner';
-    const ins = await pool.query(
-      `INSERT INTO team_members
-         (team_owner_id, clerk_user_id, email, name, role, avatar_color, active)
-       VALUES ($1, $1, $2, $3, 'owner', $4, TRUE)
-       RETURNING *`,
-      [ctx.actorUserId, email, name, pickAvatarColor(ctx.actorUserId)]
-    );
-    return { ...ctx, memberId: ins.rows[0].id, role: 'owner', isOwner: true };
-  } catch (e) {
-    console.warn('ensureOwnerRow warn:', e.message);
-    return ctx;
-  }
-}
-
 // GET /api/team/me  — bootstrap call. Returns: { me, members }
 app.get('/api/team/me', async (req, res) => {
   try {
-    const ctx = await resolveTeamContext(req);
-    if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
-
-    // For brand-new admins this lazily seeds the owner row.
-    const finalCtx = await ensureOwnerRow(ctx);
+    const finalCtx = await resolveTeamContext(req);
+    if (!finalCtx.memberId) {
+      return res.status(403).json({ error: 'Your account is not a member of this workspace', code: 'not_a_member' });
+    }
 
     const ownerId = finalCtx.tenantUserId || finalCtx.actorUserId;
     const all = await pool.query(
@@ -14570,7 +14548,6 @@ app.post('/api/team/members', sensitiveLimiter, async (req, res) => {
   try {
     const ctx = await resolveTeamContext(req);
     if (!ctx.actorUserId) return res.status(400).json({ error: 'userId is required' });
-    await ensureOwnerRow(ctx);
     if (!ctx.isOwner) return res.status(403).json({ error: 'Only an admin can invite members' });
 
     const { email, name, role = 'salesman', commissionPct, quotaMonthly, avatarColor, companyId, permissions } = req.body || {};
