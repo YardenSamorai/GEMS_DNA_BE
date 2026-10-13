@@ -601,6 +601,13 @@ const resolveJewelryBranch = (location, shippingFrom) => {
   return JEWELRY_SHIP_BRANCH[sf] || (shippingFrom ? String(shippingFrom).trim() : null);
 };
 
+// How much location detail a caller may receive. Who holds which stone on memo
+// is commercially sensitive, so only a verified identity (Clerk session or API
+// key) gets the tier its permissions grant. Anonymous callers and spoofable
+// x-actor-id / ?userId= identities get none.
+const locationViewFor = (ctx) =>
+  ctx?.isAuthenticated ? (ctx.permissions?.locationView || 'hidden') : 'hidden';
+
 // Internal cost / margin. Owner always; otherwise the per-user override wins,
 // and if it's absent we fall back to the historic role default (managers see
 // cost, salesmen never do). Stones and jewelry must answer this the same way —
@@ -1189,7 +1196,7 @@ async function listSoapStonesFor(ctx, { assignedTo } = {}) {
     if (assignedFilter === 'all') assignedFilter = null; // 'all' == no explicit filter
 
     // How much location detail this viewer is allowed to see.
-    const locView = ctx.permissions?.locationView || 'full';
+    const locView = locationViewFor(ctx);
     // Which slices of location data each tier may receive. Computed once and
     // applied per-row below so exactLocation/holder/branch/status never leave
     // the API for a viewer who isn't entitled to them.
@@ -1820,7 +1827,7 @@ async function listJewelryFor(ctx) {
     // jewelry_model), so we surface the exact location / branch / memo + hold
     // status from the representative (heaviest = centre) linked stone — gated by
     // the viewer's locationView tier exactly like loose stones.
-    const locView = ctx.permissions?.locationView || 'full';
+    const locView = locationViewFor(ctx);
     const showExact  = locView === 'full';
     const showHolder = locView === 'full' || locView === 'memo_branch';
     const showBranch = locView === 'full' || locView === 'memo_branch' || locView === 'branch_only';
