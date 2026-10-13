@@ -184,6 +184,50 @@ app.use(async (req, res, next) => {
   next();
 });
 
+// Deny by default: every /api route needs a verified Clerk session unless it
+// is listed here. These are what the public pages (stone / jewelry DNA, share
+// and signature links), the sign-in flow before its session is active, media
+// tags and API-key clients reach without one. A new public route must be added
+// here deliberately.
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const PUBLIC_API_ROUTES = [
+  ['GET', /^\/api\/health$/],
+  ['GET', /^\/api\/stones\/(?!inventory-status$)[^/]+$/],
+  ['GET', /^\/api\/jewelry\/[^/]+$/],
+  ['POST', /^\/api\/crm\/dna-lead$/],
+  ['GET', new RegExp(`^${escapeRe(MEDIA_PROXY_PREFIX)}`)],
+  ['GET', /^\/api\/vimeo-file\/[^/]+$/],
+  ['GET', /^\/api\/share\/[^/]+$/],
+  ['POST', /^\/api\/share\/[^/]+\/respond$/],
+  ['GET', /^\/api\/sign\/[^/]+$/],
+  ['POST', /^\/api\/sign\/[^/]+$/],
+  ['POST', /^\/api\/auth\/sessions\/(peers|enforce-limit|revoke-others|revoke)$/],
+  ['GET', /^\/api\/crm\/outlook\/callback$/],
+  ['*', /^\/api\/v1\//],
+];
+const isPublicApiRoute = (method, path) =>
+  PUBLIC_API_ROUTES.some(([m, re]) => (m === '*' || m === method) && re.test(path));
+
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS' || !req.path.startsWith('/api/')) return next();
+  if (req.auth?.userId) return next();
+  const method = req.method === 'HEAD' ? 'GET' : req.method;
+  if (isPublicApiRoute(method, req.path)) return next();
+  return res.status(401).json({ error: 'Authentication required' });
+});
+
+// Many routes still read the caller from a `userId` query/body field. Pin it
+// to the verified user so nobody can act as someone else by sending theirs;
+// the frontend only ever sends its own id, so legitimate calls are unchanged.
+app.use((req, res, next) => {
+  const uid = req.auth?.userId;
+  if (uid && req.path.startsWith('/api/')) {
+    if (req.query && 'userId' in req.query) req.query.userId = uid;
+    if (req.body && typeof req.body === 'object' && 'userId' in req.body) req.body.userId = uid;
+  }
+  next();
+});
+
 // Guard for internal (non-public) endpoints: requires a verified Clerk
 // session. Use on routes that must never be reachable anonymously.
 function requireAuth(req, res, next) {
@@ -404,20 +448,14 @@ const decrypt = (cipher) => {
    Design notes:
    - Fire-and-forget: failures NEVER bubble up to the parent
      route. Activity logging is best-effort by definition.
-   - Actor info comes from x-actor-id / x-actor-name headers
-     (FE will start sending these in Phase 2). Until then we
-     fall back to actorId = userId, which is correct for the
-     current single-user-per-workspace assumption.
+   - The actor is the verified Clerk user; the display name still
+     comes from x-actor-name, which is cosmetic.
    - `related` is a JSONB array of {type,id,name} pointers used
      by the FE to render backlinks ("→ contact: Liora Kirsch").
    ========================================================= */
 function getActor(req) {
   return {
-    actorId:
-      req?.headers?.['x-actor-id'] ||
-      req?.body?.actorId ||
-      req?.body?.userId ||
-      null,
+    actorId: req?.auth?.userId || null,
     actorName:
       req?.headers?.['x-actor-name'] ||
       req?.body?.actorName ||
@@ -618,23 +656,39 @@ const viewerCanSeeCost = (ctx) => {
   return !!ctx?.isOwner || perm === true || (perm !== false && ctx?.role === 'manager');
 };
 
+// Primary email of a verified Clerk user, for the first-sign-in link to an
+// invitation. Session tokens don't carry the email unless a JWT template adds
+// it, and a client-sent email can't be trusted.
+const clerkEmailCache = new Map();
+async function verifiedEmailFor(userId) {
+  if (!clerkClient || !userId) return null;
+  if (clerkEmailCache.has(userId)) return clerkEmailCache.get(userId);
+  try {
+    const u = await clerkClient.users.getUser(userId);
+    const primary = (u.emailAddresses || []).find((e) => e.id === u.primaryEmailAddressId);
+    const email = primary?.emailAddress || null;
+    clerkEmailCache.set(userId, email);
+    return email;
+  } catch (e) {
+    console.warn('verifiedEmailFor warn:', e.message);
+    return null;
+  }
+}
+
+const NO_ACCESS_CONTEXT = (actorName = null) => ({
+  tenantUserId: null, actorUserId: null,
+  role: null, memberId: null, memberName: null,
+  permissions: {},
+  isOwner: false, isWorkshopOwner: false, isAuthenticated: false,
+  actorName,
+});
+
 async function resolveTeamContext(req) {
-  // Identity comes from the cryptographically-verified Clerk session first.
-  // The x-actor-*/userId values are client-controlled and only used as a
-  // legacy fallback during rollout (removed once the FE always sends a token).
+  // Identity comes only from a cryptographically-verified Clerk session (or an
+  // API key, which passes its owner as req.auth). Client-set x-actor-id,
+  // ?userId= and body userId are ignored: anyone can send them.
   const verifiedId = req?.auth?.userId ? String(req.auth.userId).trim() : null;
-  const actorId =
-    verifiedId ||
-    (req?.headers?.['x-actor-id'] && String(req.headers['x-actor-id']).trim()) ||
-    (req?.query?.userId && String(req.query.userId).trim()) ||
-    (req?.body?.userId && String(req.body.userId).trim()) ||
-    null;
-  const actorEmail =
-    (req?.auth?.email && String(req.auth.email).trim()) ||
-    (req?.headers?.['x-actor-email'] && String(req.headers['x-actor-email']).trim()) ||
-    (req?.query?.userEmail && String(req.query.userEmail).trim()) ||
-    (req?.body?.userEmail && String(req.body.userEmail).trim()) ||
-    null;
+  const actorId = verifiedId;
   const headerActorName =
     (req?.headers?.['x-actor-name'] && String(req.headers['x-actor-name']).trim()) ||
     (req?.body?.actorName && String(req.body.actorName).trim()) ||
@@ -643,16 +697,8 @@ async function resolveTeamContext(req) {
   // No identity at all → no access. (Previously this branch granted full
   // owner+admin access, which let any anonymous caller read/write every
   // workshop's data. Hard fail-closed instead.)
-  if (!actorId) {
-    return {
-      tenantUserId: null, actorUserId: null,
-      role: null, memberId: null, memberName: null,
-      permissions: {},
-      isOwner: false, isWorkshopOwner: false, isAuthenticated: false,
-      actorName: headerActorName,
-    };
-  }
-  const isAuthenticated = !!verifiedId;
+  if (!actorId) return NO_ACCESS_CONTEXT(headerActorName);
+  const isAuthenticated = true;
 
   let rows = [];
   try {
@@ -666,6 +712,9 @@ async function resolveTeamContext(req) {
 
     // Email-based first-time linkage: rep was added before they signed up,
     // now we recognise them by email and stamp their clerk_user_id in.
+    const actorEmail = rows.length
+      ? null
+      : (req?.auth?.email && String(req.auth.email).trim()) || (await verifiedEmailFor(actorId));
     if (!rows.length && actorEmail) {
       const r2 = await pool.query(
         `SELECT * FROM team_members
@@ -687,9 +736,10 @@ async function resolveTeamContext(req) {
       }
     }
   } catch (e) {
-    // team_members table missing or transient DB hiccup — fall back to
-    // legacy single-user mode so the workspace keeps working.
+    // A DB hiccup must not fall through to the unknown-user branch below,
+    // which grants owner access. Fail closed.
     console.warn('resolveTeamContext lookup warn:', e.message);
+    return NO_ACCESS_CONTEXT(headerActorName);
   }
 
   if (rows.length) {
@@ -774,13 +824,9 @@ const STORE_USER_ALLOWED_PREFIXES = [
 ];
 app.use(async (req, res, next) => {
   try {
-    // Cheap pre-check: only API requests, only when an actor is sent.
+    // Cheap pre-check: only API requests from a verified user.
     if (!req.path.startsWith('/api/')) return next();
-    const looksLikeActor =
-      req.headers?.['x-actor-id'] ||
-      req.query?.userId ||
-      (req.body && req.body.userId);
-    if (!looksLikeActor) return next();
+    if (!req.auth?.userId) return next();
 
     const ctx = await resolveTeamContext(req);
     if (ctx?.role !== 'store_user') return next();
@@ -794,10 +840,8 @@ app.use(async (req, res, next) => {
       error: 'Store-portal users can only access /api/portal/* endpoints',
     });
   } catch (_) {
-    // If anything in the gate explodes we err on the safe side and let
-    // the request continue — this matches the rest of the codebase's
-    // backwards-compatible "fail open to legacy single-user" stance.
-    return next();
+    // Unknown role means we can't tell a store user from staff — fail closed.
+    return res.status(503).json({ error: 'Could not verify access. Please retry.' });
   }
 });
 
