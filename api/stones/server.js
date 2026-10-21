@@ -2476,6 +2476,20 @@ app.post("/api/stones/:sku/assign", async (req, res) => {
 });
 
 /* =========================================================
+   /api/stone-overrides – every admin correction, for the review screen.
+   Kept off /api/stones/:id so the public DNA route cannot swallow it.
+   ========================================================= */
+app.get("/api/stone-overrides", requireOwner, async (req, res) => {
+  try {
+    const items = await listStoneOverrides(pool);
+    res.json({ items });
+  } catch (error) {
+    console.error("❌ Error listing stone overrides:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
    /api/stones/:sku/overrides – admin-only spec corrections
    Survives the next Barak SOAP/CSV truncate. Owner/admin only.
    ========================================================= */
@@ -3057,6 +3071,7 @@ const {
 } = require('../../utils/preserveFields');
 const {
   getOverrides: getStoneOverrides,
+  listOverrides: listStoneOverrides,
   upsertOverrides: upsertStoneOverrides,
   applyOverrides: applyStoneOverrides,
 } = require('../../utils/stoneOverrides');
