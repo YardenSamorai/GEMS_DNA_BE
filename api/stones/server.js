@@ -196,7 +196,7 @@ const PUBLIC_API_ROUTES = [
   ['GET', /^\/api\/jewelry\/[^/]+$/],
   ['POST', /^\/api\/crm\/dna-lead$/],
   ['GET', new RegExp(`^${escapeRe(MEDIA_PROXY_PREFIX)}`)],
-  ['GET', /^\/api\/vimeo-file\/[^/]+$/],
+  ['GET', /^\/api\/vimeo-file\/[^/]+(?:\/file)?$/],
   ['GET', /^\/api\/share\/[^/]+$/],
   ['POST', /^\/api\/share\/[^/]+\/respond$/],
   ['GET', /^\/api\/sign\/[^/]+$/],
@@ -2941,6 +2941,7 @@ app.get(`${MEDIA_PROXY_PREFIX}*`, async (req, res) => {
 
 /* =========================================================
    /api/vimeo-file/:id – Direct MP4 link for a Vimeo video
+   /api/vimeo-file/:id/file – 302 to that MP4 (share/open)
    ---------------------------------------------------------
    iOS Safari ignores every quality hint on embedded Vimeo
    players (native HLS = Apple decides, and it downgrades
@@ -2948,64 +2949,98 @@ app.get(`${MEDIA_PROXY_PREFIX}*`, async (req, res) => {
    play the direct progressive MP4 instead — one fixed-quality
    file, no adaptive engine, no way to degrade.
    Requires VIMEO_ACCESS_TOKEN (scopes: public private
-   video_files) and a Vimeo Pro+ account. Links are cached
-   in-memory; Vimeo's `files` links don't expire.
+   video_files) and a Vimeo Pro+ account. JSON payloads are
+   cached in-memory. The /file redirect is what we put in
+   WhatsApp / copy / PDF so clients never see Vimeo's
+   short-lived oauth CDN URL.
    ========================================================= */
 const VIMEO_TOKEN = process.env.VIMEO_ACCESS_TOKEN;
-const vimeoFileCache = new Map(); // videoId -> { link, width, height, cachedAt }
+const vimeoFileCache = new Map(); // videoId -> { payload, cachedAt }
 const VIMEO_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+
+const parseVimeoId = (raw) => {
+  const videoId = String(raw || "").trim();
+  return /^\d{6,20}$/.test(videoId) ? videoId : null;
+};
+
+const resolveBestVimeoMp4 = async (videoId) => {
+  if (!VIMEO_TOKEN) {
+    const err = new Error("Vimeo token not configured");
+    err.status = 503;
+    throw err;
+  }
+
+  const cached = vimeoFileCache.get(videoId);
+  if (cached && Date.now() - cached.cachedAt < VIMEO_CACHE_TTL_MS) {
+    return cached.payload;
+  }
+
+  const vr = await fetch(
+    `https://api.vimeo.com/videos/${videoId}?fields=files`,
+    {
+      timeout: 10000,
+      headers: {
+        Authorization: `Bearer ${VIMEO_TOKEN}`,
+        Accept: "application/vnd.vimeo.*+json;version=3.4",
+      },
+    }
+  );
+  if (!vr.ok) {
+    const err = new Error(`Vimeo API ${vr.status}`);
+    err.status = vr.status === 404 ? 404 : 502;
+    throw err;
+  }
+  const data = await vr.json();
+
+  // Pick the highest-resolution progressive MP4 (skip the HLS entry).
+  const mp4s = (data.files || []).filter(
+    (f) => f.type === "video/mp4" && f.rendition !== "adaptive" && f.link
+  );
+  if (!mp4s.length) {
+    const err = new Error("No progressive files for this video");
+    err.status = 404;
+    throw err;
+  }
+  mp4s.sort((a, b) => (b.height || 0) - (a.height || 0));
+  const best = mp4s[0];
+
+  const payload = {
+    link: best.link,
+    rendition: best.rendition,
+    width: best.width || null,
+    height: best.height || null,
+  };
+  vimeoFileCache.set(videoId, { payload, cachedAt: Date.now() });
+  return payload;
+};
+
+/* Stable share/open URL. The Vimeo CDN MP4 expires and carries an oauth
+ * token in the query string — never put that in a WhatsApp message. This
+ * 302 always points at the current 1080p file. */
+app.get("/api/vimeo-file/:id/file", async (req, res) => {
+  try {
+    const videoId = parseVimeoId(req.params.id);
+    if (!videoId) return res.status(400).json({ error: "Invalid video id" });
+    const payload = await resolveBestVimeoMp4(videoId);
+    res.set("Cache-Control", "private, max-age=300");
+    return res.redirect(302, payload.link);
+  } catch (error) {
+    console.error("vimeo-file redirect error:", error.message);
+    if (!res.headersSent) {
+      res.status(error.status || 500).json({ error: error.message || "Failed to resolve video file" });
+    }
+  }
+});
 
 app.get("/api/vimeo-file/:id", async (req, res) => {
   try {
-    const videoId = String(req.params.id || "").trim();
-    if (!/^\d{6,20}$/.test(videoId)) {
-      return res.status(400).json({ error: "Invalid video id" });
-    }
-    if (!VIMEO_TOKEN) {
-      return res.status(503).json({ error: "Vimeo token not configured" });
-    }
-
-    const cached = vimeoFileCache.get(videoId);
-    if (cached && Date.now() - cached.cachedAt < VIMEO_CACHE_TTL_MS) {
-      return res.json(cached.payload);
-    }
-
-    const vr = await fetch(
-      `https://api.vimeo.com/videos/${videoId}?fields=files`,
-      {
-        timeout: 10000,
-        headers: {
-          Authorization: `Bearer ${VIMEO_TOKEN}`,
-          Accept: "application/vnd.vimeo.*+json;version=3.4",
-        },
-      }
-    );
-    if (!vr.ok) {
-      return res.status(vr.status === 404 ? 404 : 502).json({ error: `Vimeo API ${vr.status}` });
-    }
-    const data = await vr.json();
-
-    // Pick the highest-resolution progressive MP4 (skip the HLS entry).
-    const mp4s = (data.files || []).filter(
-      (f) => f.type === "video/mp4" && f.rendition !== "adaptive" && f.link
-    );
-    if (!mp4s.length) {
-      return res.status(404).json({ error: "No progressive files for this video" });
-    }
-    mp4s.sort((a, b) => (b.height || 0) - (a.height || 0));
-    const best = mp4s[0];
-
-    const payload = {
-      link: best.link,
-      rendition: best.rendition,
-      width: best.width || null,
-      height: best.height || null,
-    };
-    vimeoFileCache.set(videoId, { payload, cachedAt: Date.now() });
+    const videoId = parseVimeoId(req.params.id);
+    if (!videoId) return res.status(400).json({ error: "Invalid video id" });
+    const payload = await resolveBestVimeoMp4(videoId);
     res.json(payload);
   } catch (error) {
     console.error("vimeo-file error:", error.message);
-    res.status(500).json({ error: "Failed to resolve video file" });
+    res.status(error.status || 500).json({ error: error.message || "Failed to resolve video file" });
   }
 });
 
