@@ -2476,6 +2476,51 @@ app.post("/api/stones/:sku/assign", async (req, res) => {
 });
 
 /* =========================================================
+   /api/stones/:sku/overrides – admin-only spec corrections
+   Survives the next Barak SOAP/CSV truncate. Owner/admin only.
+   ========================================================= */
+app.get("/api/stones/:sku/overrides", requireOwner, async (req, res) => {
+  try {
+    const sku = String(req.params.sku || "").trim();
+    if (!sku) return res.status(400).json({ error: "SKU is required" });
+    const data = await getStoneOverrides(pool, sku);
+    res.json(data);
+  } catch (error) {
+    console.error("❌ Error reading stone overrides:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.patch("/api/stones/:sku/overrides", requireOwner, async (req, res) => {
+  try {
+    const sku = String(req.params.sku || "").trim();
+    if (!sku) return res.status(400).json({ error: "SKU is required" });
+    const exists = await pool.query("SELECT sku FROM soap_stones WHERE sku = $1", [sku]);
+    if (!exists.rows.length) return res.status(404).json({ error: "Stone not found" });
+
+    const data = await upsertStoneOverrides(pool, sku, req.body || {}, req.teamCtx?.actorUserId);
+    res.json(data);
+
+    const keys = Object.keys(data.fields || {});
+    logActivity({
+      userId: req.teamCtx?.tenantUserId || req.teamCtx?.actorUserId,
+      actorId: req.teamCtx?.actorUserId,
+      actorName: req.teamCtx?.actorName,
+      entityType: "loose_stone",
+      entityId: sku,
+      action: keys.length ? "override_specs" : "clear_overrides",
+      summary: keys.length
+        ? `Admin overrode ${keys.join(", ")} on ${sku}`
+        : `Admin cleared spec overrides on ${sku}`,
+    });
+  } catch (error) {
+    if (error.status === 400) return res.status(400).json({ error: error.message });
+    console.error("❌ Error saving stone overrides:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
    /api/stones/:sku/tags/:tagId - Remove tag from a stone
    ========================================================= */
 app.delete("/api/stones/:sku/tags/:tagId", async (req, res) => {
@@ -3010,6 +3055,11 @@ const {
   snapshotColumns,
   restoreColumns,
 } = require('../../utils/preserveFields');
+const {
+  getOverrides: getStoneOverrides,
+  upsertOverrides: upsertStoneOverrides,
+  applyOverrides: applyStoneOverrides,
+} = require('../../utils/stoneOverrides');
 
 /* Which CSV header feeds each stored column. Used to tell "the export says
  * this field is empty" (honour it — the stone really has no video now) from
@@ -3194,6 +3244,13 @@ app.post("/api/import-csv", sensitiveLimiter, requireOwner, async (req, res) => 
       csvImportProgress = { ...csvImportProgress, phase: 'restoring', progress: 95, detail: 'Restoring fields the file did not carry...' };
       const restored = await restoreColumns(pool, preservedFields, absentCols, CHUNK);
       console.log(`🛟 Kept ${absentCols.length} untouched column(s) on ${restored} stones.`);
+    }
+
+    try {
+      const overridden = await applyStoneOverrides(pool);
+      if (overridden) console.log(`🛟 Re-applied admin overrides on ${overridden} stone(s)`);
+    } catch (e) {
+      console.warn("⚠️  Could not re-apply stone overrides:", e.message);
     }
 
     // 🔍 Verify the prices we just stored still follow the supplier convention

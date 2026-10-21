@@ -5,6 +5,7 @@ const { parseXml } = require("../../utils/xmlParser");
 const { pool } = require("../../db/client");
 const { cleanText } = require("../../utils/preserveFields");
 const { auditPrices } = require("../../utils/priceIntegrity");
+const { applyOverrides } = require("../../utils/stoneOverrides");
 
 const CHUNK_SIZE = 300; // ⭐ הכי יציב
 
@@ -408,6 +409,15 @@ const runImport = async (options = {}) => {
         totalStones: stoneArray.length, 
         processedStones 
       });
+    }
+
+    // Admin corrections (wrong Weight on a set, etc.) live outside this table
+    // so the truncate cannot wipe them. Re-apply before the price check.
+    try {
+      const overridden = await applyOverrides(dbPool);
+      if (overridden) console.log(`🛟 Re-applied admin overrides on ${overridden} stone(s)`);
+    } catch (e) {
+      console.warn("⚠️  Could not re-apply stone overrides:", e.message);
     }
 
     // 🔍 Verify the prices we just stored still follow the supplier convention
