@@ -2490,6 +2490,88 @@ app.get("/api/stone-overrides", requireOwner, async (req, res) => {
 });
 
 /* =========================================================
+   /api/web-listings – stones published to Eshed.com
+   Replaces picking them in Barak's eTrade module: admins
+   choose stones here and download the same eTrade CSV the
+   site sync already reads. Owner/admin only.
+   ========================================================= */
+app.get("/api/web-listings", requireOwner, async (req, res) => {
+  try {
+    const items = await webListings.listDetailed(pool);
+    res.json({ items });
+  } catch (error) {
+    console.error("❌ Error listing web listings:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/web-listings/skus", requireOwner, async (req, res) => {
+  try {
+    res.json({ skus: await webListings.listSkus(pool) });
+  } catch (error) {
+    console.error("❌ Error listing web listing SKUs:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/web-listings", requireOwner, async (req, res) => {
+  try {
+    const result = await webListings.addSkus(pool, req.body?.skus, req.teamCtx?.actorUserId);
+    res.json(result);
+    if (result.added.length) {
+      logActivity({
+        userId: req.teamCtx?.tenantUserId || req.teamCtx?.actorUserId,
+        actorId: req.teamCtx?.actorUserId,
+        actorName: req.teamCtx?.actorName,
+        entityType: "loose_stone",
+        entityId: result.added.length === 1 ? result.added[0] : "website",
+        action: "website_add",
+        summary: `Added ${result.added.length} stone(s) to the website: ${result.added.slice(0, 20).join(", ")}`,
+      });
+    }
+  } catch (error) {
+    console.error("❌ Error adding web listings:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/web-listings/remove", requireOwner, async (req, res) => {
+  try {
+    const result = await webListings.removeSkus(pool, req.body?.skus);
+    res.json(result);
+    if (result.removed.length) {
+      logActivity({
+        userId: req.teamCtx?.tenantUserId || req.teamCtx?.actorUserId,
+        actorId: req.teamCtx?.actorUserId,
+        actorName: req.teamCtx?.actorName,
+        entityType: "loose_stone",
+        entityId: result.removed.length === 1 ? result.removed[0] : "website",
+        action: "website_remove",
+        summary: `Removed ${result.removed.length} stone(s) from the website: ${result.removed.slice(0, 20).join(", ")}`,
+      });
+    }
+  } catch (error) {
+    console.error("❌ Error removing web listings:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/web-listings/etrade.csv", requireOwner, async (req, res) => {
+  try {
+    const { csv, count } = await webListings.exportCsv(pool);
+    const name = etradeFileName();
+    res.set("Content-Type", "text/csv; charset=utf-8");
+    res.set("Content-Disposition", `attachment; filename="${name}"`);
+    res.set("X-Stone-Count", String(count));
+    res.set("Access-Control-Expose-Headers", "Content-Disposition, X-Stone-Count");
+    res.send(csv);
+  } catch (error) {
+    console.error("❌ Error exporting eTrade CSV:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/* =========================================================
    /api/stones/:sku/overrides – admin-only spec corrections
    Survives the next Barak SOAP/CSV truncate. Owner/admin only.
    ========================================================= */
@@ -3110,6 +3192,8 @@ const {
   upsertOverrides: upsertStoneOverrides,
   applyOverrides: applyStoneOverrides,
 } = require('../../utils/stoneOverrides');
+const webListings = require('../../utils/webListings');
+const { fileName: etradeFileName } = require('../../utils/etradeExport');
 
 /* Which CSV header feeds each stored column. Used to tell "the export says
  * this field is empty" (honour it — the stone really has no video now) from
