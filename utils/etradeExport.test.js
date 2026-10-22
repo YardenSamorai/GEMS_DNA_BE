@@ -77,4 +77,23 @@ test("file name follows Barak's DiamondsYYYYMMDD_HHMMSS pattern in Israel time",
   assert.strictEqual(fileName(new Date("2026-10-22T08:45:55Z")), "Diamonds20261022_114555.csv");
 });
 
+test("Vimeo links become our 1080p MP4; other players and images are untouched", () => {
+  const base = "https://api.example.com/";
+  const row = {
+    sku: "T1",
+    image: "https://app.barakdiamonds.com/Gemstones/Output/StoneImages/T1.jpg",
+    video: "https://player.vimeo.com/video/574832396",
+    additional_videos:
+      "https://vimeo.com/574832768;https://v360.in/gemstone/vision360.html?d=T1;https://vimeo.com/manage/videos/534409199",
+  };
+  const opts = { videoBase: base };
+  assert.strictEqual(cell(row, "Image"), row.image);
+  assert.strictEqual(rowToCells(row, opts)[HEADERS.indexOf("Video")], "https://api.example.com/api/vimeo-file/574832396/1080.mp4");
+  assert.strictEqual(
+    rowToCells(row, opts)[HEADERS.indexOf("additional_videos")],
+    "https://api.example.com/api/vimeo-file/574832768/1080.mp4;https://v360.in/gemstone/vision360.html?d=T1;https://api.example.com/api/vimeo-file/534409199/1080.mp4"
+  );
+  assert.strictEqual(cell(row, "Video"), row.video);
+});
+
 console.log(`\n${passed} passed`);

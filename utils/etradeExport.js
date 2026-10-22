@@ -13,6 +13,10 @@
  *   - Branch as a two-letter branch code (EM → IL, EY → NY, …),
  *   - the " O" suffix dropped from Category ("Tourmaline O" → "Tourmaline"),
  *   - Lab "ESH" spelled out as "Eshed".
+ *
+ * One deliberate difference: with `videoBase`, Vimeo links become our 1080p
+ * MP4 link (/api/vimeo-file/:id/1080.mp4). The Vimeo player lets the
+ * browser pick the quality and often settles on 360p; the MP4 is fixed.
  * ========================================================================== */
 
 const HEADERS = [
@@ -72,8 +76,22 @@ const lab = (v) => {
   return LAB_NAME[s.toUpperCase()] || s;
 };
 
+const VIMEO_RE = /^https?:\/\/(?:player\.|www\.)?vimeo\.com\/(?:video\/|manage\/videos\/)?(\d{6,20})(?:[/?#].*)?$/i;
+
+const videoLink = (url, videoBase) => {
+  const s = text(url);
+  const id = videoBase ? VIMEO_RE.exec(s)?.[1] : null;
+  return id ? `${videoBase.replace(/\/+$/, "")}/api/vimeo-file/${id}/1080.mp4` : s;
+};
+
+const videoList = (v, videoBase) =>
+  text(v)
+    .split(";")
+    .map((u) => videoLink(u, videoBase))
+    .join(";");
+
 /* One soap_stones row → the 40 eTrade cells, in HEADERS order. */
-const rowToCells = (r) => [
+const rowToCells = (r, { videoBase } = {}) => [
   category(r.category),
   text(r.sku),
   text(r.shape),
@@ -88,7 +106,7 @@ const rowToCells = (r) => [
   price(r.total_price),
   "",
   text(r.image),
-  text(r.video),
+  videoLink(r.video, videoBase),
   text(r.certificate_image),
   text(r.certificate_number),
   text(r.cut),
@@ -107,7 +125,7 @@ const rowToCells = (r) => [
   text(r.home_page),
   text(r.additional_pictures),
   branchCode(r.branch),
-  text(r.additional_videos),
+  videoList(r.additional_videos, videoBase),
   text(r.comment),
   text(r.type),
   text(r.cert_comments),
@@ -122,8 +140,10 @@ const csvCell = (v) => {
 };
 
 /* CRLF line endings, no BOM, trailing newline — the same bytes Barak writes. */
-const toCsv = (rows) =>
-  [HEADERS, ...rows.map(rowToCells)].map((cells) => cells.map(csvCell).join(",")).join("\r\n") + "\r\n";
+const toCsv = (rows, options) =>
+  [HEADERS, ...rows.map((r) => rowToCells(r, options))]
+    .map((cells) => cells.map(csvCell).join(","))
+    .join("\r\n") + "\r\n";
 
 /* Named the way Barak names it, in Israel time — the server runs on UTC. */
 const fileName = (date = new Date(), timeZone = "Asia/Jerusalem") => {
@@ -140,4 +160,4 @@ const fileName = (date = new Date(), timeZone = "Asia/Jerusalem") => {
   return `Diamonds${parts.year}${parts.month}${parts.day}_${parts.hour}${parts.minute}${parts.second}.csv`;
 };
 
-module.exports = { HEADERS, rowToCells, toCsv, fileName, branchCode, category, lab, price };
+module.exports = { HEADERS, rowToCells, toCsv, fileName, branchCode, category, lab, price, videoLink };

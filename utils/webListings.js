@@ -249,14 +249,14 @@ async function listDetailed(pool) {
 }
 
 /* The eTrade CSV: every listed stone still in the Barak feed. */
-async function exportCsv(pool) {
+async function exportCsv(pool, { videoBase } = {}) {
   await ensureTable(pool);
   const { rows } = await pool.query(
     `SELECT s.* FROM web_listings w
        JOIN soap_stones s ON s.sku = w.sku
       ORDER BY s.category, s.sku`
   );
-  return { csv: toCsv(rows), count: rows.length };
+  return { csv: toCsv(rows, { videoBase }), count: rows.length };
 }
 
 module.exports = {

@@ -196,7 +196,7 @@ const PUBLIC_API_ROUTES = [
   ['GET', /^\/api\/jewelry\/[^/]+$/],
   ['POST', /^\/api\/crm\/dna-lead$/],
   ['GET', new RegExp(`^${escapeRe(MEDIA_PROXY_PREFIX)}`)],
-  ['GET', /^\/api\/vimeo-file\/[^/]+(?:\/file)?$/],
+  ['GET', /^\/api\/vimeo-file\/[^/]+(?:\/file|\/\d{3,4}\.mp4)?$/],
   ['GET', /^\/api\/share\/[^/]+$/],
   ['POST', /^\/api\/share\/[^/]+\/respond$/],
   ['GET', /^\/api\/sign\/[^/]+$/],
@@ -2570,7 +2570,8 @@ app.post("/api/web-listings/sync", sensitiveLimiter, requireOwner, async (req, r
 app.get("/api/web-listings/etrade.csv", requireOwner, async (req, res) => {
   try {
     await barakWebSync.syncIfStale(pool, { ftpConfig: barakFtpConfig(), source: "export" }).catch(() => {});
-    const { csv, count } = await webListings.exportCsv(pool);
+    const videoBase = (process.env.PUBLIC_API_URL || `${req.protocol}://${req.get("host")}`).replace(/\/+$/, "");
+    const { csv, count } = await webListings.exportCsv(pool, { videoBase });
     const name = etradeFileName();
     res.set("Content-Type", "text/csv; charset=utf-8");
     res.set("Content-Disposition", `attachment; filename="${name}"`);
@@ -3049,7 +3050,7 @@ app.get(`${MEDIA_PROXY_PREFIX}*`, async (req, res) => {
    short-lived oauth CDN URL.
    ========================================================= */
 const VIMEO_TOKEN = process.env.VIMEO_ACCESS_TOKEN;
-const vimeoFileCache = new Map(); // videoId -> { payload, cachedAt }
+const vimeoFileCache = new Map(); // videoId -> { mp4s (largest first), cachedAt }
 const VIMEO_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 
 const parseVimeoId = (raw) => {
@@ -3057,16 +3058,30 @@ const parseVimeoId = (raw) => {
   return /^\d{6,20}$/.test(videoId) ? videoId : null;
 };
 
-const resolveBestVimeoMp4 = async (videoId) => {
+/* maxShortSide caps the file by its shorter edge, so a portrait 1080×1920
+ * counts as 1080p. Without a cap the largest file wins. */
+const resolveBestVimeoMp4 = async (videoId, { maxShortSide = Infinity } = {}) => {
   if (!VIMEO_TOKEN) {
     const err = new Error("Vimeo token not configured");
     err.status = 503;
     throw err;
   }
 
+  const pick = (mp4s) => {
+    const short = (f) => Math.min(f.width || Infinity, f.height || Infinity);
+    const fits = mp4s.filter((f) => short(f) <= maxShortSide);
+    const best = fits.length ? fits[0] : mp4s[mp4s.length - 1];
+    return {
+      link: best.link,
+      rendition: best.rendition,
+      width: best.width || null,
+      height: best.height || null,
+    };
+  };
+
   const cached = vimeoFileCache.get(videoId);
   if (cached && Date.now() - cached.cachedAt < VIMEO_CACHE_TTL_MS) {
-    return cached.payload;
+    return pick(cached.mp4s);
   }
 
   const vr = await fetch(
@@ -3096,26 +3111,19 @@ const resolveBestVimeoMp4 = async (videoId) => {
     throw err;
   }
   mp4s.sort((a, b) => (b.height || 0) - (a.height || 0));
-  const best = mp4s[0];
-
-  const payload = {
-    link: best.link,
-    rendition: best.rendition,
-    width: best.width || null,
-    height: best.height || null,
-  };
-  vimeoFileCache.set(videoId, { payload, cachedAt: Date.now() });
-  return payload;
+  vimeoFileCache.set(videoId, { mp4s, cachedAt: Date.now() });
+  return pick(mp4s);
 };
 
 /* Stable share/open URL. The Vimeo CDN MP4 expires and carries an oauth
  * token in the query string — never put that in a WhatsApp message. This
- * 302 always points at the current 1080p file. */
-app.get("/api/vimeo-file/:id/file", async (req, res) => {
+ * 302 always points at the current best file.
+ * /api/vimeo-file/:id/1080.mp4 caps it at that size — the eTrade export
+ * uses it so Eshed.com never pulls a 4K original. */
+const redirectToVimeoMp4 = async (req, res, videoId, maxShortSide = Infinity) => {
   try {
-    const videoId = parseVimeoId(req.params.id);
     if (!videoId) return res.status(400).json({ error: "Invalid video id" });
-    const payload = await resolveBestVimeoMp4(videoId);
+    const payload = await resolveBestVimeoMp4(videoId, { maxShortSide });
     res.set("Cache-Control", "private, max-age=300");
     return res.redirect(302, payload.link);
   } catch (error) {
@@ -3124,6 +3132,15 @@ app.get("/api/vimeo-file/:id/file", async (req, res) => {
       res.status(error.status || 500).json({ error: error.message || "Failed to resolve video file" });
     }
   }
+};
+
+app.get("/api/vimeo-file/:id/file", (req, res) =>
+  redirectToVimeoMp4(req, res, parseVimeoId(req.params.id))
+);
+
+app.get(/^\/api\/vimeo-file\/(\d{6,20})\/(\d{3,4})\.mp4$/, (req, res) => {
+  const max = Number(req.params[1]);
+  return redirectToVimeoMp4(req, res, parseVimeoId(req.params[0]), max >= 240 ? max : Infinity);
 });
 
 app.get("/api/vimeo-file/:id", async (req, res) => {
