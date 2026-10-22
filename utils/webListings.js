@@ -9,20 +9,47 @@
  *
  * Pairs travel together. Adding or removing one half always takes its
  * partner with it — a half pair on the site is what this list replaces.
+ *
+ * source = 'barak' rows mirror Barak's eTrade file (see barakWebSync.js) and
+ * only leave when Barak drops them; 'manual' rows stay until an admin
+ * removes them here.
  * ========================================================================== */
 
 const { toCsv } = require("./etradeExport");
 
 const MAX_SKUS = 5000;
 
-async function ensureTable(pool) {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS web_listings (
-      sku       TEXT PRIMARY KEY,
-      added_by  TEXT,
-      added_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
+const ready = new WeakMap();
+
+function ensureTable(pool) {
+  if (!ready.has(pool)) {
+    const p = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS web_listings (
+          sku       TEXT PRIMARY KEY,
+          added_by  TEXT,
+          added_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(`ALTER TABLE web_listings ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual'`);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS web_listing_syncs (
+          id         SERIAL PRIMARY KEY,
+          file_name  TEXT,
+          source     TEXT,
+          success    BOOLEAN NOT NULL,
+          stones     INTEGER,
+          added      INTEGER,
+          removed    INTEGER,
+          message    TEXT,
+          ran_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+    })();
+    p.catch(() => ready.delete(pool));
+    ready.set(pool, p);
+  }
+  return ready.get(pool);
 }
 
 const cleanSkus = (input) => {
@@ -80,16 +107,92 @@ async function addSkus(pool, input, actorId) {
   return { added: rows.map((r) => r.sku), skus };
 }
 
+/* Barak-managed stones are not removed here: the next sync would bring them
+ * back. They come back in `managed` so the caller can say why. */
 async function removeSkus(pool, input) {
   await ensureTable(pool);
   const requested = cleanSkus(input);
   const skus = await withPartners(pool, requested);
-  if (!skus.length) return { removed: [] };
+  if (!skus.length) return { removed: [], managed: [] };
   const { rows } = await pool.query(
-    `DELETE FROM web_listings WHERE sku = ANY($1::text[]) RETURNING sku`,
+    `DELETE FROM web_listings WHERE sku = ANY($1::text[]) AND source <> 'barak' RETURNING sku`,
     [skus]
   );
-  return { removed: rows.map((r) => r.sku) };
+  const { rows: managed } = await pool.query(
+    `SELECT sku FROM web_listings WHERE sku = ANY($1::text[]) AND source = 'barak'`,
+    [skus]
+  );
+  return { removed: rows.map((r) => r.sku), managed: managed.map((r) => r.sku) };
+}
+
+/* Make the Barak-managed rows exactly `skus`. A stone already added by hand
+ * becomes Barak-managed once Barak lists it. `guard(removing, managed)`
+ * returns a reason to abort, checked before anything is written. */
+async function syncManaged(pool, input, guard) {
+  await ensureTable(pool);
+  const skus = cleanSkus(input);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(`SELECT sku, source FROM web_listings FOR UPDATE`);
+    const keep = new Set(skus);
+    const existing = new Set(rows.map((r) => r.sku));
+    const managed = rows.filter((r) => r.source === "barak").map((r) => r.sku);
+    const removing = managed.filter((s) => !keep.has(s));
+    const blocked = guard ? guard(removing.length, managed.length) : null;
+    if (blocked) {
+      await client.query("ROLLBACK");
+      return { blocked, added: [], removed: [] };
+    }
+    if (removing.length) {
+      await client.query(`DELETE FROM web_listings WHERE sku = ANY($1::text[])`, [removing]);
+    }
+    await client.query(
+      `INSERT INTO web_listings (sku, added_by, source)
+       SELECT s, 'barak', 'barak' FROM unnest($1::text[]) AS s
+       ON CONFLICT (sku) DO UPDATE SET source = 'barak'`,
+      [skus]
+    );
+    await client.query("COMMIT");
+    return { blocked: null, added: skus.filter((s) => !existing.has(s)), removed: removing };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+async function logSync(pool, e) {
+  await ensureTable(pool);
+  await pool.query(
+    `INSERT INTO web_listing_syncs (file_name, source, success, stones, added, removed, message)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [e.fileName || null, e.source || null, Boolean(e.success), e.stones ?? null, e.added ?? null, e.removed ?? null, e.message || null]
+  );
+}
+
+async function lastSync(pool, { successOnly = false } = {}) {
+  await ensureTable(pool);
+  const { rows } = await pool.query(
+    `SELECT file_name, source, success, stones, added, removed, message, ran_at
+       FROM web_listing_syncs
+      ${successOnly ? "WHERE success AND stones IS NOT NULL" : ""}
+      ORDER BY ran_at DESC LIMIT 1`
+  );
+  const r = rows[0];
+  return r
+    ? {
+        fileName: r.file_name,
+        source: r.source,
+        success: r.success,
+        stones: r.stones,
+        added: r.added,
+        removed: r.removed,
+        message: r.message,
+        ranAt: r.ran_at,
+      }
+    : null;
 }
 
 const hasFile = (v) => {
@@ -101,7 +204,7 @@ const hasFile = (v) => {
 async function listDetailed(pool) {
   await ensureTable(pool);
   const { rows } = await pool.query(
-    `SELECT w.sku, w.added_at, w.added_by,
+    `SELECT w.sku, w.added_at, w.added_by, w.source,
             s.sku IS NOT NULL AS in_catalog,
             s.category, s.shape, s.weight, s.color, s.clarity, s.lab,
             s.price_per_carat, s.total_price, s.branch, s.image, s.video,
@@ -139,6 +242,7 @@ async function listDetailed(pool) {
       homePage: r.home_page || null,
       addedAt: r.added_at,
       addedBy: r.added_by,
+      source: r.source,
       warnings,
     };
   });
@@ -161,6 +265,9 @@ module.exports = {
   listSkus,
   addSkus,
   removeSkus,
+  syncManaged,
+  logSync,
+  lastSync,
   listDetailed,
   exportCsv,
 };

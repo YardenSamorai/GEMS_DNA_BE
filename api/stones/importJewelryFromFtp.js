@@ -241,7 +241,9 @@ const run = async (options = {}) => {
   return result;
 };
 
-module.exports = { run };
+const ftpConfig = () => ({ host: FTP_HOST, user: FTP_USER, password: FTP_PASSWORD });
+
+module.exports = { run, ftpConfig };
 
 // Only auto-run when executed directly (the Render Cron Job runs
 // `node api/stones/importJewelryFromFtp.js`)

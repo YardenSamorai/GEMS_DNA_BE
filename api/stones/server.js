@@ -2491,14 +2491,14 @@ app.get("/api/stone-overrides", requireOwner, async (req, res) => {
 
 /* =========================================================
    /api/web-listings – stones published to Eshed.com
-   Replaces picking them in Barak's eTrade module: admins
-   choose stones here and download the same eTrade CSV the
-   site sync already reads. Owner/admin only.
+   Follows Barak's eTrade file on the FTP (every 3 hours) plus
+   stones admins add here, and downloads the same eTrade CSV
+   the site sync already reads. Owner/admin only.
    ========================================================= */
 app.get("/api/web-listings", requireOwner, async (req, res) => {
   try {
-    const items = await webListings.listDetailed(pool);
-    res.json({ items });
+    const [items, sync] = await Promise.all([webListings.listDetailed(pool), webListings.lastSync(pool)]);
+    res.json({ items, sync });
   } catch (error) {
     console.error("❌ Error listing web listings:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -2556,8 +2556,20 @@ app.post("/api/web-listings/remove", requireOwner, async (req, res) => {
   }
 });
 
+app.post("/api/web-listings/sync", sensitiveLimiter, requireOwner, async (req, res) => {
+  try {
+    const result = await barakWebSync.runSync(pool, { ftpConfig: barakFtpConfig(), source: "manual", force: true });
+    const sync = await webListings.lastSync(pool);
+    res.status(result.success ? 200 : 502).json({ ...result, sync });
+  } catch (error) {
+    console.error("❌ Error syncing web listings:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 app.get("/api/web-listings/etrade.csv", requireOwner, async (req, res) => {
   try {
+    await barakWebSync.syncIfStale(pool, { ftpConfig: barakFtpConfig(), source: "export" }).catch(() => {});
     const { csv, count } = await webListings.exportCsv(pool);
     const name = etradeFileName();
     res.set("Content-Type", "text/csv; charset=utf-8");
@@ -3193,6 +3205,8 @@ const {
   applyOverrides: applyStoneOverrides,
 } = require('../../utils/stoneOverrides');
 const webListings = require('../../utils/webListings');
+const barakWebSync = require('../../utils/barakWebSync');
+const { ftpConfig: barakFtpConfig } = require('./importJewelryFromFtp');
 const { fileName: etradeFileName } = require('../../utils/etradeExport');
 
 /* Which CSV header feeds each stored column. Used to tell "the export says
@@ -15501,3 +15515,15 @@ const offersReadyPromise = (async () => {
 app.listen(port, () => {
   console.log(`🚀 Server is running on http://localhost:${port}`);
 });
+
+/* Barak writes the web file at 02:00, 05:00 … 23:00 Israel time; pick it up a
+ * quarter of an hour later. The boot check covers runs missed while the
+ * service was down or asleep. */
+if (process.env.NODE_ENV !== "test") {
+  const syncWebsite = (source) =>
+    barakWebSync.runSync(pool, { ftpConfig: barakFtpConfig(), source }).catch(() => {});
+  require("node-cron").schedule("15 2-23/3 * * *", () => syncWebsite("cron"), { timezone: "Asia/Jerusalem" });
+  setTimeout(() => {
+    barakWebSync.syncIfStale(pool, { ftpConfig: barakFtpConfig(), source: "boot" }).catch(() => {});
+  }, 60 * 1000).unref?.();
+}
