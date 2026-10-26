@@ -2556,6 +2556,39 @@ app.post("/api/web-listings/remove", requireOwner, async (req, res) => {
   }
 });
 
+/* =========================================================
+   /api/fantasy – Fantasy (the inventory system replacing
+   Barak) mirrored into fantasy_lots and compared with the
+   Barak feed. Read-only towards Fantasy. Owner/admin only.
+   ========================================================= */
+const fantasyLots = require('../../utils/fantasyLots');
+const { compare: compareFantasy } = require('../../utils/fantasyCompare');
+
+app.get("/api/fantasy/overview", requireOwner, async (req, res) => {
+  try {
+    const [lots, stones, jewelry, sync] = await Promise.all([
+      fantasyLots.loadLots(pool),
+      pool.query("SELECT sku, category, branch, weight, total_price, cost_per_carat, location, holder FROM soap_stones").then((r) => r.rows),
+      pool.query("SELECT model_number, jewelry_type, price, location FROM jewelry_products").then((r) => r.rows).catch(() => []),
+      fantasyLots.lastSync(pool),
+    ]);
+    res.json({ ...compareFantasy({ lots, stones, jewelry }), sync });
+  } catch (error) {
+    console.error("❌ Error building Fantasy overview:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/fantasy/sync", sensitiveLimiter, requireOwner, async (req, res) => {
+  try {
+    const result = await fantasyLots.runSync(pool, { source: "manual" });
+    res.status(result.success ? 200 : 502).json({ ...result, sync: await fantasyLots.lastSync(pool) });
+  } catch (error) {
+    console.error("❌ Error syncing Fantasy:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 app.post("/api/web-listings/sync", sensitiveLimiter, requireOwner, async (req, res) => {
   try {
     const result = await barakWebSync.runSync(pool, { ftpConfig: barakFtpConfig(), source: "manual", force: true });
@@ -15543,4 +15576,13 @@ if (process.env.NODE_ENV !== "test") {
   setTimeout(() => {
     barakWebSync.syncIfStale(pool, { ftpConfig: barakFtpConfig(), source: "boot" }).catch(() => {});
   }, 60 * 1000).unref?.();
+
+  /* Fantasy mirror: half an hour after each Barak stone sync (07:00 / 19:00),
+   * so both sides of the comparison are from the same morning or evening. */
+  require("node-cron").schedule("30 7,19 * * *", () => {
+    fantasyLots.runSync(pool, { source: "cron" }).catch(() => {});
+  }, { timezone: "Asia/Jerusalem" });
+  setTimeout(() => {
+    fantasyLots.syncIfStale(pool, { source: "boot" }).catch(() => {});
+  }, 90 * 1000).unref?.();
 }
