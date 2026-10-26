@@ -6,6 +6,7 @@ const { pool } = require("../../db/client");
 const { cleanText } = require("../../utils/preserveFields");
 const { auditPrices } = require("../../utils/priceIntegrity");
 const { applyOverrides } = require("../../utils/stoneOverrides");
+const { realignCertComments } = require("../../utils/barakRow");
 
 const CHUNK_SIZE = 300; // ⭐ הכי יציב
 
@@ -114,7 +115,7 @@ const runImport = async (options = {}) => {
       // Detect: Color contains a quote AND Lab looks like a clarity grade
       const colorVal = String(stone.Color || '');
       const labVal = String(stone.Lab || '');
-      if (!colorVal.includes('"') || !CLARITY_GRADES.test(labVal.trim())) return;
+      if (!colorVal.includes('"') || !CLARITY_GRADES.test(labVal.trim())) return false;
 
       shiftFixCount++;
       console.warn(`⚠️  Fixing shifted fields for ${stone.SKU}: color="${stone.Color}" → lab="${stone.Lab}"`);
@@ -175,7 +176,10 @@ const runImport = async (options = {}) => {
       stone.cost_per_carat = null;
       stone.Holder = null;
       stone.JewelryModel = null;
+      return true;
     };
+
+    let commentFixCount = 0;
 
     const values = stoneArray.map((stone) => {
       const safeNumber = (value) => {
@@ -187,7 +191,12 @@ const runImport = async (options = {}) => {
       const rawSnapshot = JSON.stringify(stone);
 
       // 🛡️ Fix shifted fields (e.g. Color with comma breaks SOAP XML parsing)
-      fixShiftedFields(stone);
+      const colorShifted = fixShiftedFields(stone);
+
+      // 🛡️ A certificate comment with commas pushes Location, Holder and cost
+      //    into the wrong elements — put them back (utils/barakRow.js).
+      const commentSpill = colorShifted ? 0 : realignCertComments(stone);
+      if (commentSpill) commentFixCount++;
 
       // Handle xml2js object values: extract text content if field is an object with _ property
       const textVal = (v) => {
@@ -214,7 +223,9 @@ const runImport = async (options = {}) => {
         stone.Holder = null;
         stone.JewelryModel = null;
       };
-      if (stonesStr && isValidGT(stonesStr)) {
+      if (commentSpill) {
+        // Already realigned element by element.
+      } else if (stonesStr && isValidGT(stonesStr)) {
         // Shift by 2: GroupingType is in Stones, TradeShow is in Box, Origin is in GroupingType
         console.warn(`⚠️  Tail shift (2) for ${stone.SKU}: Stones="${stonesStr}" → GroupingType`);
         const realGroupingType = stonesStr;
@@ -323,6 +334,9 @@ const runImport = async (options = {}) => {
 
     if (shiftFixCount > 0) {
       console.log(`🛡️  Fixed ${shiftFixCount} stone(s) with shifted fields in this chunk`);
+    }
+    if (commentFixCount > 0) {
+      console.log(`🛡️  Realigned ${commentFixCount} stone(s) whose certificate comment contained commas`);
     }
 
     // Log GroupingType distribution for verification
