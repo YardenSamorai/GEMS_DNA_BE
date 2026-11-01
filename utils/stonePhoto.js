@@ -18,24 +18,45 @@
 //   cutout - remove.bg segmentation. Handles messy backgrounds better, but
 //            translucent stones are exactly what segmentation models get
 //            wrong, so it is offered next to `clean`, never instead of it.
+//
+// Both end in the same house style, measured on Barak's own catalog shots so
+// a station photo sits among them without standing out: a 1600px square of
+// pure white, the stone's longer side at 52% of the frame, centred
+// horizontally and a touch below the middle, with only a whisper of shadow
+// under it. A generative model is deliberately not part of this: it would
+// repaint the stone, and for an emerald the colour is the product.
 
 const sharp = require('sharp');
 
 // Working resolution. Phones upload at most this; anything larger is reduced.
 const WORK_SIDE = 3000;
 const OUT_SIDE = 1600;
-// Share of the square frame's side the stone (or pair / parcel) fills.
-const FILL = 0.72;
+// Share of the square frame's side the stone (or pair / parcel) fills, and
+// where its centre sits from the top. Barak's catalog: 0.49-0.53 and 0.52.
+const FILL = 0.52;
+const CENTRE_Y = 0.52;
+// Shadow under the stone: darkening of the white right at the girdle, how
+// far it is dropped and how soft it is, both as shares of the stone's size.
+// Barak's catalog reads 251-254 just below the stone and 255 a little lower.
+const SHADOW_STRENGTH = 0.1;
+const SHADOW_DROP = 0.04;
+const SHADOW_SOFTNESS = 0.05;
+// A photo whose short side is below this was sent through a chat app or
+// cropped, and can't make a sharp 1600px catalog image.
+const MIN_PHOTO_SIDE = 1200;
 // Foreground pieces smaller than this share of the largest one are dust.
 const MIN_COMPONENT_SHARE = 0.03;
 // A stone whose outline spans fewer pixels than this ends up enlarged in the
-// 1600px catalog image and looks soft, however well it was focused.
-const MIN_STONE_PX = 600;
-// Laplacian variance, measured on the stone at SHARPNESS_SIDE (never
-// enlarged). Barak's own catalog shots score 78 and up, the same shots blurred
-// by 3px score 53 and down. Revisit once real station photos exist.
+// 1600px catalog image (where it spans OUT_SIDE * FILL = 832px) by more
+// than 1.85x and looks soft, however well it was focused.
+const MIN_STONE_PX = 450;
+// Laplacian variance over the stone's own grey-level spread, measured at
+// SHARPNESS_SIDE (never enlarged). Raw Laplacian variance also falls with
+// contrast, which flagged every pale emerald as blurry. Station photos and
+// Barak catalog stones score 1.04 and up, the same blurred by 1.5px 0.62
+// and down (one mild case 0.88), by 3px 0.24 and down.
 const SHARPNESS_SIDE = 600;
-const BLUR_THRESHOLD = 60;
+const BLUR_THRESHOLD = 0.7;
 // A bigger tilt is a deliberate pose (a pear shot on the diagonal), not a
 // crooked stone. The station's holder keeps accidental tilt well under this.
 const MAX_STRAIGHTEN = 10;
@@ -70,6 +91,8 @@ const median = (arr) => {
   return s.length ? s[s.length >> 1] : 0;
 };
 
+const MAX_FLOOD_LOW = 60;
+
 function estimateBackground({ data, width, height }) {
   const band = Math.max(4, Math.round(Math.min(width, height) * 0.03));
   const rs = [], gs = [], bs = [];
@@ -92,7 +115,10 @@ function estimateBackground({ data, width, height }) {
   }
   ds.sort((a, b) => a - b);
   const spread = ds.length ? ds[Math.floor(ds.length * 0.9)] : 0;
-  const low = Math.max(20, spread * 1.5);
+  // Tweezers, a finger or a pen mark on the frame edge inflate the spread.
+  // Uncapped, the flood below then runs straight through a pale stone and
+  // the photo comes back as "no stone".
+  const low = Math.min(MAX_FLOOD_LOW, Math.max(20, spread * 1.5));
   return { color, spread, low, high: low * 1.8 };
 }
 
@@ -408,6 +434,45 @@ function stonesFrom(fg, width, height) {
   return { mask, groups, label: grouped.label };
 }
 
+// Tweezers holding the stone, or a pin under it, join it to the frame edge
+// as one object. Their arms are thin and the stone is not, so an opening
+// wider than an arm cuts them off and leaves the stone. Only objects that
+// reach the frame edge are opened: a parcel's small stones lying free in the
+// frame would not survive it. Returns null when nothing was detached.
+const TOOL_ARM = 0.02;
+function detachTools(mask, width, height) {
+  const { kept, label } = components(mask, width, height);
+  const edgeIds = new Set(kept.filter((c) => touchesFrame(c, width, height)).map((c) => c.id));
+  if (!edgeIds.size) return null;
+  const edge = new Uint8Array(mask.length);
+  for (let p = 0; p < mask.length; p++) if (edgeIds.has(label[p])) edge[p] = 1;
+  const r = Math.max(4, Math.round(Math.min(width, height) * TOOL_ARM));
+  const opened = morph(morph(edge, width, height, r, true), width, height, r, false);
+  const bodies = components(opened, width, height);
+  const free = new Set(bodies.kept.filter((c) => !touchesFrame(c, width, height)).map((c) => c.id));
+  if (!free.size) return null;
+  const out = new Uint8Array(mask.length);
+  for (let p = 0; p < mask.length; p++) {
+    if (free.has(bodies.label[p]) || (mask[p] && !edgeIds.has(label[p]))) out[p] = 1;
+  }
+  return out;
+}
+
+// Pen marks, scratches and hairs on the backdrop are lines; even a melee
+// stone in a parcel is a blob several times thicker than this.
+const MIN_THICKNESS = 0.008;
+function withoutLines(mask, width, height) {
+  const r = Math.max(2, Math.round((Math.min(width, height) * MIN_THICKNESS) / 2));
+  const core = morph(mask, width, height, r, true);
+  const { kept, label } = components(mask, width, height);
+  const solid = new Set();
+  for (let p = 0; p < mask.length; p++) if (core[p] && label[p]) solid.add(label[p]);
+  const keep = new Set(kept.filter((c) => solid.has(c.id)).map((c) => c.id));
+  const out = new Uint8Array(mask.length);
+  for (let p = 0; p < mask.length; p++) if (keep.has(label[p])) out[p] = 1;
+  return out;
+}
+
 const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
 
 function convexHull(pts) {
@@ -505,18 +570,25 @@ async function analyse(img, bg) {
   const isBg = floodBackground(img, bg);
   const coarse = new Uint8Array(width * height);
   for (let p = 0; p < coarse.length; p++) coarse[p] = isBg[p] ? 0 : 1;
-  let found = stonesFrom(coarse, width, height);
+  const detached = detachTools(coarse, width, height);
+  let found = stonesFrom(withoutLines(detached || coarse, width, height), width, height);
   if (!found.groups.length) return found;
 
   const r = Math.max(3, Math.round(Math.min(width, height) * 0.015));
   const objects = components(morph(morph(found.mask, width, height, r, false), width, height, r, true), width, height);
 
   const margin = (share) => Math.max(4, Math.round(Math.min(width, height) * share));
+  // With a tool cut off, the second round may only refine the stone's edge,
+  // not find the tool again, and the tool is no backdrop to model.
+  const zone = detached ? morph(found.mask, width, height, margin(0.006), false) : null;
   let precise = null;
   for (const share of [0.03, 0.015]) {
     const exclude = morph((precise || found).mask, width, height, margin(share), false);
+    if (detached) for (let p = 0; p < exclude.length; p++) exclude[p] |= coarse[p];
     const surface = await backgroundSurface(img, exclude);
-    const next = stonesFrom(classify(img, surface), width, height);
+    const fg = classify(img, surface);
+    if (zone) for (let p = 0; p < fg.length; p++) fg[p] &= zone[p];
+    const next = stonesFrom(fg, width, height);
     if (!next.groups.length) break;
     precise = next;
   }
@@ -570,12 +642,13 @@ async function analyse(img, bg) {
     if (claimed.has(g.id) || g.solidity < MIN_SOLIDITY) continue;
     for (let p = 0; p < mask.length; p++) if (precise.label[p] === g.id) mask[p] = 1;
   }
+  mask.set(withoutLines(mask, width, height));
 
   const grouped = components(mask, width, height);
   const ids = new Set(grouped.kept.map((g) => g.id));
   for (let p = 0; p < mask.length; p++) if (mask[p] && !ids.has(grouped.label[p])) mask[p] = 0;
   const groups = grouped.kept.map((g) => ({ ...g, moments: momentsOf(grouped.label, g.id, g, width) }));
-  return { mask, groups, protectedObjects };
+  return { mask, groups, protectedObjects, toolRemoved: Boolean(detached) };
 }
 
 const unionBox = (groups) => groups.reduce(
@@ -618,17 +691,18 @@ async function sharpnessOf(img, box) {
     .raw()
     .toBuffer({ resolveWithObject: true });
   const w = info.width, h = info.height;
-  let sum = 0, sumSq = 0, count = 0;
+  let sum = 0, sumSq = 0, grey = 0, greySq = 0, count = 0;
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
       const p = y * w + x;
       const v = data[p - 1] + data[p + 1] + data[p - w] + data[p + w] - 4 * data[p];
-      sum += v; sumSq += v * v; count++;
+      sum += v; sumSq += v * v; grey += data[p]; greySq += data[p] * data[p]; count++;
     }
   }
   if (!count) return 0;
-  const mean = sum / count;
-  return sumSq / count - mean * mean;
+  const laplacian = sumSq / count - (sum / count) ** 2;
+  const spread = Math.sqrt(Math.max(0, greySq / count - (grey / count) ** 2));
+  return laplacian / Math.max(4, spread);
 }
 
 function exposureOf({ data }, mask) {
@@ -647,12 +721,21 @@ function exposureOf({ data }, mask) {
   };
 }
 
-async function assessQuality(img, bg, { groups, mask }) {
+// Issues come back most important first; the station shows the first one
+// as the headline. `no_stone` is the only one that keeps a photo from being
+// saved, and it carries the likely cause along with it.
+async function assessQuality(img, bg, { groups, mask, protectedObjects, toolRemoved }) {
   const issues = [];
   const imgArea = img.width * img.height;
   const stoneArea = groups.reduce((s, g) => s + g.moments.area, 0);
+  const bgLum = 0.299 * bg.color.r + 0.587 * bg.color.g + 0.114 * bg.color.b;
   if (!groups.length || stoneArea < imgArea * 0.002) {
-    return { ok: false, issues: ['no_stone'], metrics: { backgroundSpread: Math.round(bg.spread) } };
+    const cause = bgLum < 150 ? 'dark_background' : groups.length ? 'stone_too_small' : 'low_contrast';
+    return {
+      ok: false,
+      issues: ['no_stone', cause],
+      metrics: { backgroundLuminance: Math.round(bgLum), backgroundSpread: Math.round(bg.spread) },
+    };
   }
   const box = unionBox(groups);
   const touches = box.x0 <= 1 || box.y0 <= 1 || box.x1 >= img.width - 2 || box.y1 >= img.height - 2;
@@ -662,22 +745,26 @@ async function assessQuality(img, bg, { groups, mask }) {
 
   const sharpness = await sharpnessOf(img, box);
   if (sharpness < BLUR_THRESHOLD && stonePx >= MIN_STONE_PX) issues.push('blurry');
+  if (Math.min(img.width, img.height) < MIN_PHOTO_SIDE) issues.push('low_resolution');
 
   const { meanLum, clippedShare } = exposureOf(img, mask);
   if (meanLum < 40) issues.push('too_dark');
   if (clippedShare > 0.25) issues.push('too_bright');
 
-  // The backdrop is modelled locally, so ordinary fall-off and a stone's own
-  // shadow clean up fine; only a backdrop this patchy still leaves marks.
-  const bgLum = 0.299 * bg.color.r + 0.587 * bg.color.g + 0.114 * bg.color.b;
+  // Everything outside a precise outline ends up white whatever the backdrop
+  // looked like, so a patchy backdrop only shows when a pale stone fell back
+  // to the generous outline, which carries some of it along.
   if (bgLum < 150) issues.push('dark_background');
-  if (bg.spread > 90) issues.push('uneven_background');
+  if (bg.spread > 90 && protectedObjects) issues.push('uneven_background');
+  // Cut away, but where tweezers or a finger cover the girdle there is no
+  // stone to show, and inventing it is not an option.
+  if (toolRemoved) issues.push('tool_in_photo');
 
   return {
     ok: issues.length === 0,
     issues,
     metrics: {
-      sharpness: Math.round(sharpness),
+      sharpness: Math.round(sharpness * 100) / 100,
       stonePx,
       stoneLuminance: Math.round(meanLum),
       clippedShare: Math.round(clippedShare * 1000) / 1000,
@@ -694,31 +781,64 @@ async function assessQuality(img, bg, { groups, mask }) {
 // backdrop, so the outline is pulled in by that much and then softened,
 // which gives the anti-aliased edge of a studio cut-out instead of a grey
 // rim or a jagged one.
-function composeOnWhite(img, mask) {
+function composeOnWhite(img, mask, box) {
   const { data, width, height } = img;
   const pull = Math.max(1, Math.round(Math.min(width, height) / 1500));
   const core = morph(mask, width, height, pull, true);
   const soft = new Float32Array(core.length);
   for (let p = 0; p < core.length; p++) soft[p] = core[p];
   const alpha = boxMean(boxMean(soft, width, height, pull), width, height, pull);
+  return onWhite(data, alpha, width, height, box);
+}
+
+// The stone's silhouette, dropped a little and blurred, as 0-255 per pixel.
+async function shadowUnder(alpha, width, height, box) {
+  const size = Math.max(box.x1 - box.x0, box.y1 - box.y0) + 1;
+  const drop = Math.round(size * SHADOW_DROP);
+  const shifted = Buffer.alloc(width * height);
+  for (let p = drop * width; p < shifted.length; p++) shifted[p] = alpha[p - drop * width] >= 0.5 ? 255 : 0;
+  const scale = Math.min(1, 480 / Math.max(width, height));
+  const lw = Math.max(1, Math.round(width * scale));
+  const lh = Math.max(1, Math.round(height * scale));
+  const small = await sharp(shifted, { raw: { width, height, channels: 1 } })
+    .resize(lw, lh, { fit: 'fill' })
+    .toColourspace('b-w')
+    .raw()
+    .toBuffer();
+  return sharp(small, { raw: { width: lw, height: lh, channels: 1 } })
+    .blur(Math.max(0.5, size * SHADOW_SOFTNESS * scale))
+    .resize(width, height, { fit: 'fill', kernel: 'cubic' })
+    .toColourspace('b-w')
+    .raw()
+    .toBuffer();
+}
+
+// Stone pixels where alpha is 1, as shot; white with a soft shadow where it
+// is 0; a blend of the two along the edge.
+async function onWhite(data, alpha, width, height, box) {
+  const shadow = await shadowUnder(alpha, width, height, box);
   const out = Buffer.alloc(data.length, 255);
   for (let p = 0; p < alpha.length; p++) {
-    const a = alpha[p];
-    if (a <= 0) continue;
+    const a = Math.min(1, Math.max(0, alpha[p]));
     const i = p * 3;
     if (a >= 1) {
       out[i] = data[i]; out[i + 1] = data[i + 1]; out[i + 2] = data[i + 2];
       continue;
     }
-    out[i] = Math.round(data[i] * a + 255 * (1 - a));
-    out[i + 1] = Math.round(data[i + 1] * a + 255 * (1 - a));
-    out[i + 2] = Math.round(data[i + 2] * a + 255 * (1 - a));
+    const white = 255 * (1 - (SHADOW_STRENGTH * shadow[p]) / 255);
+    if (a <= 0) {
+      out[i] = out[i + 1] = out[i + 2] = Math.round(white);
+      continue;
+    }
+    out[i] = Math.round(data[i] * a + white * (1 - a));
+    out[i + 1] = Math.round(data[i + 1] * a + white * (1 - a));
+    out[i + 2] = Math.round(data[i + 2] * a + white * (1 - a));
   }
   return { data: out, width, height };
 }
 
-// Paints `img` onto a white square centred on `box`, sized so the box fills
-// FILL of it, then scales to the output size.
+// Paints `img` onto a white square sized so `box` fills FILL of it, its
+// centre at CENTRE_Y from the top, then scales to the output size.
 async function frame(img, box) {
   const bw = box.x1 - box.x0 + 1;
   const bh = box.y1 - box.y0 + 1;
@@ -726,7 +846,7 @@ async function frame(img, box) {
   const cx = (box.x0 + box.x1) / 2;
   const cy = (box.y0 + box.y1) / 2;
   const left = Math.round(cx - side / 2);
-  const top = Math.round(cy - side / 2);
+  const top = Math.round(cy - side * CENTRE_Y);
   const out = Buffer.alloc(side * side * 3, 255);
   for (let y = 0; y < side; y++) {
     const sy = top + y;
@@ -761,10 +881,11 @@ async function processClean(buffer) {
     ...quality.metrics,
     straightenedBy: Math.round(skew * 10) / 10,
     protectedOutlines: a.protectedObjects || 0,
+    toolRemoved: Boolean(a.toolRemoved),
   };
-  if (!a.groups.length) return { image: null, quality };
+  if (!a.groups.length || quality.issues[0] === 'no_stone') return { image: null, quality };
   const box = unionBox(a.groups);
-  const image = await frame(composeOnWhite(img, a.mask), box);
+  const image = await frame(await composeOnWhite(img, a.mask, box), box);
   return { image, quality, geometry: { rotateBy: skew, fill: bg.color, box } };
 }
 
@@ -833,17 +954,14 @@ async function processCutout(buffer, apiKey, geometry) {
   // brings it back to the one or two pixels a real edge spans.
   const steep = Math.max(1, Math.min(4, upscale / 1.5));
 
-  const out = Buffer.alloc(n * 3, 255);
+  const edge = new Float32Array(n);
   for (let p = 0; p < n; p++) {
     let a = core[p] ? 1 : Math.min(1, Math.max(0, (alpha[p] / 255 - 0.5) * steep + 0.5));
     if (!keptIds.has(label[p]) && !core[p] && alpha[p] >= 128) a = 0;
-    if (a <= 0) continue;
-    const i = p * 3;
-    out[i] = Math.round(data[i] * a + 255 * (1 - a));
-    out[i + 1] = Math.round(data[i + 1] * a + 255 * (1 - a));
-    out[i + 2] = Math.round(data[i + 2] * a + 255 * (1 - a));
+    edge[p] = a;
   }
-  const image = await frame({ data: out, width: cw, height: ch }, unionBox(kept));
+  const box = unionBox(kept);
+  const image = await frame(await onWhite(data, edge, cw, ch, box), box);
   return { image, error: null };
 }
 

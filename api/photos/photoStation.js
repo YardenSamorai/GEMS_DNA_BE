@@ -15,6 +15,8 @@
 // Capture lifecycle: pending -> uploading -> uploaded
 //                    pending -> rejected
 //                    pending -> replaced   (the same stone was shot again)
+//                    failed                (no stone found; kept, with the
+//                                           original, to tune the checks)
 // A failed FTP upload goes back to pending with upload_error set, so it can
 // simply be approved again.
 
@@ -211,7 +213,7 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
         `SELECT COUNT(*) FILTER (WHERE captured_at >= date_trunc('day', NOW()))::int AS today,
                 COUNT(*) FILTER (WHERE captured_at >= date_trunc('week', NOW()))::int AS week
            FROM stone_photo_captures
-          WHERE captured_by = $1 AND status <> 'replaced'`,
+          WHERE captured_by = $1 AND status NOT IN ('replaced', 'failed')`,
         [req.teamCtx.actorUserId]
       );
       const byStatus = Object.fromEntries(counts.rows.map((r) => [r.status, r.n]));
@@ -271,7 +273,7 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 12));
       const { rows } = await pool.query(
         `SELECT * FROM stone_photo_captures
-          WHERE captured_by = $1 AND status <> 'replaced'
+          WHERE captured_by = $1 AND status NOT IN ('replaced', 'failed')
           ORDER BY captured_at DESC LIMIT $2`,
         [req.teamCtx.actorUserId, limit]
       );
@@ -295,7 +297,7 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       const row = rows[0];
       const last = await pool.query(
         `SELECT * FROM stone_photo_captures
-          WHERE sku = $1 AND status <> 'replaced'
+          WHERE sku = $1 AND status NOT IN ('replaced', 'failed')
           ORDER BY captured_at DESC LIMIT 1`,
         [row.sku]
       );
@@ -322,6 +324,14 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
 
       const clean = await processClean(req.file.buffer);
       if (!clean.image) {
+        const ctx = req.teamCtx;
+        putBlob(sku, 'failed', req.file.buffer)
+          .then((url) => pool.query(
+            `INSERT INTO stone_photo_captures (sku, status, original_url, quality, captured_by, captured_by_name)
+             VALUES ($1, 'failed', $2, $3, $4, $5)`,
+            [sku, url, JSON.stringify(clean.quality), ctx.actorUserId, ctx.memberName || ctx.actorName || null]
+          ))
+          .catch((e) => console.error('photo-station failed-shot log error:', e.message));
         return res.status(422).json({ error: 'No stone found in the photo', quality: clean.quality });
       }
       const cutout = await processCutout(req.file.buffer, process.env.REMOVE_BG_API_KEY, clean.geometry)
