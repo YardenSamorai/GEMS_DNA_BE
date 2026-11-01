@@ -4,6 +4,8 @@
 //
 //   GET  /api/photo-station/status              what is configured
 //   GET  /api/photo-station/queue               stones still needing a photo, most valuable first
+//   GET  /api/photo-station/search?q=           SKUs matching what is being typed
+//   GET  /api/photo-station/mine                the caller's recent shots and their fate
 //   GET  /api/photo-station/stone/:sku          one stone, for a scanned barcode
 //   POST /api/photo-station/captures            upload + process a shot (multipart: photo, sku)
 //   GET  /api/photo-station/captures            review list (manager)
@@ -48,9 +50,32 @@ const stoneSummary = (row, onMemo) => ({
   groupingType: row.grouping_type || null,
   stones: row.stones != null ? Number(row.stones) : null,
   branch: row.branch || null,
+  location: row.location || null,
+  box: row.box || null,
+  holder: row.holder || null,
   onMemo,
   hasPhoto: hasPhoto(row),
 });
+
+// Queue tabs. Lots without a grouping type are parcels in practice.
+const KINDS = { single: 'Single', pair: 'Pair', set: 'Set', parcel: 'Parcel' };
+const kindOf = (row) => {
+  const g = String(row.grouping_type || '').toLowerCase();
+  return KINDS[g] ? g : 'parcel';
+};
+
+// Generic bulk lots ("LOT PS", "LOT EC-2") hold hundreds of carats in the
+// factory; they are not what a photographer at the office should start with.
+const isBulkLot = (sku) => /^LOT\b/i.test(String(sku || ''));
+
+const countBy = (rows, key) => {
+  const out = {};
+  for (const r of rows) {
+    const k = key(r);
+    out[k] = (out[k] || 0) + 1;
+  }
+  return out;
+};
 
 const captureOut = (c) => ({
   id: c.id,
@@ -147,9 +172,11 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       const branch = String(req.query.branch || DEFAULT_BRANCH).trim();
       const category = String(req.query.category || DEFAULT_CATEGORY).trim().toLowerCase();
       const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 30));
+      const kind = String(req.query.kind || 'all').toLowerCase();
+      const location = String(req.query.location || 'all').trim();
       const { rows } = await pool.query(
         `SELECT s.sku, s.shape, s.weight, s.category, s.color, s.grouping_type, s.stones,
-                s.branch, s.location, s.total_price, s.image, s.additional_pictures
+                s.branch, s.location, s.box, s.holder, s.total_price, s.image, s.additional_pictures
            FROM soap_stones s
           WHERE s.sku IS NOT NULL
             AND ($1 = '' OR s.branch = $1)
@@ -161,27 +188,96 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       );
       const waiting = rows
         .filter((r) => !hasPhoto(r) && !computeOnMemo(r.location))
-        .sort((a, b) => (Number(b.total_price) || 0) - (Number(a.total_price) || 0));
+        .sort((a, b) => isBulkLot(a.sku) - isBulkLot(b.sku) || (Number(b.total_price) || 0) - (Number(a.total_price) || 0));
+      // Each filter's counts are taken with the other filter applied, so the
+      // numbers on the chips are what tapping them would show.
+      const atLocation = location === 'all' ? waiting : waiting.filter((r) => (r.location || '') === location);
+      const ofKind = kind === 'all' ? waiting : waiting.filter((r) => kindOf(r) === kind);
+      const shown = atLocation.filter((r) => kind === 'all' || kindOf(r) === kind);
+      const rejected = shown.length
+        ? await pool.query(
+          `SELECT DISTINCT ON (sku) sku, reject_reason, reviewed_at FROM stone_photo_captures
+            WHERE status = 'rejected' AND sku = ANY($1)
+            ORDER BY sku, reviewed_at DESC`,
+          [shown.slice(0, limit).map((r) => r.sku)]
+        )
+        : { rows: [] };
+      const rejectedBySku = new Map(rejected.rows.map((r) => [r.sku, r]));
       const counts = await pool.query(
         `SELECT status, COUNT(*)::int AS n FROM stone_photo_captures
           WHERE status IN ('pending', 'uploaded') GROUP BY status`
       );
       const mine = await pool.query(
-        `SELECT COUNT(*)::int AS n FROM stone_photo_captures
-          WHERE captured_by = $1 AND captured_at >= date_trunc('day', NOW())
-            AND status <> 'replaced'`,
+        `SELECT COUNT(*) FILTER (WHERE captured_at >= date_trunc('day', NOW()))::int AS today,
+                COUNT(*) FILTER (WHERE captured_at >= date_trunc('week', NOW()))::int AS week
+           FROM stone_photo_captures
+          WHERE captured_by = $1 AND status <> 'replaced'`,
         [req.teamCtx.actorUserId]
       );
       const byStatus = Object.fromEntries(counts.rows.map((r) => [r.status, r.n]));
       res.json({
         remaining: waiting.length,
+        matching: shown.length,
         awaitingReview: byStatus.pending || 0,
         uploaded: byStatus.uploaded || 0,
-        mineToday: mine.rows[0]?.n || 0,
-        items: waiting.slice(0, limit).map((r, i) => ({ rank: i + 1, ...stoneSummary(r, false) })),
+        mineToday: mine.rows[0]?.today || 0,
+        mineWeek: mine.rows[0]?.week || 0,
+        kinds: { all: atLocation.length, ...countBy(atLocation, kindOf) },
+        locations: Object.entries(countBy(ofKind, (r) => r.location || ''))
+          .filter(([name]) => name)
+          .sort((a, b) => b[1] - a[1])
+          .map(([name, n]) => ({ name, n })),
+        items: shown.slice(0, limit).map((r, i) => {
+          const rej = rejectedBySku.get(r.sku);
+          return {
+            rank: i + 1,
+            ...stoneSummary(r, false),
+            lastRejected: rej ? { reason: rej.reject_reason, at: rej.reviewed_at } : null,
+          };
+        }),
       });
     } catch (e) {
       console.error('photo-station queue error:', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get('/api/photo-station/search', ...shooter, async (req, res) => {
+    try {
+      const q = String(req.query.q || '').trim();
+      if (!q) return res.json({ items: [] });
+      const compact = q.toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const { rows } = await pool.query(
+        `SELECT sku, shape, weight, category, color, grouping_type, stones, branch, location, box, holder,
+                image, additional_pictures
+           FROM soap_stones
+          WHERE sku ILIKE '%' || $3 || '%'
+             OR ($2 <> '' AND regexp_replace(UPPER(sku), '[^A-Z0-9]', '', 'g') LIKE '%' || $2 || '%')
+          ORDER BY (UPPER(sku) = UPPER($1)) DESC,
+                   ($2 <> '' AND regexp_replace(UPPER(sku), '[^A-Z0-9]', '', 'g') LIKE $2 || '%') DESC,
+                   LENGTH(sku), sku
+          LIMIT 8`,
+        [q, compact, q.replace(/[\\%_]/g, '\\$&')]
+      );
+      res.json({ items: rows.map((r) => stoneSummary(r, computeOnMemo(r.location))) });
+    } catch (e) {
+      console.error('photo-station search error:', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get('/api/photo-station/mine', ...shooter, async (req, res) => {
+    try {
+      const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 12));
+      const { rows } = await pool.query(
+        `SELECT * FROM stone_photo_captures
+          WHERE captured_by = $1 AND status <> 'replaced'
+          ORDER BY captured_at DESC LIMIT $2`,
+        [req.teamCtx.actorUserId, limit]
+      );
+      res.json({ items: rows.map(captureOut) });
+    } catch (e) {
+      console.error('photo-station mine error:', e);
       res.status(500).json({ error: e.message });
     }
   });
@@ -190,7 +286,7 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
     try {
       const code = String(req.params.sku || '').trim();
       const { rows } = await pool.query(
-        `SELECT sku, shape, weight, category, color, grouping_type, stones, branch, location,
+        `SELECT sku, shape, weight, category, color, grouping_type, stones, branch, location, box, holder,
                 image, additional_pictures
            FROM soap_stones WHERE UPPER(sku) = UPPER($1) LIMIT 1`,
         [code]
@@ -263,7 +359,7 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       const status = String(req.query.status || 'pending');
       const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 60));
       const { rows } = await pool.query(
-        `SELECT c.*, s.shape, s.weight, s.category, s.color, s.grouping_type, s.stones
+        `SELECT c.*, s.shape, s.weight, s.category, s.color, s.grouping_type, s.stones, s.location
            FROM stone_photo_captures c
            LEFT JOIN soap_stones s ON s.sku = c.sku
           WHERE c.status = $1
@@ -281,6 +377,7 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
             color: r.color || null,
             groupingType: r.grouping_type || null,
             stones: r.stones != null ? Number(r.stones) : null,
+            location: r.location || null,
           },
         })),
       });
