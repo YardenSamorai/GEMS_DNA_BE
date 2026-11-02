@@ -1,5 +1,5 @@
-// AI version of a station photo, made in the background after a capture is
-// saved and offered to the reviewer next to the clean one.
+// AI version of a station photo, made in the background when a reviewer asks
+// for it and offered next to the clean one.
 //
 // An OpenAI model edits the photo as shot: background to white, tweezers and
 // dust gone, stone centred and straight. Measured on real captures it does

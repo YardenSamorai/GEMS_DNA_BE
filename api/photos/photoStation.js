@@ -396,34 +396,62 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       const { rows } = await pool.query(
         `INSERT INTO stone_photo_captures
            (sku, status, original_url, clean_url, cutout_url, cutout_error, quality,
-            captured_by, captured_by_name, ai_status)
-         VALUES ($1, 'pending', $2, $3, $4, $5, $6, $7, $8, $9)
+            captured_by, captured_by_name)
+         VALUES ($1, 'pending', $2, $3, $4, $5, $6, $7, $8)
          RETURNING *`,
         [sku, originalUrl, cleanUrl, cutoutUrl, cutout.error || null, JSON.stringify(clean.quality),
-          ctx.actorUserId, ctx.memberName || ctx.actorName || null, ai.isConfigured() ? 'working' : null]
+          ctx.actorUserId, ctx.memberName || ctx.actorName || null]
       );
       res.json(captureOut(rows[0]));
-
-      if (ai.isConfigured()) {
-        const id = rows[0].id;
-        const original = req.file.buffer;
-        ai.enqueue(() => ai.processAi(original, clean.image))
-          .then((image) => putBlob(sku, 'ai', image))
-          .then((url) => pool.query(
-            `UPDATE stone_photo_captures SET ai_url = $2, ai_status = 'ready', ai_error = NULL WHERE id = $1`,
-            [id, url]
-          ))
-          .catch((e) => {
-            console.error('photo-station AI edit error:', e.message);
-            return pool.query(
-              `UPDATE stone_photo_captures SET ai_status = 'failed', ai_error = $2 WHERE id = $1`,
-              [id, String(e.message).slice(0, 300)]
-            );
-          })
-          .catch((e) => console.error('photo-station AI status error:', e.message));
-      }
     } catch (e) {
       console.error('photo-station capture error:', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // The AI version is paid per photo (about $0.28), so it is made only when a
+  // reviewer asks for it, in the background, and at most once per capture
+  // unless the previous attempt failed.
+  app.post('/api/photo-station/captures/:id/ai', ...reviewer, async (req, res) => {
+    try {
+      if (!ai.isConfigured()) return res.status(503).json({ error: 'The AI version is not configured' });
+      const id = parseInt(req.params.id, 10);
+      const claimed = await pool.query(
+        `UPDATE stone_photo_captures SET ai_status = 'working', ai_error = NULL
+          WHERE id = $1 AND status = 'pending' AND clean_url IS NOT NULL
+            AND (ai_status IS NULL OR ai_status = 'failed')
+          RETURNING *`,
+        [id]
+      );
+      if (!claimed.rows.length) {
+        const current = await pool.query(`SELECT * FROM stone_photo_captures WHERE id = $1`, [id]);
+        if (!current.rows.length) return res.status(404).json({ error: 'Capture not found' });
+        return res.json(captureOut(current.rows[0]));
+      }
+      const capture = claimed.rows[0];
+      res.json(captureOut(capture));
+
+      const read = async (url) => {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`Could not read the stored photo (${r.status})`);
+        return Buffer.from(await r.arrayBuffer());
+      };
+      ai.enqueue(async () => ai.processAi(await read(capture.original_url), await read(capture.clean_url)))
+        .then((image) => putBlob(capture.sku, 'ai', image))
+        .then((url) => pool.query(
+          `UPDATE stone_photo_captures SET ai_url = $2, ai_status = 'ready', ai_error = NULL WHERE id = $1`,
+          [id, url]
+        ))
+        .catch((e) => {
+          console.error('photo-station AI edit error:', e.message);
+          return pool.query(
+            `UPDATE stone_photo_captures SET ai_status = 'failed', ai_error = $2 WHERE id = $1`,
+            [id, String(e.message).slice(0, 300)]
+          );
+        })
+        .catch((e) => console.error('photo-station AI status error:', e.message));
+    } catch (e) {
+      console.error('photo-station AI request error:', e);
       res.status(500).json({ error: e.message });
     }
   });
