@@ -22,6 +22,7 @@
 
 const multer = require('multer');
 const { processClean, processCutout } = require('../../utils/stonePhoto');
+const ai = require('../../utils/aiStonePhoto');
 const barak = require('../../utils/barakPictures');
 
 const DEFAULT_BRANCH = 'Israel';
@@ -87,6 +88,9 @@ const captureOut = (c) => ({
   cleanUrl: c.clean_url,
   cutoutUrl: c.cutout_url,
   cutoutError: c.cutout_error,
+  aiUrl: c.ai_url,
+  aiStatus: c.ai_status,
+  aiError: c.ai_error,
   chosenVariant: c.chosen_variant,
   quality: c.quality,
   capturedBy: c.captured_by_name,
@@ -128,6 +132,17 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       `);
       await pool.query(`CREATE INDEX IF NOT EXISTS idx_stone_photo_captures_sku ON stone_photo_captures(sku)`);
       await pool.query(`CREATE INDEX IF NOT EXISTS idx_stone_photo_captures_status ON stone_photo_captures(status)`);
+      await pool.query(`
+        ALTER TABLE stone_photo_captures
+          ADD COLUMN IF NOT EXISTS ai_url TEXT,
+          ADD COLUMN IF NOT EXISTS ai_status TEXT,
+          ADD COLUMN IF NOT EXISTS ai_error TEXT
+      `);
+      // A restart kills edits in flight; they would otherwise spin forever.
+      await pool.query(
+        `UPDATE stone_photo_captures SET ai_status = 'failed', ai_error = 'Interrupted by a server restart'
+          WHERE ai_status = 'working'`
+      );
       console.log('stone_photo_captures ready');
     } catch (err) {
       console.error('stone_photo_captures table creation error:', err);
@@ -162,6 +177,8 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       canReview: canReview(req.teamCtx),
       storage: !!(blobPut && process.env.BLOB_READ_WRITE_TOKEN),
       cutout: !!process.env.REMOVE_BG_API_KEY,
+      ai: ai.isConfigured(),
+      aiModel: ai.isConfigured() ? ai.MODEL : null,
       ftp: barak.isConfigured(),
       suffix: barak.SUFFIX,
     };
@@ -379,13 +396,32 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       const { rows } = await pool.query(
         `INSERT INTO stone_photo_captures
            (sku, status, original_url, clean_url, cutout_url, cutout_error, quality,
-            captured_by, captured_by_name)
-         VALUES ($1, 'pending', $2, $3, $4, $5, $6, $7, $8)
+            captured_by, captured_by_name, ai_status)
+         VALUES ($1, 'pending', $2, $3, $4, $5, $6, $7, $8, $9)
          RETURNING *`,
         [sku, originalUrl, cleanUrl, cutoutUrl, cutout.error || null, JSON.stringify(clean.quality),
-          ctx.actorUserId, ctx.memberName || ctx.actorName || null]
+          ctx.actorUserId, ctx.memberName || ctx.actorName || null, ai.isConfigured() ? 'working' : null]
       );
       res.json(captureOut(rows[0]));
+
+      if (ai.isConfigured()) {
+        const id = rows[0].id;
+        const original = req.file.buffer;
+        ai.enqueue(() => ai.processAi(original, clean.image))
+          .then((image) => putBlob(sku, 'ai', image))
+          .then((url) => pool.query(
+            `UPDATE stone_photo_captures SET ai_url = $2, ai_status = 'ready', ai_error = NULL WHERE id = $1`,
+            [id, url]
+          ))
+          .catch((e) => {
+            console.error('photo-station AI edit error:', e.message);
+            return pool.query(
+              `UPDATE stone_photo_captures SET ai_status = 'failed', ai_error = $2 WHERE id = $1`,
+              [id, String(e.message).slice(0, 300)]
+            );
+          })
+          .catch((e) => console.error('photo-station AI status error:', e.message));
+      }
     } catch (e) {
       console.error('photo-station capture error:', e);
       res.status(500).json({ error: e.message });
@@ -427,7 +463,7 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
 
   app.post('/api/photo-station/captures/:id/approve', ...reviewer, async (req, res) => {
     const id = parseInt(req.params.id, 10);
-    const variant = req.body?.variant === 'cutout' ? 'cutout' : 'clean';
+    const variant = ['cutout', 'ai'].includes(req.body?.variant) ? req.body.variant : 'clean';
     const ctx = req.teamCtx;
     try {
       if (!barak.isConfigured()) {
@@ -444,7 +480,7 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       );
       if (!claimed.rows.length) return res.status(409).json({ error: 'This photo is no longer waiting for review' });
       const capture = claimed.rows[0];
-      const url = variant === 'cutout' ? capture.cutout_url : capture.clean_url;
+      const url = { cutout: capture.cutout_url, ai: capture.ai_url, clean: capture.clean_url }[variant];
       try {
         if (!url) throw new Error(`There is no ${variant} version of this photo`);
         const imgRes = await fetch(url);

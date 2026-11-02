@@ -23,8 +23,10 @@
 // a station photo sits among them without standing out: a 1600px square of
 // pure white, the stone's longer side at 52% of the frame, centred
 // horizontally and a touch below the middle, with only a whisper of shadow
-// under it. A generative model is deliberately not part of this: it would
-// repaint the stone, and for an emerald the colour is the product.
+// under it. A generative model is not part of either path: it repaints the
+// stone, and for an emerald the colour is the product. The optional AI
+// version (`restyle` below) starts from one and is offered only as a third
+// choice, with its colour put back to the one measured here.
 
 const sharp = require('sharp');
 
@@ -965,4 +967,71 @@ async function processCutout(buffer, apiKey, geometry) {
   return { image, error: null };
 }
 
-module.exports = { processClean, processCutout };
+const LINEAR = Float64Array.from({ length: 256 }, (_, v) => {
+  const c = v / 255;
+  return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+});
+const D65 = [0.95047, 1, 1.08883];
+const labF = (t) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+const labFi = (t) => (t > 0.206893 ? t * t * t : (t - 16 / 116) / 7.787);
+const toByte = (c) => {
+  const v = c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055;
+  return Math.max(0, Math.min(255, Math.round(v * 255)));
+};
+function toLab(data, i, out) {
+  const r = LINEAR[data[i]], g = LINEAR[data[i + 1]], b = LINEAR[data[i + 2]];
+  const fx = labF((r * 0.4124 + g * 0.3576 + b * 0.1805) / D65[0]);
+  const fy = labF(r * 0.2126 + g * 0.7152 + b * 0.0722);
+  const fz = labF((r * 0.0193 + g * 0.1192 + b * 0.9505) / D65[2]);
+  out[0] = 116 * fy - 16; out[1] = 500 * (fx - fy); out[2] = 200 * (fy - fz);
+}
+function fromLab(lab, data, i) {
+  const fy = (lab[0] + 16) / 116;
+  const x = labFi(fy + lab[1] / 500) * D65[0], y = labFi(fy), z = labFi(fy - lab[2] / 200) * D65[2];
+  data[i] = toByte(x * 3.2406 - y * 1.5372 - z * 0.4986);
+  data[i + 1] = toByte(-x * 0.9689 + y * 1.8758 + z * 0.0415);
+  data[i + 2] = toByte(x * 0.0557 - y * 0.204 + z * 1.057);
+}
+
+// Mean and spread of each Lab channel over the stone's pixels.
+function colourOf({ data }, mask) {
+  const sum = [0, 0, 0], sq = [0, 0, 0], lab = [0, 0, 0];
+  let n = 0;
+  for (let p = 0; p < mask.length; p++) {
+    if (!mask[p]) continue;
+    toLab(data, p * 3, lab);
+    for (let k = 0; k < 3; k++) { sum[k] += lab[k]; sq[k] += lab[k] * lab[k]; }
+    n++;
+  }
+  if (!n) return null;
+  return sum.map((s, k) => ({ mean: s / n, sd: Math.sqrt(Math.max(1e-6, sq[k] / n - (s / n) ** 2)) }));
+}
+
+// AI path (utils/aiStonePhoto.js). A generative model returns the stone
+// alone on white, positioned and without tweezers, but its colour is the
+// model's own. Here that stone is outlined like any photo, each Lab channel
+// of it is moved onto the mean and spread measured on `reference` (this
+// capture's clean image, i.e. the stone's real pixels), and it is framed
+// exactly like the clean path. Overall colour is the real one; individual
+// facets and inclusions are still the model's drawing.
+async function restyle(generated, reference) {
+  const ref = await toWorking(reference);
+  const refShape = await analyse(ref, estimateBackground(ref));
+  const target = refShape.groups.length ? colourOf(ref, refShape.mask) : null;
+  const img = await toWorking(generated);
+  const a = await analyse(img, estimateBackground(img));
+  const source = a.groups.length ? colourOf(img, a.mask) : null;
+  if (!target || !source) return null;
+  const scale = target.map((t, k) => Math.min(2, Math.max(0.5, t.sd / source[k].sd)));
+  const lab = [0, 0, 0];
+  for (let p = 0; p < a.mask.length; p++) {
+    if (!a.mask[p]) continue;
+    toLab(img.data, p * 3, lab);
+    for (let k = 0; k < 3; k++) lab[k] = (lab[k] - source[k].mean) * scale[k] + target[k].mean;
+    fromLab(lab, img.data, p * 3);
+  }
+  const box = unionBox(a.groups);
+  return frame(await composeOnWhite(img, a.mask, box), box);
+}
+
+module.exports = { processClean, processCutout, restyle };
