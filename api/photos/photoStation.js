@@ -178,18 +178,21 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       const location = String(req.query.location || 'all').trim();
       const { rows } = await pool.query(
         `SELECT s.sku, s.shape, s.weight, s.category, s.color, s.grouping_type, s.stones,
-                s.branch, s.location, s.box, s.holder, s.total_price, s.image, s.additional_pictures
+                s.branch, s.location, s.box, s.holder, s.total_price, s.image, s.additional_pictures,
+                EXISTS (
+                  SELECT 1 FROM stone_photo_captures c
+                   WHERE c.sku = s.sku AND c.status IN ('pending', 'uploading', 'uploaded')) AS in_flow
            FROM soap_stones s
           WHERE s.sku IS NOT NULL
             AND ($1 = '' OR s.branch = $1)
-            AND ($2 = '' OR LOWER(s.category) LIKE '%' || $2 || '%')
-            AND NOT EXISTS (
-                  SELECT 1 FROM stone_photo_captures c
-                   WHERE c.sku = s.sku AND c.status IN ('pending', 'uploading', 'uploaded'))`,
+            AND ($2 = '' OR LOWER(s.category) LIKE '%' || $2 || '%')`,
         [branch === 'all' ? '' : branch, category === 'all' ? '' : category]
       );
-      const waiting = rows
-        .filter((r) => !hasPhoto(r) && !computeOnMemo(r.location))
+      const photographed = rows.filter(hasPhoto).length;
+      const unphotographed = rows.filter((r) => !hasPhoto(r));
+      const onMemo = unphotographed.filter((r) => !r.in_flow && computeOnMemo(r.location)).length;
+      const waiting = unphotographed
+        .filter((r) => !r.in_flow && !computeOnMemo(r.location))
         .sort((a, b) => isBulkLot(a.sku) - isBulkLot(b.sku) || (Number(b.total_price) || 0) - (Number(a.total_price) || 0));
       // Each filter's counts are taken with the other filter applied, so the
       // numbers on the chips are what tapping them would show.
@@ -216,10 +219,35 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
           WHERE captured_by = $1 AND status NOT IN ('replaced', 'failed')`,
         [req.teamCtx.actorUserId]
       );
+      const team = await pool.query(
+        `SELECT COALESCE(captured_by_name, '') AS name,
+                COUNT(*) FILTER (WHERE captured_at >= date_trunc('day', NOW()))::int AS today,
+                COUNT(*)::int AS week,
+                COUNT(*) FILTER (WHERE status = 'uploaded')::int AS uploaded
+           FROM stone_photo_captures
+          WHERE status NOT IN ('replaced', 'failed') AND captured_at >= date_trunc('week', NOW())
+          GROUP BY 1 ORDER BY week DESC, name LIMIT 8`
+      );
+      const recent = await pool.query(
+        `SELECT * FROM stone_photo_captures
+          WHERE status NOT IN ('replaced', 'failed')
+          ORDER BY captured_at DESC LIMIT 8`
+      );
       const byStatus = Object.fromEntries(counts.rows.map((r) => [r.status, r.n]));
       res.json({
         remaining: waiting.length,
         matching: shown.length,
+        // Every stone in scope: has a photo, is somewhere between station and
+        // Barak, waits here, or is out on memo and can't be shot right now.
+        progress: {
+          total: rows.length,
+          photographed,
+          inFlow: unphotographed.filter((r) => r.in_flow).length,
+          waiting: waiting.length,
+          onMemo,
+        },
+        team: team.rows,
+        recent: recent.rows.map(captureOut),
         awaitingReview: byStatus.pending || 0,
         uploaded: byStatus.uploaded || 0,
         mineToday: mine.rows[0]?.today || 0,
