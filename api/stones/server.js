@@ -3068,6 +3068,60 @@ app.get(`${MEDIA_PROXY_PREFIX}*`, async (req, res) => {
 });
 
 /* =========================================================
+   /api/barak-appendix?certs=a,b – Which GRS appendix exists
+   ---------------------------------------------------------
+   Barak names a GRS appendix after the certificate, but not
+   consistently: most are "2025-012345-ap.pdf", newer ones
+   "2026-067137 ap.pdf", a few both, many have none. The Excel
+   export asks here which file is really there, so its link
+   opens the PDF instead of a 404 and is left out when there is
+   no appendix. Answers: { appendix: { cert: url | null } };
+   a cert that could not be checked is left out of the answer.
+   ========================================================= */
+const APPENDIX_FOLDER = "https://app.barakdiamonds.com/Gemstones/Output/StoneImages/";
+const APPENDIX_FOUND_MS = 24 * 60 * 60 * 1000;
+// Short, so an appendix Barak uploads later shows up the same day.
+const APPENDIX_MISSING_MS = 30 * 60 * 1000;
+const appendixCache = new Map();
+
+const findAppendix = async (cert) => {
+  const hit = appendixCache.get(cert);
+  if (hit && hit.until > Date.now()) return hit.url;
+  let url = null;
+  for (const name of [`${cert} ap.pdf`, `${cert}-ap.pdf`]) {
+    const candidate = APPENDIX_FOLDER + encodeURIComponent(name);
+    const r = await fetch(candidate, { method: "HEAD", timeout: 10000 });
+    if (r.ok && /pdf/i.test(r.headers.get("content-type") || "")) {
+      url = candidate;
+      break;
+    }
+    if (r.status !== 404) throw new Error(`Barak answered ${r.status}`);
+  }
+  appendixCache.set(cert, { url, until: Date.now() + (url ? APPENDIX_FOUND_MS : APPENDIX_MISSING_MS) });
+  return url;
+};
+
+app.get("/api/barak-appendix", async (req, res) => {
+  const certs = [...new Set(
+    String(req.query.certs || "")
+      .split(",")
+      .map((c) => c.trim())
+      .filter((c) => /^[\w.\- ]{1,60}$/.test(c))
+  )].slice(0, 300);
+  const appendix = {};
+  for (let i = 0; i < certs.length; i += 8) {
+    await Promise.all(certs.slice(i, i + 8).map(async (cert) => {
+      try {
+        appendix[cert] = await findAppendix(cert);
+      } catch (e) {
+        console.error("❌ Appendix check failed:", cert, e.message);
+      }
+    }));
+  }
+  res.json({ appendix });
+});
+
+/* =========================================================
    /api/vimeo-file/:id – Direct MP4 link for a Vimeo video
    /api/vimeo-file/:id/file – 302 to that MP4 (share/open)
    ---------------------------------------------------------
