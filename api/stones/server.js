@@ -203,7 +203,6 @@ const PUBLIC_API_ROUTES = [
   ['POST', /^\/api\/sign\/[^/]+$/],
   ['POST', /^\/api\/auth\/sessions\/(peers|enforce-limit|revoke-others|revoke)$/],
   ['GET', /^\/api\/crm\/outlook\/callback$/],
-  ['GET', /^\/api\/feeds\/google-merchant\.xml$/],
   ['*', /^\/api\/v1\//],
 ];
 const isPublicApiRoute = (method, path) =>
@@ -2619,24 +2618,6 @@ app.get("/api/web-listings/etrade.csv", requireOwner, async (req, res) => {
 });
 
 /* =========================================================
-   /api/feeds/google-merchant.xml – Eshed.com products for
-   Google Merchant Center (see utils/googleMerchantFeed.js).
-   Public: Merchant Center fetches it on a schedule.
-   ========================================================= */
-app.get("/api/feeds/google-merchant.xml", async (req, res) => {
-  try {
-    const { xml, count } = await googleMerchantFeed.getFeed();
-    res.set("Content-Type", "application/xml; charset=utf-8");
-    res.set("Cache-Control", "public, max-age=900");
-    res.set("X-Product-Count", String(count));
-    res.send(xml);
-  } catch (error) {
-    console.error("❌ Error building Google Merchant feed:", error);
-    res.status(503).json({ error: "Feed temporarily unavailable" });
-  }
-});
-
-/* =========================================================
    /api/stones/:sku/overrides – admin-only spec corrections
    Survives the next Barak SOAP/CSV truncate. Owner/admin only.
    ========================================================= */
@@ -3331,7 +3312,6 @@ const webListings = require('../../utils/webListings');
 const barakWebSync = require('../../utils/barakWebSync');
 const { ftpConfig: barakFtpConfig } = require('./importJewelryFromFtp');
 const { fileName: etradeFileName } = require('../../utils/etradeExport');
-const googleMerchantFeed = require('../../utils/googleMerchantFeed');
 
 /* Which CSV header feeds each stored column. Used to tell "the export says
  * this field is empty" (honour it — the stone really has no video now) from
