@@ -2166,6 +2166,7 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
     if (prunedCount > 0) {
       console.log(`[jewelry CSV import] Pruned ${prunedCount} model_number(s) no longer in the feed.`);
     }
+    await reapplyDnaPhotos(pool, 'jewelry');
 
     const completionDetail = duplicateModelCount > 0
       ? `Successfully imported ${values.length} jewelry items (collapsed ${duplicateModelCount} duplicate Model Number rows).`
@@ -3308,6 +3309,7 @@ const {
   upsertOverrides: upsertStoneOverrides,
   applyOverrides: applyStoneOverrides,
 } = require('../../utils/stoneOverrides');
+const { reapplyDnaPhotos } = require('../../utils/dnaPhotos');
 const webListings = require('../../utils/webListings');
 const barakWebSync = require('../../utils/barakWebSync');
 const { ftpConfig: barakFtpConfig } = require('./importJewelryFromFtp');
@@ -3504,6 +3506,7 @@ app.post("/api/import-csv", sensitiveLimiter, requireOwner, async (req, res) => 
     } catch (e) {
       console.warn("⚠️  Could not re-apply stone overrides:", e.message);
     }
+    await reapplyDnaPhotos(pool, 'stone');
 
     // 🔍 Verify the prices we just stored still follow the supplier convention
     // (see utils/priceIntegrity.js). Never blocks the import — it only reports.

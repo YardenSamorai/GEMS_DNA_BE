@@ -11,6 +11,7 @@ const ftp = require("basic-ftp");
 const { Writable } = require("stream");
 const { parse: parseCsv } = require("csv-parse/sync");
 const { pool } = require("../../db/client");
+const { reapplyDnaPhotos } = require("../../utils/dnaPhotos");
 
 const FTP_HOST = process.env.BARAK_FTP_HOST || "ftp.eshed.art";
 const FTP_USER = process.env.BARAK_FTP_USER || "eshedftp@eshed.art";
@@ -167,6 +168,7 @@ const runImport = async (options = {}) => {
       [importedModels]
     );
     const pruned = pruneRes.rowCount || 0;
+    await reapplyDnaPhotos(dbPool, "jewelry");
 
     const message = `Successfully synced ${values.length} jewelry items` +
       (pruned > 0 ? ` (removed ${pruned} sold/discontinued)` : "");

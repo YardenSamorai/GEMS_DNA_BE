@@ -6,6 +6,7 @@ const { pool } = require("../../db/client");
 const { cleanText } = require("../../utils/preserveFields");
 const { auditPrices } = require("../../utils/priceIntegrity");
 const { applyOverrides } = require("../../utils/stoneOverrides");
+const { reapplyDnaPhotos } = require("../../utils/dnaPhotos");
 const { realignCertComments } = require("../../utils/barakRow");
 
 const CHUNK_SIZE = 300; // ⭐ הכי יציב
@@ -433,6 +434,7 @@ const runImport = async (options = {}) => {
     } catch (e) {
       console.warn("⚠️  Could not re-apply stone overrides:", e.message);
     }
+    await reapplyDnaPhotos(dbPool, "stone");
 
     // 🔍 Verify the prices we just stored still follow the supplier convention
     // (see utils/priceIntegrity.js). Never blocks the sync — it only reports.

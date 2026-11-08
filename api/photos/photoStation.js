@@ -1,29 +1,35 @@
-// Photo Station: office staff photograph stones that have no picture, a
-// manager approves each shot, and the approved image is uploaded to Barak's
-// picture FTP (see utils/barakPictures.js for the naming contract).
+// Photo Station: office staff photograph stones and jewelry, a manager
+// approves each shot, and the approved image becomes a DNA photo of the item:
+// it is added to the item's gallery (see utils/dnaPhotos.js). Optionally a
+// stone's photo is also uploaded to Barak's picture FTP (see
+// utils/barakPictures.js for the naming contract).
 //
 //   GET  /api/photo-station/status              what is configured
 //   GET  /api/photo-station/queue               stones still needing a photo, most valuable first
-//   GET  /api/photo-station/search?q=           SKUs matching what is being typed
+//   GET  /api/photo-station/search?q=           stone SKUs and jewelry model numbers matching what is typed
 //   GET  /api/photo-station/mine                the caller's recent shots and their fate
-//   GET  /api/photo-station/stone/:sku          one stone, for a scanned barcode
+//   GET  /api/photo-station/stone/:sku          one stone or jewelry item, for a scanned barcode
 //   POST /api/photo-station/captures            upload + process a shot (multipart: photo, sku)
 //   GET  /api/photo-station/captures            review list (manager)
-//   POST /api/photo-station/captures/:id/approve   upload the chosen version to Barak (manager)
-//   POST /api/photo-station/captures/:id/reject    send the stone back to the queue (manager)
+//   POST /api/photo-station/captures/:id/approve        save the chosen version in DNA (manager)
+//   POST /api/photo-station/captures/:id/send-to-barak  upload an approved stone photo to Barak (manager)
+//   POST /api/photo-station/captures/:id/reject         send the item back to the queue (manager)
 //
-// Capture lifecycle: pending -> uploading -> uploaded
+// Capture lifecycle: pending -> approved
 //                    pending -> rejected
-//                    pending -> replaced   (the same stone was shot again)
+//                    pending -> replaced   (the same item was shot again)
 //                    failed                (no stone found; kept, with the
 //                                           original, to tune the checks)
-// A failed FTP upload goes back to pending with upload_error set, so it can
-// simply be approved again.
+//                    uploaded              (before DNA photos: sent to Barak only)
+// Sending to Barak is tracked apart, in barak_status: sending -> sent | failed.
+// A failed send leaves the DNA photo in place and can simply be retried.
 
 const multer = require('multer');
+const sharp = require('sharp');
 const { processClean, processCutout } = require('../../utils/stonePhoto');
 const ai = require('../../utils/aiStonePhoto');
 const barak = require('../../utils/barakPictures');
+const { applyDnaPhotos } = require('../../utils/dnaPhotos');
 
 const DEFAULT_BRANCH = 'Israel';
 const DEFAULT_CATEGORY = 'emerald';
@@ -38,6 +44,7 @@ const usableUrl = (u) => {
 };
 const hasPhoto = (row) =>
   usableUrl(row.image) || String(row.additional_pictures || '').split(';').some(usableUrl);
+const jewelryHasPhoto = (row) => String(row.all_pictures_link || '').split(';').some(usableUrl);
 
 const canShoot = (ctx) =>
   !!ctx && !ctx.isStoreUser && (ctx.isOwner || ctx.role === 'manager' ||
@@ -46,6 +53,7 @@ const canReview = (ctx) => !!ctx && !ctx.isStoreUser && (ctx.isOwner || ctx.role
 
 const stoneSummary = (row, onMemo) => ({
   sku: row.sku,
+  itemType: 'stone',
   shape: row.shape || null,
   weightCt: row.weight != null ? Number(row.weight) : null,
   category: row.category || null,
@@ -59,6 +67,28 @@ const stoneSummary = (row, onMemo) => ({
   onMemo,
   hasPhoto: hasPhoto(row),
 });
+
+// A jewelry item goes by its model number, which is what a capture's sku holds.
+const jewelrySummary = (row, onMemo) => ({
+  sku: row.model_number,
+  itemType: 'jewelry',
+  title: row.title || null,
+  stockNumber: row.stock_number || null,
+  category: row.jewelry_type || row.category || null,
+  metal: row.metal_type || null,
+  weightCt: row.total_carat != null ? Number(row.total_carat) : null,
+  location: row.location || null,
+  onMemo,
+  hasPhoto: jewelryHasPhoto(row),
+});
+
+const STONE_COLS = `sku, shape, weight, category, color, grouping_type, stones, branch, location, box, holder,
+                    image, additional_pictures`;
+const JEWELRY_COLS = `model_number, stock_number, title, jewelry_type, category, metal_type, total_carat,
+                      location, all_pictures_link`;
+
+// The URL of the version a reviewer picked; $2 is the variant.
+const VARIANT_URL = `(CASE $2::text WHEN 'cutout' THEN cutout_url WHEN 'ai' THEN ai_url ELSE clean_url END)`;
 
 // Queue tabs. Lots without a grouping type are parcels in practice.
 const KINDS = { single: 'Single', pair: 'Pair', set: 'Set', parcel: 'Parcel' };
@@ -83,6 +113,7 @@ const countBy = (rows, key) => {
 const captureOut = (c) => ({
   id: c.id,
   sku: c.sku,
+  itemType: c.item_type || 'stone',
   status: c.status,
   originalUrl: c.original_url,
   cleanUrl: c.clean_url,
@@ -98,10 +129,13 @@ const captureOut = (c) => ({
   reviewedBy: c.reviewed_by_name,
   reviewedAt: c.reviewed_at,
   rejectReason: c.reject_reason,
+  dnaImageUrl: c.dna_image_url,
+  savedAt: c.saved_at,
+  barakStatus: c.barak_status,
   ftpFilename: c.ftp_filename,
   uploadedAt: c.uploaded_at,
   uploadError: c.upload_error,
-  filenameWarning: barak.skuFilenameWarning(c.sku),
+  filenameWarning: (c.item_type || 'stone') === 'stone' ? barak.skuFilenameWarning(c.sku) : null,
 });
 
 module.exports = function registerPhotoStation(app, { pool, requireAuth, resolveTeamContext, computeOnMemo, blobPut, limiter }) {
@@ -138,10 +172,28 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
           ADD COLUMN IF NOT EXISTS ai_status TEXT,
           ADD COLUMN IF NOT EXISTS ai_error TEXT
       `);
-      // A restart kills edits in flight; they would otherwise spin forever.
+      await pool.query(`
+        ALTER TABLE stone_photo_captures
+          ADD COLUMN IF NOT EXISTS item_type TEXT NOT NULL DEFAULT 'stone',
+          ADD COLUMN IF NOT EXISTS dna_image_url TEXT,
+          ADD COLUMN IF NOT EXISTS saved_at TIMESTAMP,
+          ADD COLUMN IF NOT EXISTS barak_status TEXT
+      `);
+      await pool.query(
+        `UPDATE stone_photo_captures SET barak_status = 'sent' WHERE status = 'uploaded' AND barak_status IS NULL`
+      );
+      // A restart kills edits and uploads in flight; they would otherwise spin forever.
       await pool.query(
         `UPDATE stone_photo_captures SET ai_status = 'failed', ai_error = 'Interrupted by a server restart'
           WHERE ai_status = 'working'`
+      );
+      await pool.query(
+        `UPDATE stone_photo_captures SET barak_status = 'failed', upload_error = 'Interrupted by a server restart'
+          WHERE barak_status = 'sending'`
+      );
+      await pool.query(
+        `UPDATE stone_photo_captures SET status = 'pending', upload_error = 'Interrupted by a server restart'
+          WHERE status = 'uploading'`
       );
       console.log('stone_photo_captures ready');
     } catch (err) {
@@ -172,6 +224,64 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
     return blob.url;
   };
 
+  // A scanned or typed code: a stone SKU first, else a jewelry model number
+  // or stock number.
+  const findItem = async (code) => {
+    const stone = await pool.query(`SELECT ${STONE_COLS} FROM soap_stones WHERE UPPER(sku) = UPPER($1) LIMIT 1`, [code]);
+    if (stone.rows.length) return { itemType: 'stone', sku: stone.rows[0].sku, row: stone.rows[0] };
+    const piece = await pool.query(
+      `SELECT ${JEWELRY_COLS} FROM jewelry_products
+        WHERE UPPER(model_number) = UPPER($1) OR UPPER(stock_number) = UPPER($1)
+        ORDER BY (UPPER(model_number) = UPPER($1)) DESC LIMIT 1`,
+      [code]
+    );
+    if (piece.rows.length) return { itemType: 'jewelry', sku: piece.rows[0].model_number, row: piece.rows[0] };
+    return null;
+  };
+  const summaryOf = (item) =>
+    (item.itemType === 'jewelry' ? jewelrySummary : stoneSummary)(item.row, computeOnMemo(item.row.location));
+
+  const attachToItem = async (capture) => {
+    try {
+      await applyDnaPhotos(pool, capture.item_type, capture.sku);
+    } catch (e) {
+      // The capture is approved either way; the next sync attaches it.
+      console.error('photo-station attach error:', e.message);
+    }
+  };
+
+  // Uploads an approved stone photo to Barak's FTP. Returns the updated row,
+  // or null when it is not an approved stone photo waiting to be sent.
+  const sendToBarak = async (id) => {
+    const claimed = await pool.query(
+      `UPDATE stone_photo_captures SET barak_status = 'sending', upload_error = NULL
+        WHERE id = $1 AND status = 'approved' AND item_type = 'stone'
+          AND (barak_status IS NULL OR barak_status = 'failed')
+        RETURNING *`,
+      [id]
+    );
+    if (!claimed.rows.length) return null;
+    const capture = claimed.rows[0];
+    try {
+      if (!barak.isConfigured()) throw new Error('Barak picture FTP is not configured');
+      const imgRes = await fetch(capture.dna_image_url);
+      if (!imgRes.ok) throw new Error(`Could not read the stored photo (${imgRes.status})`);
+      const filename = await barak.uploadStonePhoto(capture.sku, Buffer.from(await imgRes.arrayBuffer()));
+      const done = await pool.query(
+        `UPDATE stone_photo_captures SET barak_status = 'sent', ftp_filename = $2, uploaded_at = NOW()
+          WHERE id = $1 RETURNING *`,
+        [id, filename]
+      );
+      return done.rows[0];
+    } catch (e) {
+      const failed = await pool.query(
+        `UPDATE stone_photo_captures SET barak_status = 'failed', upload_error = $2 WHERE id = $1 RETURNING *`,
+        [id, String(e.message).slice(0, 300)]
+      );
+      return failed.rows[0];
+    }
+  };
+
   app.get('/api/photo-station/status', ...shooter, async (req, res) => {
     const out = {
       canReview: canReview(req.teamCtx),
@@ -198,7 +308,8 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
                 s.branch, s.location, s.box, s.holder, s.total_price, s.image, s.additional_pictures,
                 EXISTS (
                   SELECT 1 FROM stone_photo_captures c
-                   WHERE c.sku = s.sku AND c.status IN ('pending', 'uploading', 'uploaded')) AS in_flow
+                   WHERE c.sku = s.sku AND c.item_type = 'stone'
+                     AND c.status IN ('pending', 'approved', 'uploaded')) AS in_flow
            FROM soap_stones s
           WHERE s.sku IS NOT NULL
             AND ($1 = '' OR s.branch = $1)
@@ -219,7 +330,7 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       const rejected = shown.length
         ? await pool.query(
           `SELECT DISTINCT ON (sku) sku, reject_reason, reviewed_at FROM stone_photo_captures
-            WHERE status = 'rejected' AND sku = ANY($1)
+            WHERE status = 'rejected' AND item_type = 'stone' AND sku = ANY($1)
             ORDER BY sku, reviewed_at DESC`,
           [shown.slice(0, limit).map((r) => r.sku)]
         )
@@ -227,7 +338,7 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       const rejectedBySku = new Map(rejected.rows.map((r) => [r.sku, r]));
       const counts = await pool.query(
         `SELECT status, COUNT(*)::int AS n FROM stone_photo_captures
-          WHERE status IN ('pending', 'uploaded') GROUP BY status`
+          WHERE status IN ('pending', 'approved', 'uploaded') GROUP BY status`
       );
       const mine = await pool.query(
         `SELECT COUNT(*) FILTER (WHERE captured_at >= date_trunc('day', NOW()))::int AS today,
@@ -240,7 +351,7 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
         `SELECT COALESCE(captured_by_name, '') AS name,
                 COUNT(*) FILTER (WHERE captured_at >= date_trunc('day', NOW()))::int AS today,
                 COUNT(*)::int AS week,
-                COUNT(*) FILTER (WHERE status = 'uploaded')::int AS uploaded
+                COUNT(*) FILTER (WHERE status IN ('approved', 'uploaded'))::int AS saved
            FROM stone_photo_captures
           WHERE status NOT IN ('replaced', 'failed') AND captured_at >= date_trunc('week', NOW())
           GROUP BY 1 ORDER BY week DESC, name LIMIT 8`
@@ -254,8 +365,9 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       res.json({
         remaining: waiting.length,
         matching: shown.length,
-        // Every stone in scope: has a photo, is somewhere between station and
-        // Barak, waits here, or is out on memo and can't be shot right now.
+        // Every stone in scope: has a photo, has a shot awaiting review (or
+        // approved but not yet in the gallery), waits here, or is out on memo
+        // and can't be shot right now.
         progress: {
           total: rows.length,
           photographed,
@@ -266,7 +378,7 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
         team: team.rows,
         recent: recent.rows.map(captureOut),
         awaitingReview: byStatus.pending || 0,
-        uploaded: byStatus.uploaded || 0,
+        saved: (byStatus.approved || 0) + (byStatus.uploaded || 0),
         mineToday: mine.rows[0]?.today || 0,
         mineWeek: mine.rows[0]?.week || 0,
         kinds: { all: atLocation.length, ...countBy(atLocation, kindOf) },
@@ -294,19 +406,27 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       const q = String(req.query.q || '').trim();
       if (!q) return res.json({ items: [] });
       const compact = q.toUpperCase().replace(/[^A-Z0-9]/g, '');
-      const { rows } = await pool.query(
-        `SELECT sku, shape, weight, category, color, grouping_type, stones, branch, location, box, holder,
-                image, additional_pictures
-           FROM soap_stones
-          WHERE sku ILIKE '%' || $3 || '%'
-             OR ($2 <> '' AND regexp_replace(UPPER(sku), '[^A-Z0-9]', '', 'g') LIKE '%' || $2 || '%')
-          ORDER BY (UPPER(sku) = UPPER($1)) DESC,
-                   ($2 <> '' AND regexp_replace(UPPER(sku), '[^A-Z0-9]', '', 'g') LIKE $2 || '%') DESC,
-                   LENGTH(sku), sku
-          LIMIT 8`,
-        [q, compact, q.replace(/[\\%_]/g, '\\$&')]
-      );
-      res.json({ items: rows.map((r) => stoneSummary(r, computeOnMemo(r.location))) });
+      const params = [q, compact, q.replace(/[\\%_]/g, '\\$&')];
+      const match = (col) => `(${col} ILIKE '%' || $3 || '%'
+             OR ($2 <> '' AND regexp_replace(UPPER(${col}), '[^A-Z0-9]', '', 'g') LIKE '%' || $2 || '%'))`;
+      const order = (col) => `(UPPER(${col}) = UPPER($1)) DESC,
+                   ($2 <> '' AND regexp_replace(UPPER(${col}), '[^A-Z0-9]', '', 'g') LIKE $2 || '%') DESC,
+                   LENGTH(${col}), ${col}`;
+      const [stones, jewelry] = await Promise.all([
+        pool.query(`SELECT ${STONE_COLS} FROM soap_stones WHERE ${match('sku')} ORDER BY ${order('sku')} LIMIT 8`, params),
+        pool.query(
+          `SELECT ${JEWELRY_COLS} FROM jewelry_products
+            WHERE ${match('model_number')} OR UPPER(stock_number) = UPPER($1)
+            ORDER BY ${order('model_number')} LIMIT 8`,
+          params
+        ),
+      ]);
+      const exact = (s) => s.sku.toUpperCase() === q.toUpperCase() || (s.stockNumber || '').toUpperCase() === q.toUpperCase();
+      const items = [
+        ...stones.rows.map((r) => stoneSummary(r, computeOnMemo(r.location))),
+        ...jewelry.rows.map((r) => jewelrySummary(r, computeOnMemo(r.location))),
+      ];
+      res.json({ items: [...items.filter(exact), ...items.filter((s) => !exact(s))].slice(0, 8) });
     } catch (e) {
       console.error('photo-station search error:', e);
       res.status(500).json({ error: e.message });
@@ -331,23 +451,16 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
 
   app.get('/api/photo-station/stone/:sku', ...shooter, async (req, res) => {
     try {
-      const code = String(req.params.sku || '').trim();
-      const { rows } = await pool.query(
-        `SELECT sku, shape, weight, category, color, grouping_type, stones, branch, location, box, holder,
-                image, additional_pictures
-           FROM soap_stones WHERE UPPER(sku) = UPPER($1) LIMIT 1`,
-        [code]
-      );
-      if (!rows.length) return res.status(404).json({ error: 'Stone not found' });
-      const row = rows[0];
+      const item = await findItem(String(req.params.sku || '').trim());
+      if (!item) return res.status(404).json({ error: 'Item not found' });
       const last = await pool.query(
         `SELECT * FROM stone_photo_captures
-          WHERE sku = $1 AND status NOT IN ('replaced', 'failed')
+          WHERE sku = $1 AND item_type = $2 AND status NOT IN ('replaced', 'failed')
           ORDER BY captured_at DESC LIMIT 1`,
-        [row.sku]
+        [item.sku, item.itemType]
       );
       res.json({
-        ...stoneSummary(row, computeOnMemo(row.location)),
+        ...summaryOf(item),
         lastCapture: last.rows[0] ? captureOut(last.rows[0]) : null,
       });
     } catch (e) {
@@ -362,19 +475,28 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
         return res.status(503).json({ error: 'Photo storage (BLOB_READ_WRITE_TOKEN) is not configured' });
       }
       if (!req.file) return res.status(400).json({ error: 'No photo uploaded' });
-      const code = String(req.body?.sku || '').trim();
-      const found = await pool.query(`SELECT sku FROM soap_stones WHERE UPPER(sku) = UPPER($1) LIMIT 1`, [code]);
-      if (!found.rows.length) return res.status(404).json({ error: 'Stone not found' });
-      const sku = found.rows[0].sku;
+      const item = await findItem(String(req.body?.sku || '').trim());
+      if (!item) return res.status(404).json({ error: 'Item not found' });
+      const { sku, itemType } = item;
 
       const clean = await processClean(req.file.buffer);
+      if (!clean.image && itemType === 'jewelry') {
+        // The detection is tuned for loose stones on the lightbox. A piece it
+        // can't frame is kept as shot (upright, resized) for the reviewer.
+        clean.image = await sharp(req.file.buffer)
+          .rotate()
+          .resize({ width: 2400, height: 2400, fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 90 })
+          .toBuffer();
+        clean.quality = { ...clean.quality, issues: (clean.quality?.issues || []).filter((c) => c !== 'no_stone') };
+      }
       if (!clean.image) {
         const ctx = req.teamCtx;
         putBlob(sku, 'failed', req.file.buffer)
           .then((url) => pool.query(
-            `INSERT INTO stone_photo_captures (sku, status, original_url, quality, captured_by, captured_by_name)
-             VALUES ($1, 'failed', $2, $3, $4, $5)`,
-            [sku, url, JSON.stringify(clean.quality), ctx.actorUserId, ctx.memberName || ctx.actorName || null]
+            `INSERT INTO stone_photo_captures (sku, item_type, status, original_url, quality, captured_by, captured_by_name)
+             VALUES ($1, $2, 'failed', $3, $4, $5, $6)`,
+            [sku, itemType, url, JSON.stringify(clean.quality), ctx.actorUserId, ctx.memberName || ctx.actorName || null]
           ))
           .catch((e) => console.error('photo-station failed-shot log error:', e.message));
         return res.status(422).json({ error: 'No stone found in the photo', quality: clean.quality });
@@ -390,16 +512,16 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
 
       const ctx = req.teamCtx;
       await pool.query(
-        `UPDATE stone_photo_captures SET status = 'replaced' WHERE sku = $1 AND status = 'pending'`,
-        [sku]
+        `UPDATE stone_photo_captures SET status = 'replaced' WHERE sku = $1 AND item_type = $2 AND status = 'pending'`,
+        [sku, itemType]
       );
       const { rows } = await pool.query(
         `INSERT INTO stone_photo_captures
-           (sku, status, original_url, clean_url, cutout_url, cutout_error, quality,
+           (sku, item_type, status, original_url, clean_url, cutout_url, cutout_error, quality,
             captured_by, captured_by_name)
-         VALUES ($1, 'pending', $2, $3, $4, $5, $6, $7, $8)
+         VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9)
          RETURNING *`,
-        [sku, originalUrl, cleanUrl, cutoutUrl, cutout.error || null, JSON.stringify(clean.quality),
+        [sku, itemType, originalUrl, cleanUrl, cutoutUrl, cutout.error || null, JSON.stringify(clean.quality),
           ctx.actorUserId, ctx.memberName || ctx.actorName || null]
       );
       res.json(captureOut(rows[0]));
@@ -458,29 +580,41 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
 
   app.get('/api/photo-station/captures', ...reviewer, async (req, res) => {
     try {
-      const status = String(req.query.status || 'pending');
+      // One status, or several separated by commas (approved,uploaded).
+      const statuses = String(req.query.status || 'pending').split(',').map((s) => s.trim()).filter(Boolean);
       const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 60));
       const { rows } = await pool.query(
-        `SELECT c.*, s.shape, s.weight, s.category, s.color, s.grouping_type, s.stones, s.location
+        `SELECT c.*, s.shape, s.weight, s.category, s.color, s.grouping_type, s.stones, s.location,
+                j.title AS j_title, j.jewelry_type AS j_type, j.category AS j_category,
+                j.metal_type AS j_metal, j.total_carat AS j_carat, j.location AS j_location
            FROM stone_photo_captures c
-           LEFT JOIN soap_stones s ON s.sku = c.sku
-          WHERE c.status = $1
-          ORDER BY ${status === 'pending' ? 'c.captured_at ASC' : 'COALESCE(c.reviewed_at, c.captured_at) DESC'}
+           LEFT JOIN soap_stones s ON c.item_type = 'stone' AND s.sku = c.sku
+           LEFT JOIN jewelry_products j ON c.item_type = 'jewelry' AND j.model_number = c.sku
+          WHERE c.status = ANY($1)
+          ORDER BY ${statuses.includes('pending') ? 'c.captured_at ASC' : 'COALESCE(c.reviewed_at, c.captured_at) DESC'}
           LIMIT $2`,
-        [status, limit]
+        [statuses, limit]
       );
       res.json({
         items: rows.map((r) => ({
           ...captureOut(r),
-          stone: {
-            shape: r.shape || null,
-            weightCt: r.weight != null ? Number(r.weight) : null,
-            category: r.category || null,
-            color: r.color || null,
-            groupingType: r.grouping_type || null,
-            stones: r.stones != null ? Number(r.stones) : null,
-            location: r.location || null,
-          },
+          stone: r.item_type === 'jewelry'
+            ? {
+              title: r.j_title || null,
+              category: r.j_type || r.j_category || null,
+              metal: r.j_metal || null,
+              weightCt: r.j_carat != null ? Number(r.j_carat) : null,
+              location: r.j_location || null,
+            }
+            : {
+              shape: r.shape || null,
+              weightCt: r.weight != null ? Number(r.weight) : null,
+              category: r.category || null,
+              color: r.color || null,
+              groupingType: r.grouping_type || null,
+              stones: r.stones != null ? Number(r.stones) : null,
+              location: r.location || null,
+            },
         })),
       });
     } catch (e) {
@@ -494,43 +628,50 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
     const variant = ['cutout', 'ai'].includes(req.body?.variant) ? req.body.variant : 'clean';
     const ctx = req.teamCtx;
     try {
-      if (!barak.isConfigured()) {
-        return res.status(503).json({ error: 'Barak picture FTP is not configured' });
-      }
-      // Claim the row first so two managers can't upload the same shot twice.
-      const claimed = await pool.query(
+      // One statement, so two managers can't approve the same shot twice.
+      const approved = await pool.query(
         `UPDATE stone_photo_captures
-            SET status = 'uploading', chosen_variant = $2, reviewed_by = $3,
-                reviewed_by_name = $4, reviewed_at = NOW(), upload_error = NULL
-          WHERE id = $1 AND status = 'pending'
+            SET status = 'approved', chosen_variant = $2, dna_image_url = ${VARIANT_URL}, saved_at = NOW(),
+                reviewed_by = $3, reviewed_by_name = $4, reviewed_at = NOW(), upload_error = NULL
+          WHERE id = $1 AND status = 'pending' AND ${VARIANT_URL} IS NOT NULL
           RETURNING *`,
         [id, variant, ctx.actorUserId, ctx.memberName || ctx.actorName || null]
       );
-      if (!claimed.rows.length) return res.status(409).json({ error: 'This photo is no longer waiting for review' });
-      const capture = claimed.rows[0];
-      const url = { cutout: capture.cutout_url, ai: capture.ai_url, clean: capture.clean_url }[variant];
-      try {
-        if (!url) throw new Error(`There is no ${variant} version of this photo`);
-        const imgRes = await fetch(url);
-        if (!imgRes.ok) throw new Error(`Could not read the stored photo (${imgRes.status})`);
-        const buffer = Buffer.from(await imgRes.arrayBuffer());
-        const filename = await barak.uploadStonePhoto(capture.sku, buffer);
-        const done = await pool.query(
-          `UPDATE stone_photo_captures
-              SET status = 'uploaded', ftp_filename = $2, uploaded_at = NOW()
-            WHERE id = $1 RETURNING *`,
-          [id, filename]
-        );
-        res.json(captureOut(done.rows[0]));
-      } catch (e) {
-        const back = await pool.query(
-          `UPDATE stone_photo_captures SET status = 'pending', upload_error = $2 WHERE id = $1 RETURNING *`,
-          [id, e.message]
-        );
-        res.status(502).json({ error: e.message, capture: captureOut(back.rows[0]) });
+      if (!approved.rows.length) {
+        const current = await pool.query(`SELECT status FROM stone_photo_captures WHERE id = $1`, [id]);
+        if (!current.rows.length) return res.status(404).json({ error: 'Capture not found' });
+        if (current.rows[0].status !== 'pending') {
+          return res.status(409).json({ error: 'This photo is no longer waiting for review' });
+        }
+        return res.status(400).json({ error: `There is no ${variant} version of this photo` });
       }
+      let capture = approved.rows[0];
+      await attachToItem(capture);
+      if (req.body?.sendToBarak === true && capture.item_type === 'stone') {
+        capture = (await sendToBarak(id)) || capture;
+      }
+      res.json(captureOut(capture));
     } catch (e) {
       console.error('photo-station approve error:', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post('/api/photo-station/captures/:id/send-to-barak', ...reviewer, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      const sent = await sendToBarak(id);
+      if (!sent) {
+        const current = await pool.query(`SELECT * FROM stone_photo_captures WHERE id = $1`, [id]);
+        if (!current.rows.length) return res.status(404).json({ error: 'Capture not found' });
+        return res.status(409).json({ error: 'This photo cannot be sent to Barak', capture: captureOut(current.rows[0]) });
+      }
+      if (sent.barak_status === 'failed') {
+        return res.status(502).json({ error: sent.upload_error, capture: captureOut(sent) });
+      }
+      res.json(captureOut(sent));
+    } catch (e) {
+      console.error('photo-station send-to-barak error:', e);
       res.status(500).json({ error: e.message });
     }
   });
