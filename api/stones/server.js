@@ -14268,6 +14268,8 @@ require('../photos/photoStation')(app, {
   pool, requireAuth, resolveTeamContext, computeOnMemo, blobPut, limiter: sensitiveLimiter,
 });
 
+require('../present/presentations')(app, { pool, requireAuth, resolveTeamContext, limiter: sensitiveLimiter });
+
 registerPublicApi(app, {
   pool,
   requireAuth,
