@@ -62,6 +62,11 @@ const BLUR_THRESHOLD = 0.7;
 // A bigger tilt is a deliberate pose (a pear shot on the diagonal), not a
 // crooked stone. The station's holder keeps accidental tilt well under this.
 const MAX_STRAIGHTEN = 10;
+// A lit lightbox reads near white even after the phone's auto exposure; an
+// unlit one under room light comes out grey (161-188 on the first station
+// shots), and the stone, with no light through it, comes out dark. Only a
+// warning: the threshold is a first estimate until lit shots are measured.
+const LIGHTBOX_MIN_LUM = 210;
 
 const WHITE = { r: 255, g: 255, b: 255 };
 
@@ -757,6 +762,7 @@ async function assessQuality(img, bg, { groups, mask, protectedObjects, toolRemo
   // looked like, so a patchy backdrop only shows when a pale stone fell back
   // to the generous outline, which carries some of it along.
   if (bgLum < 150) issues.push('dark_background');
+  else if (bgLum < LIGHTBOX_MIN_LUM) issues.push('lightbox_off');
   if (bg.spread > 90 && protectedObjects) issues.push('uneven_background');
   // Cut away, but where tweezers or a finger cover the girdle there is no
   // stone to show, and inventing it is not an option.
