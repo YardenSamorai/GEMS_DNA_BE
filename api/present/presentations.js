@@ -2,34 +2,46 @@
 // (/present on the frontend), kept under a name so a show can be prepared at
 // the office and opened on the iPad, or run again later.
 //
-//   GET    /api/presentations        the ones the caller can see
+//   GET    /api/presentations          the ones the caller can see
+//   GET    /api/presentations/people   teammates a presentation can be shared with
 //   GET    /api/presentations/:id
-//   POST   /api/presentations        { name, items, settings, shared }
-//   PATCH  /api/presentations/:id    any of the same fields
+//   POST   /api/presentations          { name, items, settings, shared, sharedWith }
+//   PATCH  /api/presentations/:id      any of the same fields
 //   DELETE /api/presentations/:id
 //
 // Items are kept as the showcase's own references (a stone SKU, or "j:" and a
 // jewelry model number), never as copies: prices, photos and stock stay live,
 // and a piece that left the inventory is simply reported missing on opening.
 //
-// A presentation belongs to the workspace. A shared one is open to everyone
-// in it who may present, to view and edit; a private one only to whoever
-// made it. Only the maker changes which it is, and deletes it (an admin may
-// also delete a shared one).
+// A presentation belongs to the workspace and is open to whoever made it,
+// plus either the whole team (shared) or the teammates it names (sharedWith,
+// team_members ids, so someone invited but not yet signed in can be named
+// too). Whoever can open it can edit it. Only the maker changes who sees it,
+// and deletes it (an admin may also delete one shared with the whole team).
 
 const NAME_MAX = 120;
 const ITEMS_MAX = 500;
 const REF_MAX = 80;
+const PEOPLE_MAX = 100;
 const SETTINGS = {
   prices: ['off', 'total', 'both'],
   interval: ['8', '12', '20', '30'],
   brand: ['none', 'eshed', 'gemstar'],
 };
 const DEFAULT_SETTINGS = { prices: 'off', interval: '12', brand: 'none' };
+const ADMIN_ROLES = ['owner', 'admin'];
 
 const canPresent = (ctx) =>
   !!ctx && ctx.isAuthenticated && !ctx.isStoreUser && !!ctx.tenantUserId &&
   (ctx.isOwner || (ctx.permissions?.sections || []).includes('inventory'));
+
+const memberCanPresent = (m) => {
+  if (m.role === 'store_user') return false;
+  if (ADMIN_ROLES.includes(m.role)) return true;
+  let p = m.permissions;
+  if (typeof p === 'string') { try { p = JSON.parse(p); } catch { p = null; } }
+  return Array.isArray(p?.sections) && p.sections.includes('inventory');
+};
 
 const cleanName = (v) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, NAME_MAX);
 
@@ -46,6 +58,11 @@ const cleanItems = (v) => {
     if (out.length >= ITEMS_MAX) break;
   }
   return out;
+};
+
+const cleanPeople = (v) => {
+  if (!Array.isArray(v)) return null;
+  return [...new Set(v.map((x) => Number.parseInt(x, 10)).filter((n) => Number.isFinite(n) && n > 0))].slice(0, PEOPLE_MAX);
 };
 
 const cleanSettings = (v, base = DEFAULT_SETTINGS) => {
@@ -66,6 +83,7 @@ const out = (row, ctx) => {
     items: row.items || [],
     settings: cleanSettings(row.settings),
     shared: row.shared,
+    sharedWith: row.shared_with || [],
     createdByName: row.created_by_name,
     updatedByName: row.updated_by_name,
     createdAt: row.created_at,
@@ -93,6 +111,7 @@ module.exports = function registerPresentations(app, { pool, requireAuth, resolv
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
       `);
+      await pool.query(`ALTER TABLE presentations ADD COLUMN IF NOT EXISTS shared_with INTEGER[] NOT NULL DEFAULT '{}'`);
       await pool.query(`CREATE INDEX IF NOT EXISTS idx_presentations_tenant ON presentations(tenant_id)`);
       console.log('presentations ready');
     } catch (err) {
@@ -115,13 +134,11 @@ module.exports = function registerPresentations(app, { pool, requireAuth, resolv
   ];
   const actorName = (ctx) => ctx.memberName || ctx.actorName || null;
 
-  // Visible to the caller: in their workspace, and shared or their own.
-  const VISIBLE = `tenant_id = $1 AND (shared OR created_by = $2)`;
+  // Visible to the caller: in their workspace, and theirs, the team's, or named for them.
+  const VISIBLE = `tenant_id = $1 AND (shared OR created_by = $2 OR ($3::int IS NOT NULL AND $3::int = ANY(shared_with)))`;
+  const visibleArgs = (ctx) => [ctx.tenantUserId, ctx.actorUserId, ctx.memberId ?? null];
   const findVisible = async (ctx, id) => {
-    const { rows } = await pool.query(
-      `SELECT * FROM presentations WHERE id = $3 AND ${VISIBLE}`,
-      [ctx.tenantUserId, ctx.actorUserId, id]
-    );
+    const { rows } = await pool.query(`SELECT * FROM presentations WHERE id = $4 AND ${VISIBLE}`, [...visibleArgs(ctx), id]);
     return rows[0] || null;
   };
   const idParam = (req) => {
@@ -129,16 +146,46 @@ module.exports = function registerPresentations(app, { pool, requireAuth, resolv
     return Number.isFinite(id) && id > 0 ? id : null;
   };
 
+  // Only teammates of this workspace who may present can be named.
+  const presentablePeople = async (ctx) => {
+    const { rows } = await pool.query(
+      `SELECT id, name, email, role, permissions, clerk_user_id
+         FROM team_members
+        WHERE team_owner_id = $1 AND active = TRUE
+        ORDER BY name ASC`,
+      [ctx.tenantUserId]
+    );
+    return rows.filter(memberCanPresent);
+  };
+  const keepTeammates = async (ctx, ids) => {
+    if (!ids.length) return ids;
+    const allowed = new Set((await presentablePeople(ctx)).map((m) => m.id));
+    return ids.filter((id) => allowed.has(id) && id !== ctx.memberId);
+  };
+
   app.get('/api/presentations', ...presenter, async (req, res) => {
     try {
       const ctx = req.teamCtx;
       const { rows } = await pool.query(
         `SELECT * FROM presentations WHERE ${VISIBLE} ORDER BY updated_at DESC LIMIT 500`,
-        [ctx.tenantUserId, ctx.actorUserId]
+        visibleArgs(ctx)
       );
       res.json({ presentations: rows.map((r) => out(r, ctx)) });
     } catch (e) {
       console.error('presentations list error:', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get('/api/presentations/people', ...presenter, async (req, res) => {
+    try {
+      const ctx = req.teamCtx;
+      const people = (await presentablePeople(ctx))
+        .filter((m) => m.id !== ctx.memberId)
+        .map((m) => ({ id: m.id, name: m.name || m.email, email: m.email, pending: !m.clerk_user_id }));
+      res.json({ people });
+    } catch (e) {
+      console.error('presentation people error:', e);
       res.status(500).json({ error: e.message });
     }
   });
@@ -161,12 +208,14 @@ module.exports = function registerPresentations(app, { pool, requireAuth, resolv
       const name = cleanName(req.body?.name);
       if (!name) return res.status(400).json({ error: 'A name is required' });
       const items = cleanItems(req.body?.items) || [];
+      const shared = req.body?.shared !== false;
+      const sharedWith = shared ? [] : await keepTeammates(ctx, cleanPeople(req.body?.sharedWith) || []);
       const { rows } = await pool.query(
-        `INSERT INTO presentations (tenant_id, name, items, settings, shared, created_by, created_by_name, updated_by_name)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+        `INSERT INTO presentations (tenant_id, name, items, settings, shared, shared_with, created_by, created_by_name, updated_by_name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
          RETURNING *`,
         [ctx.tenantUserId, name, JSON.stringify(items), JSON.stringify(cleanSettings(req.body?.settings)),
-          req.body?.shared !== false, ctx.actorUserId, actorName(ctx)]
+          shared, sharedWith, ctx.actorUserId, actorName(ctx)]
       );
       res.status(201).json(out(rows[0], ctx));
     } catch (e) {
@@ -182,7 +231,13 @@ module.exports = function registerPresentations(app, { pool, requireAuth, resolv
       const row = id && (await findVisible(ctx, id));
       if (!row) return res.status(404).json({ error: 'Presentation not found' });
       const body = req.body || {};
-      const next = { name: row.name, items: row.items || [], settings: cleanSettings(row.settings), shared: row.shared };
+      const next = {
+        name: row.name,
+        items: row.items || [],
+        settings: cleanSettings(row.settings),
+        shared: row.shared,
+        sharedWith: row.shared_with || [],
+      };
       if (body.name !== undefined) {
         next.name = cleanName(body.name);
         if (!next.name) return res.status(400).json({ error: 'A name is required' });
@@ -192,18 +247,26 @@ module.exports = function registerPresentations(app, { pool, requireAuth, resolv
         if (!next.items) return res.status(400).json({ error: 'Items must be a list' });
       }
       if (body.settings !== undefined) next.settings = cleanSettings(body.settings, next.settings);
-      if (body.shared !== undefined && Boolean(body.shared) !== row.shared) {
+      const sharingChange =
+        (body.shared !== undefined && Boolean(body.shared) !== row.shared) || body.sharedWith !== undefined;
+      if (sharingChange) {
         if (row.created_by !== ctx.actorUserId) {
           return res.status(403).json({ error: 'Only whoever made this presentation can change who sees it' });
         }
-        next.shared = Boolean(body.shared);
+        if (body.shared !== undefined) next.shared = Boolean(body.shared);
+        if (body.sharedWith !== undefined) {
+          const people = cleanPeople(body.sharedWith);
+          if (!people) return res.status(400).json({ error: 'sharedWith must be a list' });
+          next.sharedWith = await keepTeammates(ctx, people);
+        }
+        if (next.shared) next.sharedWith = [];
       }
       const { rows } = await pool.query(
         `UPDATE presentations
-            SET name = $2, items = $3, settings = $4, shared = $5, updated_by_name = $6, updated_at = NOW()
+            SET name = $2, items = $3, settings = $4, shared = $5, shared_with = $6, updated_by_name = $7, updated_at = NOW()
           WHERE id = $1
           RETURNING *`,
-        [id, next.name, JSON.stringify(next.items), JSON.stringify(next.settings), next.shared, actorName(ctx)]
+        [id, next.name, JSON.stringify(next.items), JSON.stringify(next.settings), next.shared, next.sharedWith, actorName(ctx)]
       );
       res.json(out(rows[0], ctx));
     } catch (e) {
