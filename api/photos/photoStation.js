@@ -538,6 +538,12 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
     try {
       if (!ai.isConfigured()) return res.status(503).json({ error: 'The AI version is not configured' });
       const id = parseInt(req.params.id, 10);
+      // The model redraws the stones and frames them loose on white, which
+      // is the opposite of what a photo of a set in its display box wants.
+      const kind = await pool.query(`SELECT quality FROM stone_photo_captures WHERE id = $1`, [id]);
+      if (kind.rows[0]?.quality?.metrics?.displayBox) {
+        return res.status(409).json({ error: 'The AI version is not made for a set in its display box' });
+      }
       const claimed = await pool.query(
         `UPDATE stone_photo_captures SET ai_status = 'working', ai_error = NULL
           WHERE id = $1 AND status = 'pending' AND clean_url IS NOT NULL

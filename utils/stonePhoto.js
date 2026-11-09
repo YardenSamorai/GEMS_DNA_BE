@@ -870,9 +870,299 @@ async function frame(img, box) {
     .toBuffer();
 }
 
+/* ------------------------------------------------------------ display box */
+
+// Sets usually reach the station in their display box: a dark frame around a
+// white or cream pad, often with the label on it. Then the box is the
+// picture, the way the office's own set photos show it, so the photo is not
+// cut down to the stones. The box is found, straightened, made to fill the
+// frame, and everything around it turns white. No pixel inside the box is
+// changed, only resampled.
+//
+// It is a box only when the pad is a clear rectangle clear of the photo's
+// edge, ringed by a band of even width that ends against something else. A
+// lit lightbox fills the photo, and paper or a lightbox lying on a table has
+// no such band, so loose stones keep the path above.
+const BOX_PROBE = 1000;
+// Share of the square output the box's longer side fills.
+const BOX_FILL = 0.94;
+const BOX_MIN_PAD_SHARE = 0.08;
+// The pad's area (stones included) over the quadrilateral fitted to its
+// edges: a rectangle seen at an angle still fills it.
+const BOX_MIN_RECT = 0.9;
+// Where the frame's outer edge is looked for, as shares of the pad's width:
+// past the bright lip at the pad's rim, and no wider than a frame gets.
+const FRAME_FROM = 0.03;
+const FRAME_TO = 0.18;
+const FRAME_SIDE_POINTS = [0.2, 0.35, 0.5, 0.65, 0.8];
+
+function otsu(lum) {
+  const hist = new Float64Array(256);
+  for (let p = 0; p < lum.length; p++) hist[Math.min(255, Math.max(0, Math.round(lum[p])))]++;
+  const total = lum.length;
+  let sumAll = 0;
+  for (let v = 0; v < 256; v++) sumAll += v * hist[v];
+  let wB = 0, sumB = 0, best = 0, at = 128;
+  for (let v = 0; v < 256; v++) {
+    wB += hist[v];
+    if (!wB || wB === total) continue;
+    sumB += v * hist[v];
+    const mB = sumB / wB, mF = (sumAll - sumB) / (total - wB);
+    const between = wB * (total - wB) * (mB - mF) ** 2;
+    if (between > best) { best = between; at = v; }
+  }
+  return at;
+}
+
+// Least squares v = a*u + b, refitted once without the points far off the
+// line (a stone or a highlight touching the pad's rim).
+function fitLine(points) {
+  const fit = (pts) => {
+    let su = 0, sv = 0, suu = 0, suv = 0;
+    for (const [u, v] of pts) { su += u; sv += v; suu += u * u; suv += u * v; }
+    const n = pts.length;
+    const den = n * suu - su * su;
+    const a = den ? (n * suv - su * sv) / den : 0;
+    return { a, b: (sv - a * su) / n };
+  };
+  if (points.length < 10) return null;
+  const first = fit(points);
+  const res = points.map(([u, v]) => Math.abs(v - (first.a * u + first.b)));
+  const limit = Math.max(1.5, 2.5 * median(res));
+  const kept = points.filter((_, i) => res[i] <= limit);
+  return kept.length >= 10 ? fit(kept) : first;
+}
+
+// y = a*x + b (a top or bottom side) meets x = c*y + d (a left or right side).
+function corner(h, v) {
+  const x = (v.a * h.b + v.b) / (1 - h.a * v.a);
+  return [x, h.a * x + h.b];
+}
+
+const quadArea = (q) => Math.abs(q.reduce((s, [x, y], i) => {
+  const [nx, ny] = q[(i + 1) % q.length];
+  return s + x * ny - nx * y;
+}, 0)) / 2;
+
+// Distance from the pad's edge to the frame's outer edge, along the outward
+// normal at a point of the side, with the frame's luminance. The frame reads
+// as an even band; its outer edge is where the luminance ahead stops
+// matching it. 'out' when the photo ends before an edge shows up.
+function frameEdgeAt(lum, w, h, point, normal, padW) {
+  const tangent = [-normal[1], normal[0]];
+  const half = Math.round(padW * 0.04);
+  const prof = [];
+  for (let k = 0; k <= padW * FRAME_TO + padW * 0.03; k++) {
+    let s = 0, n = 0;
+    for (let t = -half; t <= half; t += 2) {
+      const x = Math.round(point[0] + normal[0] * k + tangent[0] * t);
+      const y = Math.round(point[1] + normal[1] * k + tangent[1] * t);
+      if (x < 0 || y < 0 || x >= w || y >= h) continue;
+      s += lum[y * w + x]; n++;
+    }
+    if (n < half) break;
+    prof.push(s / n);
+  }
+  const start = Math.round(padW * FRAME_FROM);
+  const win = Math.max(3, Math.round(padW * 0.012));
+  const mean = (a, b) => { let s = 0; for (let i = a; i < b; i++) s += prof[i]; return s / (b - a); };
+  for (let k = start + 2 * win; k + 2 * win <= prof.length && k <= padW * FRAME_TO; k++) {
+    const ref = median(prof.slice(start, k));
+    const tol = Math.max(12, ref * 0.3);
+    if (Math.abs(mean(k, k + win) - ref) > tol && Math.abs(mean(k + win, k + 2 * win) - ref) > tol) {
+      return { edge: k, frameLum: ref };
+    }
+  }
+  return prof.length < padW * FRAME_TO + 2 * win ? 'out' : null;
+}
+
+// Returns the pad's corners (top-left, top-right, bottom-right, bottom-left)
+// and the frame's width on each side (top, right, bottom, left), in `img`
+// pixels, or null when there is no box.
+async function findDisplayBox(img) {
+  const { data, info } = await sharp(img.data, { raw: { width: img.width, height: img.height, channels: 3 } })
+    .resize(BOX_PROBE, BOX_PROBE, { fit: 'inside' })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const w = info.width, h = info.height;
+  const lum = new Float32Array(w * h);
+  for (let p = 0; p < w * h; p++) lum[p] = 0.299 * data[p * 3] + 0.587 * data[p * 3 + 1] + 0.114 * data[p * 3 + 2];
+  const threshold = Math.min(210, Math.max(110, otsu(lum)));
+  const bright = new Uint8Array(w * h);
+  for (let p = 0; p < bright.length; p++) bright[p] = lum[p] > threshold ? 1 : 0;
+  const { kept, label } = components(bright, w, h);
+  if (!kept.length) return null;
+  const pad = kept.reduce((a, b) => (b.area > a.area ? b : a));
+  // A box cut off on one side is still a box (and is flagged); a bright
+  // area running off two or more sides is a lightbox filling the photo.
+  const touching = [pad.y0 <= 1, pad.x1 >= w - 2, pad.y1 >= h - 2, pad.x0 <= 1];
+  if (touching.filter(Boolean).length > 1) return null;
+
+  const top = [], bottom = [], left = [], right = [];
+  let filled = 0;
+  const bw = pad.x1 - pad.x0, bh = pad.y1 - pad.y0;
+  for (let y = pad.y0; y <= pad.y1; y++) {
+    let lo = -1, hi = -1;
+    for (let x = pad.x0; x <= pad.x1; x++) if (label[y * w + x] === pad.id) { if (lo < 0) lo = x; hi = x; }
+    if (lo < 0) continue;
+    filled += hi - lo + 1;
+    if (y > pad.y0 + bh * 0.1 && y < pad.y1 - bh * 0.1) { left.push([y, lo]); right.push([y, hi]); }
+  }
+  for (let x = pad.x0 + Math.round(bw * 0.1); x < pad.x1 - bw * 0.1; x++) {
+    let lo = -1, hi = -1;
+    for (let y = pad.y0; y <= pad.y1; y++) if (label[y * w + x] === pad.id) { if (lo < 0) lo = y; hi = y; }
+    if (lo >= 0) { top.push([x, lo]); bottom.push([x, hi]); }
+  }
+  if (filled < w * h * BOX_MIN_PAD_SHARE) return null;
+  const lines = [top, right, bottom, left].map(fitLine);
+  if (lines.some((l) => !l)) return null;
+  const [lt, lr, lb, ll] = lines;
+  const quad = [corner(lt, ll), corner(lt, lr), corner(lb, lr), corner(lb, ll)];
+  const rect = filled / quadArea(quad);
+  if (!(rect >= BOX_MIN_RECT && rect <= 1.08)) return null;
+
+  const padW = (Math.hypot(quad[1][0] - quad[0][0], quad[1][1] - quad[0][1])
+    + Math.hypot(quad[2][0] - quad[3][0], quad[2][1] - quad[3][1])) / 2;
+  const cx = quad.reduce((s, q) => s + q[0], 0) / 4, cy = quad.reduce((s, q) => s + q[1], 0) / 4;
+  // Each side is measured on its own: the label often sits on a wider
+  // bottom rail. A side whose frame runs off the photo says nothing about
+  // its width but doesn't argue against a box either; it takes the others'
+  // width and the photo is flagged as cut off. At least two sides must be
+  // measured, and the frame must be clearly darker than the pad, which a
+  // lightbox's own rim is not.
+  const frames = [null, null, null, null];
+  const frameLums = [];
+  let outSides = 0;
+  for (let i = 0; i < 4; i++) {
+    if (touching[i]) { outSides++; continue; }
+    const a = quad[i], b = quad[(i + 1) % 4];
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    let normal = [(b[1] - a[1]) / len, -(b[0] - a[0]) / len];
+    const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+    if ((mx - cx) * normal[0] + (my - cy) * normal[1] < 0) normal = [-normal[0], -normal[1]];
+    const at = FRAME_SIDE_POINTS
+      .map((f) => frameEdgeAt(lum, w, h, [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f], normal, padW));
+    const found = at.filter((r) => r && typeof r === 'object');
+    if (found.length >= 3) {
+      frames[i] = median(found.map((r) => r.edge));
+      frameLums.push(median(found.map((r) => r.frameLum)));
+    } else if (at.filter((r) => r === 'out').length >= 3) outSides++;
+  }
+  const measured = frames.filter((f) => f != null);
+  if (measured.length < 2 || measured.length + outSides < 4) return null;
+  if (Math.max(...measured) > 2.2 * Math.min(...measured)) return null;
+  const padLums = [];
+  for (let p = 0; p < label.length; p += 7) if (label[p] === pad.id) padLums.push(lum[p]);
+  if (median(frameLums) > 0.55 * median(padLums)) return null;
+
+  const fallback = median(measured);
+  const k = img.width / w;
+  return {
+    quad: quad.map(([x, y]) => [x * k, y * k]),
+    frames: frames.map((f) => (f ?? fallback) * k),
+    cutOff: outSides > 0,
+  };
+}
+
+// Maps src[i] to dst[i]; a 3x3 homography as 9 numbers, row by row.
+function homography(src, dst) {
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const [x, y] = src[i], [u, v] = dst[i];
+    A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); b.push(u);
+    A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); b.push(v);
+  }
+  for (let c = 0; c < 8; c++) {
+    let piv = c;
+    for (let r = c + 1; r < 8; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
+    [A[c], A[piv]] = [A[piv], A[c]];
+    [b[c], b[piv]] = [b[piv], b[c]];
+    for (let r = 0; r < 8; r++) {
+      if (r === c) continue;
+      const f = A[r][c] / A[c][c];
+      for (let q = c; q < 8; q++) A[r][q] -= f * A[c][q];
+      b[r] -= f * b[c];
+    }
+  }
+  return [...b.map((v, i) => v / A[i][i]), 1];
+}
+
+// The box (pad plus frame) resampled straight, at the photo's own scale,
+// then fitted into the white square.
+async function frameBox(img, box) {
+  const [tl, tr, br, bl] = box.quad;
+  const padW = (Math.hypot(tr[0] - tl[0], tr[1] - tl[1]) + Math.hypot(br[0] - bl[0], br[1] - bl[1])) / 2;
+  const padH = (Math.hypot(bl[0] - tl[0], bl[1] - tl[1]) + Math.hypot(br[0] - tr[0], br[1] - tr[1])) / 2;
+  const [ft, fr, fb, fl] = box.frames;
+  const bw = Math.round(fl + padW + fr), bh = Math.round(ft + padH + fb);
+  const H = homography([[0, 0], [padW, 0], [padW, padH], [0, padH]], box.quad);
+  const { data, width, height } = img;
+  const out = Buffer.alloc(bw * bh * 3, 255);
+  let cutOff = false;
+  for (let Y = 0; Y < bh; Y++) {
+    for (let X = 0; X < bw; X++) {
+      const u = X + 0.5 - fl, v = Y + 0.5 - ft;
+      const d = H[6] * u + H[7] * v + 1;
+      const sx = (H[0] * u + H[1] * v + H[2]) / d - 0.5;
+      const sy = (H[3] * u + H[4] * v + H[5]) / d - 0.5;
+      if (sx < 0 || sy < 0 || sx >= width - 1 || sy >= height - 1) { cutOff = true; continue; }
+      const x0 = Math.floor(sx), y0 = Math.floor(sy), fx = sx - x0, fy = sy - y0;
+      const i = (y0 * width + x0) * 3, o = (Y * bw + X) * 3;
+      for (let c = 0; c < 3; c++) {
+        out[o + c] = Math.round(
+          data[i + c] * (1 - fx) * (1 - fy) + data[i + 3 + c] * fx * (1 - fy)
+          + data[i + width * 3 + c] * (1 - fx) * fy + data[i + width * 3 + 3 + c] * fx * fy
+        );
+      }
+    }
+  }
+  const fit = Math.round(OUT_SIDE * BOX_FILL);
+  const scaled = await sharp(out, { raw: { width: bw, height: bh, channels: 3 } })
+    .resize(fit, fit, { fit: 'inside', kernel: 'lanczos3' })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const { width: sw, height: sh } = scaled.info;
+  const left = Math.floor((OUT_SIDE - sw) / 2), top = Math.floor((OUT_SIDE - sh) / 2);
+  const image = await sharp(scaled.data, { raw: { width: sw, height: sh, channels: 3 } })
+    .extend({ left, right: OUT_SIDE - sw - left, top, bottom: OUT_SIDE - sh - top, background: WHITE })
+    .jpeg({ quality: 92, chromaSubsampling: '4:4:4', mozjpeg: true })
+    .toBuffer();
+  return { image, cutOff, boxPx: Math.max(bw, bh) };
+}
+
+async function processBox(img, box) {
+  const { image, cutOff, boxPx } = await frameBox(img, box);
+  const xs = box.quad.map((q) => q[0]), ys = box.quad.map((q) => q[1]);
+  const pad = {
+    x0: Math.max(0, Math.floor(Math.min(...xs))), y0: Math.max(0, Math.floor(Math.min(...ys))),
+    x1: Math.min(img.width - 1, Math.ceil(Math.max(...xs))), y1: Math.min(img.height - 1, Math.ceil(Math.max(...ys))),
+  };
+  const sharpness = await sharpnessOf(img, pad);
+  const issues = [];
+  if (cutOff || box.cutOff) issues.push('box_cut_off');
+  if (sharpness < BLUR_THRESHOLD) issues.push('blurry');
+  if (Math.min(img.width, img.height) < MIN_PHOTO_SIDE) issues.push('low_resolution');
+  return {
+    image,
+    quality: {
+      ok: issues.length === 0,
+      issues,
+      metrics: {
+        displayBox: true,
+        boxPx,
+        frameSides: box.frames.map(Math.round),
+        sharpness: Math.round(sharpness * 100) / 100,
+      },
+    },
+    geometry: { displayBox: true },
+  };
+}
+
 // Deterministic path. Returns the framed JPEG plus the quality verdict.
 async function processClean(buffer) {
   let img = await toWorking(buffer);
+  const displayBox = await findDisplayBox(img);
+  if (displayBox) return processBox(img, displayBox);
   // Estimated once, on the photo as shot. After straightening, the rotated-in
   // corners are a flat fill and would make the backdrop look perfectly even.
   const bg = estimateBackground(img);
@@ -907,6 +1197,8 @@ const CUTOUT_MARGIN = 0.15;
 // show. Sending just the stone (the `geometry` found by processClean, same
 // straightening) spends even that preview's pixels on the outline.
 async function processCutout(buffer, apiKey, geometry) {
+  // A display box is kept whole; there is nothing to cut out of it.
+  if (geometry && geometry.displayBox) return { image: null, error: null };
   if (!apiKey) return { image: null, error: 'REMOVE_BG_API_KEY is not configured' };
   const img = await toWorking(buffer, geometry ? geometry.rotateBy : 0, geometry ? geometry.fill : WHITE);
   let crop = { left: 0, top: 0, width: img.width, height: img.height };
