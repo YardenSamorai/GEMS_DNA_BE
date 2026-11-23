@@ -2,7 +2,8 @@
 // our FTP (same server that receives the Diamonds feed) and refreshes the
 // jewelry_products table. Mirrors the manual /api/jewelry/import-csv flow:
 // upsert by model_number (preserving first_seen_at) and prune rows that
-// disappeared from the feed. Every run is recorded in sync_log with
+// disappeared from the feed — unless the file is stale or older than a hand
+// upload (see utils/jewelryFeed.js). Every run is recorded in sync_log with
 // sync_type='jewelry' so the Dashboard's "Inventory sync" window shows it.
 //
 // Run directly (Render Cron Job): node api/stones/importJewelryFromFtp.js
@@ -12,6 +13,7 @@ const { Writable } = require("stream");
 const { parse: parseCsv } = require("csv-parse/sync");
 const { pool } = require("../../db/client");
 const { reapplyDnaPhotos } = require("../../utils/dnaPhotos");
+const { feedDecision } = require("../../utils/jewelryFeed");
 
 const FTP_HOST = process.env.BARAK_FTP_HOST || "ftp.eshed.art";
 const FTP_USER = process.env.BARAK_FTP_USER || "eshedftp@eshed.art";
@@ -29,18 +31,32 @@ const txt = (v) => {
   return s === "" ? null : s;
 };
 
+/* The file and when Barak last wrote it (null if the server won't say). */
 const downloadCsv = async () => {
   const client = new ftp.Client(30000);
   try {
     await client.access({ host: FTP_HOST, user: FTP_USER, password: FTP_PASSWORD });
+    const modifiedAt = await client.lastMod(JEWELRY_FILE).catch(() => null);
     const chunks = [];
     const sink = new Writable({
       write(chunk, _enc, cb) { chunks.push(chunk); cb(); },
     });
     await client.downloadTo(sink, JEWELRY_FILE);
-    return Buffer.concat(chunks).toString("utf8");
+    return { csvContent: Buffer.concat(chunks).toString("utf8"), modifiedAt };
   } finally {
     client.close();
+  }
+};
+
+/* When a jewelry file was last uploaded by hand (Dashboard → Import Jewelry). */
+const lastUploadAt = async (dbPool) => {
+  try {
+    const r = await dbPool.query(
+      `SELECT MAX(started_at) AS at FROM sync_log WHERE sync_type = 'jewelry' AND source = 'upload' AND success`
+    );
+    return r.rows[0]?.at || null;
+  } catch {
+    return null;
   }
 };
 
@@ -108,9 +124,22 @@ const runImport = async (options = {}) => {
 
   try {
     console.log(`🚀 [1/4] Downloading ${JEWELRY_FILE} from ${FTP_HOST}...`);
-    const csvContent = await downloadCsv();
+    const { csvContent, modifiedAt } = await downloadCsv();
     if (!csvContent || !csvContent.trim()) {
-      return { success: false, count: 0, message: "Jewelry CSV is empty or missing on FTP" };
+      return { success: false, count: 0, message: "Jewelry CSV is empty or missing on FTP", fileModifiedAt: modifiedAt };
+    }
+
+    const decision = feedDecision({ fileModifiedAt: modifiedAt, lastUploadAt: await lastUploadAt(dbPool) });
+    if (decision.action === "skip") {
+      console.log(`⏭️  ${decision.warning}`);
+      const current = await dbPool.query("SELECT COUNT(*)::int AS n FROM jewelry_products");
+      return {
+        success: true,
+        count: current.rows[0].n,
+        message: decision.warning,
+        warning: decision.warning,
+        fileModifiedAt: modifiedAt,
+      };
     }
 
     console.log("📦 [2/4] Parsing CSV...");
@@ -161,19 +190,24 @@ const runImport = async (options = {}) => {
       );
     }
 
-    console.log("🧹 [4/4] Pruning items no longer in the feed...");
-    const importedModels = values.map((v) => v[0]);
-    const pruneRes = await dbPool.query(
-      "DELETE FROM jewelry_products WHERE NOT (model_number = ANY($1::text[]))",
-      [importedModels]
-    );
-    const pruned = pruneRes.rowCount || 0;
+    let pruned = 0;
+    if (decision.prune) {
+      console.log("🧹 [4/4] Pruning items no longer in the feed...");
+      const importedModels = values.map((v) => v[0]);
+      const pruneRes = await dbPool.query(
+        "DELETE FROM jewelry_products WHERE NOT (model_number = ANY($1::text[]))",
+        [importedModels]
+      );
+      pruned = pruneRes.rowCount || 0;
+    } else {
+      console.warn(`⚠️  [4/4] Not pruning: ${decision.warning}`);
+    }
     await reapplyDnaPhotos(dbPool, "jewelry");
 
     const message = `Successfully synced ${values.length} jewelry items` +
       (pruned > 0 ? ` (removed ${pruned} sold/discontinued)` : "");
     console.log(`🎉 DONE! ${message}`);
-    return { success: true, count: values.length, message };
+    return { success: true, count: values.length, message, warning: decision.warning, fileModifiedAt: modifiedAt };
   } catch (err) {
     console.error("❌ Jewelry sync error:", err);
     return { success: false, count: 0, message: err.message || "Unknown error during jewelry sync" };
@@ -197,10 +231,15 @@ const logSyncRun = async (dbPool, entry) => {
       )
     `);
     await dbPool.query(`ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS sync_type TEXT NOT NULL DEFAULT 'stones'`);
+    await dbPool.query(`ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS warning TEXT`);
+    await dbPool.query(`ALTER TABLE sync_log ADD COLUMN IF NOT EXISTS file_modified_at TIMESTAMPTZ`);
     await dbPool.query(
-      `INSERT INTO sync_log (source, success, stones_count, message, duration_ms, started_at, sync_type)
-       VALUES ($1, $2, $3, $4, $5, $6, 'jewelry')`,
-      [entry.source, entry.success, entry.count, entry.message, entry.durationMs, entry.startedAt]
+      `INSERT INTO sync_log (source, success, stones_count, message, duration_ms, started_at, sync_type, warning, file_modified_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'jewelry', $7, $8)`,
+      [
+        entry.source, entry.success, entry.count, entry.message, entry.durationMs, entry.startedAt,
+        entry.warning || null, entry.fileModifiedAt || null,
+      ]
     );
     console.log(`📝 sync_log recorded (jewelry, ${entry.source}, success=${entry.success}, count=${entry.count})`);
   } catch (e) {
@@ -233,6 +272,8 @@ const run = async (options = {}) => {
     success: result.success,
     count: result.count,
     message: result.message,
+    warning: result.warning,
+    fileModifiedAt: result.fileModifiedAt,
     durationMs: Date.now() - startedAt.getTime(),
     startedAt,
   });
@@ -245,7 +286,7 @@ const run = async (options = {}) => {
 
 const ftpConfig = () => ({ host: FTP_HOST, user: FTP_USER, password: FTP_PASSWORD });
 
-module.exports = { run, ftpConfig };
+module.exports = { run, ftpConfig, logSyncRun };
 
 // Only auto-run when executed directly (the Render Cron Job runs
 // `node api/stones/importJewelryFromFtp.js`)

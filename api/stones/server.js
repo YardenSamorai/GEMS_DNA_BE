@@ -1980,7 +1980,12 @@ async function listJewelryFor(ctx) {
 
 /* =========================================================
    /api/jewelry/import-csv – Upload jewelry CSV
+   ---------------------------------------------------------
+   Logged to sync_log as source 'upload': the scheduled FTP
+   sync reads that time and won't put an older Barak file
+   back over it (utils/jewelryFeed.js).
    ========================================================= */
+const { logSyncRun: logJewelrySync } = require('./importJewelryFromFtp');
 let jewelryImportProgress = { active: false, phase: 'idle', progress: 0, detail: '', total: 0, processed: 0 };
 
 app.get("/api/jewelry/import-csv/progress", (req, res) => {
@@ -1992,6 +1997,7 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
     return res.status(409).json({ success: false, error: "A jewelry import is already in progress" });
   }
 
+  const startedAt = new Date();
   try {
     const { csvContent } = req.body;
     if (!csvContent) {
@@ -2174,6 +2180,14 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
 
     jewelryImportProgress = { active: false, phase: 'complete', progress: 100, detail: completionDetail, total: values.length, processed: values.length };
     console.log(`Jewelry CSV import completed: ${values.length} items` + (duplicateModelCount > 0 ? ` (${duplicateModelCount} duplicates collapsed)` : ''));
+    await logJewelrySync(pool, {
+      source: 'upload',
+      success: true,
+      count: values.length,
+      message: `Uploaded file: ${values.length} jewelry items` + (prunedCount > 0 ? ` (removed ${prunedCount} sold/discontinued)` : ''),
+      durationMs: Date.now() - startedAt.getTime(),
+      startedAt,
+    });
 
     res.json({
       success: true,
@@ -2184,6 +2198,14 @@ app.post("/api/jewelry/import-csv", sensitiveLimiter, requireOwner, async (req, 
   } catch (error) {
     console.error("Jewelry CSV import error:", error);
     jewelryImportProgress = { active: false, phase: 'error', progress: 0, detail: error.message, total: 0, processed: 0 };
+    await logJewelrySync(pool, {
+      source: 'upload',
+      success: false,
+      count: 0,
+      message: error.message,
+      durationMs: Date.now() - startedAt.getTime(),
+      startedAt,
+    });
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -2710,33 +2732,17 @@ app.get("/api/sync/progress", (req, res) => {
 // Backs the Dashboard's "Sync history" window. Admin-only, same as /api/sync.
 // Covers both feeds: stones (SOAP) and jewelry (FTP CSV), told apart by
 // sync_type ('stones' | 'jewelry').
+// Columns arrive with the first run that writes them (sync_type, warning,
+// file_modified_at), so read whatever the table has; rows from before
+// sync_type existed are stones.
 app.get("/api/sync/history", requireOwner, async (req, res) => {
   const limit = Math.min(parseInt(req.query?.limit, 10) || 50, 200);
-  const baseCols = "id, source, success, stones_count, message, duration_ms, started_at, finished_at";
   try {
-    const r = await pool.query(
-      `SELECT ${baseCols}, sync_type FROM sync_log ORDER BY id DESC LIMIT $1`,
-      [limit]
-    );
-    res.json({ history: r.rows });
+    const r = await pool.query(`SELECT * FROM sync_log ORDER BY id DESC LIMIT $1`, [limit]);
+    res.json({ history: r.rows.map((row) => ({ ...row, sync_type: row.sync_type || "stones" })) });
   } catch (e) {
     // 42P01 = table doesn't exist yet (no sync has run since this feature shipped)
     if (e.code === "42P01") return res.json({ history: [] });
-    // 42703 = sync_type column not added yet (no jewelry sync has run) —
-    // fall back to the legacy shape and tag everything as stones.
-    if (e.code === "42703") {
-      try {
-        const r = await pool.query(
-          `SELECT ${baseCols} FROM sync_log ORDER BY id DESC LIMIT $1`,
-          [limit]
-        );
-        return res.json({ history: r.rows.map((row) => ({ ...row, sync_type: "stones" })) });
-      } catch (e2) {
-        if (e2.code === "42P01") return res.json({ history: [] });
-        console.error("GET /api/sync/history error:", e2);
-        return res.status(500).json({ error: e2.message });
-      }
-    }
     console.error("GET /api/sync/history error:", e);
     res.status(500).json({ error: e.message });
   }
