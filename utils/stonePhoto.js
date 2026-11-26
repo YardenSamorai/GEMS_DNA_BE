@@ -30,6 +30,13 @@
 
 const sharp = require('sharp');
 
+// The server is a small container. libvips starts a thread per core it can
+// see, which in a container is the host's, and each thread keeps its own
+// buffers; on a fraction of a CPU one thread is as fast. Its operation cache
+// only helps when the same image is processed again, which never happens.
+sharp.concurrency(1);
+sharp.cache(false);
+
 // Working resolution. Phones upload at most this; anything larger is reduced.
 const WORK_SIDE = 3000;
 const OUT_SIDE = 1600;
@@ -93,6 +100,29 @@ const dist = (data, i, c) => {
   return Math.sqrt(dr * dr + dg * dg + db * db);
 };
 
+// Flood-fill work list. It rarely holds more than a sliver of the image, so
+// it starts small and doubles when full rather than reserving 4 bytes for
+// every pixel up front (27MB at the working size, per fill).
+class PixelStack {
+  constructor() {
+    this.items = new Int32Array(1 << 16);
+    this.size = 0;
+  }
+
+  push(p) {
+    if (this.size === this.items.length) {
+      const grown = new Int32Array(this.items.length * 2);
+      grown.set(this.items);
+      this.items = grown;
+    }
+    this.items[this.size++] = p;
+  }
+
+  pop() {
+    return this.items[--this.size];
+  }
+}
+
 const median = (arr) => {
   const s = Float64Array.from(arr).sort();
   return s.length ? s[s.length >> 1] : 0;
@@ -134,15 +164,14 @@ function estimateBackground({ data, width, height }) {
 function floodBackground({ data, width, height }, bg) {
   const n = width * height;
   const isBg = new Uint8Array(n);
-  const stack = new Int32Array(n);
-  let sp = 0;
+  const stack = new PixelStack();
   const seed = (p) => {
-    if (!isBg[p] && dist(data, p * 3, bg.color) < bg.high) { isBg[p] = 1; stack[sp++] = p; }
+    if (!isBg[p] && dist(data, p * 3, bg.color) < bg.high) { isBg[p] = 1; stack.push(p); }
   };
   for (let x = 0; x < width; x++) { seed(x); seed((height - 1) * width + x); }
   for (let y = 0; y < height; y++) { seed(y * width); seed(y * width + width - 1); }
-  while (sp > 0) {
-    const p = stack[--sp];
+  while (stack.size > 0) {
+    const p = stack.pop();
     const x = p % width;
     if (x > 0) seed(p - 1);
     if (x < width - 1) seed(p + 1);
@@ -152,35 +181,45 @@ function floodBackground({ data, width, height }, bg) {
   return isBg;
 }
 
+// A noisy mask can hold hundreds of thousands of regions, too many to spread
+// into Math.max's arguments.
+const largestArea = (regions) => regions.reduce((most, c) => Math.max(most, c.area), 0);
+
 // Labels 4-connected regions where mask[p] is set. Returns the kept regions
 // (area >= MIN_COMPONENT_SHARE of the largest) and a per-pixel label map.
+// The map takes 2 bytes a pixel, widened to 4 only if a noisy mask breaks
+// into more regions than that can number.
 function components(mask, width, height) {
   const n = width * height;
-  const label = new Int32Array(n);
-  const stack = new Int32Array(n);
+  let label = new Uint16Array(n);
+  const stack = new PixelStack();
   const all = [];
   for (let start = 0; start < n; start++) {
     if (label[start] || !mask[start]) continue;
     const id = all.length + 1;
-    let sp = 0;
-    stack[sp++] = start;
+    if (id > 0xffff && label instanceof Uint16Array) {
+      const wide = new Int32Array(n);
+      wide.set(label);
+      label = wide;
+    }
+    stack.push(start);
     label[start] = id;
     let area = 0, x0 = width, y0 = height, x1 = -1, y1 = -1;
-    while (sp > 0) {
-      const p = stack[--sp];
+    while (stack.size > 0) {
+      const p = stack.pop();
       const x = p % width, y = (p - x) / width;
       area++;
       if (x < x0) x0 = x; if (x > x1) x1 = x;
       if (y < y0) y0 = y; if (y > y1) y1 = y;
-      if (x > 0 && !label[p - 1] && mask[p - 1]) { label[p - 1] = id; stack[sp++] = p - 1; }
-      if (x < width - 1 && !label[p + 1] && mask[p + 1]) { label[p + 1] = id; stack[sp++] = p + 1; }
-      if (y > 0 && !label[p - width] && mask[p - width]) { label[p - width] = id; stack[sp++] = p - width; }
-      if (y < height - 1 && !label[p + width] && mask[p + width]) { label[p + width] = id; stack[sp++] = p + width; }
+      if (x > 0 && !label[p - 1] && mask[p - 1]) { label[p - 1] = id; stack.push(p - 1); }
+      if (x < width - 1 && !label[p + 1] && mask[p + 1]) { label[p + 1] = id; stack.push(p + 1); }
+      if (y > 0 && !label[p - width] && mask[p - width]) { label[p - width] = id; stack.push(p - width); }
+      if (y < height - 1 && !label[p + width] && mask[p + width]) { label[p + width] = id; stack.push(p + width); }
     }
     all.push({ id, area, x0, y0, x1, y1 });
   }
   if (!all.length) return { kept: [], label };
-  const largest = Math.max(...all.map((c) => c.area));
+  const largest = largestArea(all);
   return { kept: all.filter((c) => c.area >= largest * MIN_COMPONENT_SHARE), label };
 }
 
@@ -216,13 +255,12 @@ function morph(mask, width, height, r, erode) {
 function fillHoles(mask, width, height) {
   const n = width * height;
   const outside = new Uint8Array(n);
-  const stack = new Int32Array(n);
-  let sp = 0;
-  const seed = (p) => { if (!mask[p] && !outside[p]) { outside[p] = 1; stack[sp++] = p; } };
+  const stack = new PixelStack();
+  const seed = (p) => { if (!mask[p] && !outside[p]) { outside[p] = 1; stack.push(p); } };
   for (let x = 0; x < width; x++) { seed(x); seed((height - 1) * width + x); }
   for (let y = 0; y < height; y++) { seed(y * width); seed(y * width + width - 1); }
-  while (sp > 0) {
-    const p = stack[--sp];
+  while (stack.size > 0) {
+    const p = stack.pop();
     const x = p % width;
     if (x > 0) seed(p - 1);
     if (x < width - 1) seed(p + 1);
@@ -335,28 +373,36 @@ async function backgroundSurface(img, exclude) {
     .toBuffer();
 }
 
-// Mean of `v` over a (2r+1) square, separable running sums.
-function boxMean(v, width, height, r) {
-  const tmp = new Float32Array(v.length);
-  const out = new Float32Array(v.length);
-  for (let y = 0; y < height; y++) {
-    const o = y * width;
-    let s = 0;
-    for (let x = -r; x <= r; x++) s += v[o + Math.min(width - 1, Math.max(0, x))];
-    for (let x = 0; x < width; x++) {
-      tmp[o + x] = s / (2 * r + 1);
-      s += v[o + Math.min(width - 1, x + r + 1)] - v[o + Math.max(0, x - r)];
-    }
-  }
+// Running mean of one row over a (2r+1) window, edges clamped.
+function rowMean(row, width, r, out) {
+  const k = 2 * r + 1;
+  let s = 0;
+  for (let x = -r; x <= r; x++) s += row[Math.min(width - 1, Math.max(0, x))];
   for (let x = 0; x < width; x++) {
+    out[x] = s / k;
+    s += row[Math.min(width - 1, x + r + 1)] - row[Math.max(0, x - r)];
+  }
+}
+
+// Mean of `v` over a (2r+1) square, separable running sums, in place.
+function boxMean(v, width, height, r) {
+  const k = 2 * r + 1;
+  const row = new Float32Array(width);
+  for (let y = 0; y < height; y++) {
+    row.set(v.subarray(y * width, (y + 1) * width));
+    rowMean(row, width, r, v.subarray(y * width, (y + 1) * width));
+  }
+  const col = new Float32Array(height);
+  for (let x = 0; x < width; x++) {
+    for (let y = 0; y < height; y++) col[y] = v[y * width + x];
     let s = 0;
-    for (let y = -r; y <= r; y++) s += tmp[Math.min(height - 1, Math.max(0, y)) * width + x];
+    for (let y = -r; y <= r; y++) s += col[Math.min(height - 1, Math.max(0, y))];
     for (let y = 0; y < height; y++) {
-      out[y * width + x] = s / (2 * r + 1);
-      s += tmp[Math.min(height - 1, y + r + 1) * width + x] - tmp[Math.max(0, y - r) * width + x];
+      v[y * width + x] = s / k;
+      s += col[Math.min(height - 1, y + r + 1)] - col[Math.max(0, y - r)];
     }
   }
-  return out;
+  return v;
 }
 
 // Relative to its local backdrop, a pixel is backdrop when it has the
@@ -370,33 +416,75 @@ const NEUTRAL_TINT = 0.12;
 const SHADOW_TINT = 0.25;
 const SHADOW_DEPTH = 0.35;
 const SHADOW_TEXTURE = 0.08;
+// The texture test needs the local mean of the ratio and of its square, a
+// 7×7 box around each pixel. Computed for the whole image those are two
+// float arrays of 27MB each, so they are built in a window of rows that
+// slides down the image instead: each row's horizontal means are made once,
+// and every column keeps a running sum over the rows in the window. Values
+// pass through float32 at the same points as in a whole-image box filter,
+// the precision the thresholds were tuned at.
+const TEXTURE_R = 3;
 function classify(img, surface) {
   const { data, width, height } = img;
-  const n = width * height;
-  const ratio = new Float32Array(n);
-  const tint = new Float32Array(n);
-  for (let p = 0; p < n; p++) {
-    const i = p * 3;
-    const rr = (data[i] + 2) / (surface[i] + 2);
-    const rg = (data[i + 1] + 2) / (surface[i + 1] + 2);
-    const rb = (data[i + 2] + 2) / (surface[i + 2] + 2);
-    const m = (rr + rg + rb) / 3;
-    ratio[p] = m;
-    tint[p] = Math.max(Math.abs(rr - m), Math.abs(rg - m), Math.abs(rb - m)) / Math.max(m, 0.05);
-  }
-  const mean = boxMean(ratio, width, height, 3);
-  const sq = new Float32Array(n);
-  for (let p = 0; p < n; p++) sq[p] = ratio[p] * ratio[p];
-  const meanSq = boxMean(sq, width, height, 3);
-  const fg = new Uint8Array(n);
-  for (let p = 0; p < n; p++) {
-    const m = ratio[p];
-    if (m > 0.88 && tint[p] < NEUTRAL_TINT) continue;
-    if (m > SHADOW_DEPTH && tint[p] < SHADOW_TINT) {
-      const texture = Math.sqrt(Math.max(0, meanSq[p] - mean[p] * mean[p]));
-      if (texture < SHADOW_TEXTURE) continue;
+  const r = TEXTURE_R, k = 2 * r + 1;
+  const ratioOf = (i) => (
+    ((data[i] + 2) / (surface[i] + 2) + (data[i + 1] + 2) / (surface[i + 1] + 2) + (data[i + 2] + 2) / (surface[i + 2] + 2)) / 3
+  );
+
+  // Slots for the rows the window spans plus the one entering it.
+  const span = 2 * r + 2;
+  const held = new Int32Array(span).fill(-1);
+  const means = Array.from({ length: span }, () => new Float32Array(width));
+  const sqMeans = Array.from({ length: span }, () => new Float32Array(width));
+  const ratio = new Float32Array(width);
+  const sq = new Float32Array(width);
+  const row = (y) => {
+    const slot = y % span;
+    if (held[slot] !== y) {
+      for (let x = 0; x < width; x++) {
+        ratio[x] = ratioOf((y * width + x) * 3);
+        sq[x] = ratio[x] * ratio[x];
+      }
+      rowMean(ratio, width, r, means[slot]);
+      rowMean(sq, width, r, sqMeans[slot]);
+      held[slot] = y;
     }
-    fg[p] = 1;
+    return slot;
+  };
+
+  const sum = new Float64Array(width);
+  const sumSq = new Float64Array(width);
+  for (let y = -r; y <= r; y++) {
+    const s = row(Math.min(height - 1, Math.max(0, y)));
+    for (let x = 0; x < width; x++) { sum[x] += means[s][x]; sumSq[x] += sqMeans[s][x]; }
+  }
+
+  const fg = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const p = y * width + x;
+      const i = p * 3;
+      const rr = (data[i] + 2) / (surface[i] + 2);
+      const rg = (data[i + 1] + 2) / (surface[i + 1] + 2);
+      const rb = (data[i + 2] + 2) / (surface[i + 2] + 2);
+      const avg = (rr + rg + rb) / 3;
+      const m = Math.fround(avg);
+      const tint = Math.fround(Math.max(Math.abs(rr - avg), Math.abs(rg - avg), Math.abs(rb - avg)) / Math.max(avg, 0.05));
+      if (m > 0.88 && tint < NEUTRAL_TINT) continue;
+      if (m > SHADOW_DEPTH && tint < SHADOW_TINT) {
+        const mean = Math.fround(sum[x] / k);
+        const meanSq = Math.fround(sumSq[x] / k);
+        const texture = Math.sqrt(Math.max(0, meanSq - mean * mean));
+        if (texture < SHADOW_TEXTURE) continue;
+      }
+      fg[p] = 1;
+    }
+    const enter = row(Math.min(height - 1, y + r + 1));
+    const leave = row(Math.max(0, y - r));
+    for (let x = 0; x < width; x++) {
+      sum[x] += means[enter][x] - means[leave][x];
+      sumSq[x] += sqMeans[enter][x] - sqMeans[leave][x];
+    }
   }
   return fg;
 }
@@ -423,7 +511,7 @@ function stonesFrom(fg, width, height) {
   let kept = pieces.kept;
   const inner = kept.filter((c) => !touchesFrame(c, width, height));
   if (inner.length && inner.length < kept.length) {
-    const largest = Math.max(...inner.map((c) => c.area));
+    const largest = largestArea(inner);
     kept = inner.filter((c) => c.area >= largest * MIN_COMPONENT_SHARE);
   }
   const solid = new Uint8Array(width * height);
@@ -578,19 +666,18 @@ async function analyse(img, bg) {
   const coarse = new Uint8Array(width * height);
   for (let p = 0; p < coarse.length; p++) coarse[p] = isBg[p] ? 0 : 1;
   const detached = detachTools(coarse, width, height);
-  let found = stonesFrom(withoutLines(detached || coarse, width, height), width, height);
-  if (!found.groups.length) return found;
-
-  const r = Math.max(3, Math.round(Math.min(width, height) * 0.015));
-  const objects = components(morph(morph(found.mask, width, height, r, false), width, height, r, true), width, height);
+  // Only the first round's mask is kept; its 4-byte-per-pixel labels would
+  // otherwise sit in memory through both of the heavy rounds below.
+  const { mask: rough, groups: roughGroups } = stonesFrom(withoutLines(detached || coarse, width, height), width, height);
+  if (!roughGroups.length) return { mask: rough, groups: roughGroups };
 
   const margin = (share) => Math.max(4, Math.round(Math.min(width, height) * share));
   // With a tool cut off, the second round may only refine the stone's edge,
   // not find the tool again, and the tool is no backdrop to model.
-  const zone = detached ? morph(found.mask, width, height, margin(0.006), false) : null;
+  const zone = detached ? morph(rough, width, height, margin(0.006), false) : null;
   let precise = null;
   for (const share of [0.03, 0.015]) {
-    const exclude = morph((precise || found).mask, width, height, margin(share), false);
+    const exclude = morph(precise ? precise.mask : rough, width, height, margin(share), false);
     if (detached) for (let p = 0; p < exclude.length; p++) exclude[p] |= coarse[p];
     const surface = await backgroundSurface(img, exclude);
     const fg = classify(img, surface);
@@ -599,7 +686,10 @@ async function analyse(img, bg) {
     if (!next.groups.length) break;
     precise = next;
   }
-  if (!precise) precise = { mask: new Uint8Array(width * height), groups: [], label: new Int32Array(width * height) };
+  if (!precise) precise = { mask: new Uint8Array(width * height), groups: [], label: new Uint16Array(width * height) };
+
+  const r = Math.max(3, Math.round(Math.min(width, height) * 0.015));
+  const objects = components(morph(morph(rough, width, height, r, false), width, height, r, true), width, height);
 
   const pieces = new Map(precise.groups.map((g) => [g.id, g]));
   for (const { region, hull, count } of hullsByRegion(precise.mask, precise.label, precise.groups, width)) {
@@ -793,9 +883,10 @@ function composeOnWhite(img, mask, box) {
   const { data, width, height } = img;
   const pull = Math.max(1, Math.round(Math.min(width, height) / 1500));
   const core = morph(mask, width, height, pull, true);
-  const soft = new Float32Array(core.length);
-  for (let p = 0; p < core.length; p++) soft[p] = core[p];
-  const alpha = boxMean(boxMean(soft, width, height, pull), width, height, pull);
+  const alpha = new Float32Array(core.length);
+  for (let p = 0; p < core.length; p++) alpha[p] = core[p];
+  boxMean(alpha, width, height, pull);
+  boxMean(alpha, width, height, pull);
   return onWhite(data, alpha, width, height, box);
 }
 
