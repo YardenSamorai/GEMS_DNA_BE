@@ -5205,9 +5205,17 @@ app.post("/api/crm/contacts/bulk-tag", async (req, res) => {
 });
 
 // GET /api/health — tiny wake-up endpoint used by FE to defrost cold Render instances
+// Uptime and memory say whether the instance restarted (e.g. ran out of memory).
 app.get("/api/health", (req, res) => {
   res.set("Cache-Control", "no-store");
-  res.json({ ok: true, ts: Date.now() });
+  const mem = process.memoryUsage();
+  res.json({
+    ok: true,
+    ts: Date.now(),
+    uptimeSec: Math.round(process.uptime()),
+    rssMb: Math.round(mem.rss / 1048576),
+    heapMb: Math.round(mem.heapUsed / 1048576),
+  });
 });
 
 /* ---------- Lazy thumbnail loader (batched) ---------- */
