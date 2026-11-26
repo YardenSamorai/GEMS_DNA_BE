@@ -10,6 +10,7 @@
 //   GET  /api/photo-station/mine                the caller's recent shots and their fate
 //   GET  /api/photo-station/stone/:sku          one stone or jewelry item, for a scanned barcode
 //   POST /api/photo-station/captures            upload + process a shot (multipart: photo, sku)
+//   POST /api/photo-station/client-errors       an upload the browser saw fail without a reply
 //   GET  /api/photo-station/captures            review list (manager)
 //   POST /api/photo-station/captures/:id/approve        save the chosen version in DNA (manager)
 //   POST /api/photo-station/captures/:id/send-to-barak  upload an approved stone photo to Barak (manager)
@@ -35,6 +36,16 @@ const DEFAULT_BRANCH = 'Israel';
 const DEFAULT_CATEGORY = 'emerald';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+
+// Cleaning a shot holds ~200MB of pixel buffers. Two at once can push the
+// instance past its memory limit, and the restart drops every request in
+// flight, so shots are processed one after another.
+let processing = Promise.resolve();
+const oneAtATime = (job) => {
+  const run = processing.then(job, job);
+  processing = run.catch(() => {});
+  return run;
+};
 
 // Same rule as the frontend's usableMediaUrl: the feed sometimes carries a
 // bare folder URL, which is not a photo.
@@ -195,6 +206,22 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
         `UPDATE stone_photo_captures SET status = 'pending', upload_error = 'Interrupted by a server restart'
           WHERE status = 'uploading'`
       );
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS photo_station_client_errors (
+          id SERIAL PRIMARY KEY,
+          at TIMESTAMP DEFAULT NOW(),
+          sku TEXT,
+          kind TEXT,
+          message TEXT,
+          elapsed_ms INTEGER,
+          bytes INTEGER,
+          recovered BOOLEAN,
+          server_uptime_sec INTEGER,
+          user_agent TEXT,
+          user_id TEXT,
+          user_name TEXT
+        )
+      `);
       console.log('stone_photo_captures ready');
     } catch (err) {
       console.error('stone_photo_captures table creation error:', err);
@@ -479,17 +506,23 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       if (!item) return res.status(404).json({ error: 'Item not found' });
       const { sku, itemType } = item;
 
-      const clean = await processClean(req.file.buffer);
-      if (!clean.image && itemType === 'jewelry') {
-        // The detection is tuned for loose stones on the lightbox. A piece it
-        // can't frame is kept as shot (upright, resized) for the reviewer.
-        clean.image = await sharp(req.file.buffer)
-          .rotate()
-          .resize({ width: 2400, height: 2400, fit: 'inside', withoutEnlargement: true })
-          .jpeg({ quality: 90 })
-          .toBuffer();
-        clean.quality = { ...clean.quality, issues: (clean.quality?.issues || []).filter((c) => c !== 'no_stone') };
-      }
+      const { clean, cutout } = await oneAtATime(async () => {
+        const clean = await processClean(req.file.buffer);
+        if (!clean.image && itemType === 'jewelry') {
+          // The detection is tuned for loose stones on the lightbox. A piece it
+          // can't frame is kept as shot (upright, resized) for the reviewer.
+          clean.image = await sharp(req.file.buffer)
+            .rotate()
+            .resize({ width: 2400, height: 2400, fit: 'inside', withoutEnlargement: true })
+            .jpeg({ quality: 90 })
+            .toBuffer();
+          clean.quality = { ...clean.quality, issues: (clean.quality?.issues || []).filter((c) => c !== 'no_stone') };
+        }
+        if (!clean.image) return { clean, cutout: null };
+        const cutout = await processCutout(req.file.buffer, process.env.REMOVE_BG_API_KEY, clean.geometry)
+          .catch((e) => ({ image: null, error: e.message }));
+        return { clean, cutout };
+      });
       if (!clean.image) {
         const ctx = req.teamCtx;
         putBlob(sku, 'failed', req.file.buffer)
@@ -501,8 +534,6 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
           .catch((e) => console.error('photo-station failed-shot log error:', e.message));
         return res.status(422).json({ error: 'No stone found in the photo', quality: clean.quality });
       }
-      const cutout = await processCutout(req.file.buffer, process.env.REMOVE_BG_API_KEY, clean.geometry)
-        .catch((e) => ({ image: null, error: e.message }));
 
       const [originalUrl, cleanUrl, cutoutUrl] = await Promise.all([
         putBlob(sku, 'original', req.file.buffer),
@@ -527,6 +558,37 @@ module.exports = function registerPhotoStation(app, { pool, requireAuth, resolve
       res.json(captureOut(rows[0]));
     } catch (e) {
       console.error('photo-station capture error:', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // An upload the browser saw fail without a reply (connection dropped). The
+  // server's own uptime at report time tells whether it restarted meanwhile.
+  app.post('/api/photo-station/client-errors', ...shooter, async (req, res) => {
+    const b = req.body || {};
+    const int = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : null);
+    const ctx = req.teamCtx;
+    try {
+      await pool.query(
+        `INSERT INTO photo_station_client_errors
+           (sku, kind, message, elapsed_ms, bytes, recovered, server_uptime_sec, user_agent, user_id, user_name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          String(b.sku || '').slice(0, 80) || null,
+          String(b.kind || '').slice(0, 40) || null,
+          String(b.message || '').slice(0, 300) || null,
+          int(b.elapsedMs),
+          int(b.bytes),
+          typeof b.recovered === 'boolean' ? b.recovered : null,
+          Math.round(process.uptime()),
+          String(req.headers['user-agent'] || '').slice(0, 300) || null,
+          ctx.actorUserId,
+          ctx.memberName || ctx.actorName || null,
+        ]
+      );
+      res.json({ ok: true });
+    } catch (e) {
+      console.error('photo-station client error log:', e.message);
       res.status(500).json({ error: e.message });
     }
   });
